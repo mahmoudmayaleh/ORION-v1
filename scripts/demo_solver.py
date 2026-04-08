@@ -1,48 +1,63 @@
-"""Quick demo of the MILP solver for the supervisor meeting.
+"""Quick demo of the MILP solver.
 
 Usage:
     python scripts/demo_solver.py
 """
 from __future__ import annotations
 
-import yaml
 import numpy as np
 
-from orion.config import MILPConfig, TopologyConfig, SlicingConfig
+from orion.config import MILPConfig, TopologyConfig
 from orion.milp.solver import MILPSolver
-from orion.milp.feasibility import FeasibilityChecker
 from orion.substrate.topology_generator import generate_multi_domain_topology
-from orion.slicing.request_generator import PoissonArrivalGenerator
+from orion.types import VNF, FlowEdge, QoSRequirements, SliceRequest, SliceType
+
+
+def make_request(
+    request_id: str,
+    substrate_nodes: list[str],
+) -> SliceRequest:
+    """Build a simple 2-VNF eMBB slice request."""
+    return SliceRequest(
+        request_id=request_id,
+        slice_type=SliceType.EMBB,
+        vnfs=[
+            VNF("f0", "Firewall", cpu_demand=2.0, ram_demand=4.0,
+                permitted_nodes=substrate_nodes),
+            VNF("f1", "vEPC", cpu_demand=4.0, ram_demand=8.0,
+                permitted_nodes=substrate_nodes),
+        ],
+        flow_edges=[FlowEdge("f0", "f1", bandwidth_demand=50.0)],
+        qos=QoSRequirements(max_e2e_delay=80.0, min_throughput=20.0),
+        arrival_time=0.0,
+        lifetime=0.0,
+    )
 
 
 def main() -> None:
-    rng = np.random.default_rng(7)
+    rng = np.random.default_rng(42)
 
     # 1. Generate a 3-domain substrate
     substrate = generate_multi_domain_topology(TopologyConfig(), rng=rng)
+    all_nodes = list(substrate.graph.nodes())
     print("=== Substrate ===")
     print(f"Domains: {substrate.num_domains}")
-    print(f"Nodes:   {substrate.graph.number_of_nodes()}")
+    print(f"Nodes:   {len(all_nodes)}")
     print(f"Links:   {substrate.graph.number_of_edges()}")
     print()
 
-    # 2. Generate slice requests
-    with open("configs/slicing/standard_sfc.yaml") as f:
-        templates = yaml.safe_load(f)
-    gen = PoissonArrivalGenerator(SlicingConfig(), substrate, templates, rng=rng)
-    requests = gen.generate_batch(10)
-
+    # 2. Build a batch of slice requests
+    requests = [make_request(f"req_{i+1:03d}", all_nodes) for i in range(5)]
     print("=== Slice Requests ===")
     for r in requests:
         print(
-            f"  {r.request_id}: {r.slice_type.value:5s} | "
-            f"{len(r.vnfs)} VNFs | "
-            f"delay<={r.qos.max_e2e_delay:6.1f}ms  "
-            f"throughput>={r.qos.min_throughput:7.1f}Mbps"
+            f"  {r.request_id}: {len(r.vnfs)} VNFs, "
+            f"delay<={r.qos.max_e2e_delay}ms, "
+            f"throughput>={r.qos.min_throughput}Mbps"
         )
     print()
 
-    # 3. Solve the full MILP
+    # 3. Solve the full MILP (all C1-C9 constraints)
     solver = MILPSolver(MILPConfig())
     solution = solver.solve(substrate, requests)
 
@@ -53,40 +68,18 @@ def main() -> None:
     print(f"Solve time: {solution.solve_time:.3f}s")
     print()
 
-    # 4. Show placement details for admitted slices
+    # 4. Show placement details
     for sid, admitted in solution.admitted.items():
         if admitted:
             plan = solution.placements[sid]
             print(f"  {sid}: ADMITTED")
             for fid, nid in plan.vnf_placements.items():
-                print(
-                    f"    {fid} -> {nid}  "
-                    f"CPU={plan.cpu_allocations[fid]:.1f}  "
-                    f"RAM={plan.ram_allocations[fid]:.1f}"
-                )
+                print(f"    {fid} -> {nid}  CPU={plan.cpu_allocations[fid]:.1f}  RAM={plan.ram_allocations[fid]:.1f}")
             for flow, links in plan.flow_routes.items():
                 if links:
                     print(f"    route {flow[0]}->{flow[1]}: {' -> '.join(links)}")
         else:
             print(f"  {sid}: REJECTED")
-    print()
-
-    # 5. Feasibility check on first admitted plan
-    checker = FeasibilityChecker(substrate)
-    for sid, admitted in solution.admitted.items():
-        if admitted:
-            plan = solution.placements[sid]
-            req = [r for r in requests if r.request_id == sid][0]
-            res = checker.check(plan, req)
-            stc = checker.check_structural(plan, req)
-            print(f"=== Feasibility [{sid}] ===")
-            tag = "PASS" if res.is_feasible else "FAIL"
-            print(f"  Resource (C2,C3,C5,C5b,C7): {tag}")
-            if not res.is_feasible:
-                print(f"    violations: {res.violated_constraints}")
-            tag = "PASS" if stc.is_feasible else "FAIL"
-            print(f"  Structural (C1,C4,C6,C8):   {tag}")
-            break
 
 
 if __name__ == "__main__":

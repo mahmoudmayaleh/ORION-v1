@@ -1,16 +1,9 @@
-"""MILPSolver: orchestrates variable creation, constraints, objective, and solving.
-
-Evaluation mode (solve): Full MILP on static batches.
-Produces z*_MILP for offline optimality-gap evaluation and
-few-shot examples for Agent B.
-"""
+"""MILPSolver: orchestrates variable creation, constraints, objective, and solving."""
 
 from __future__ import annotations
 
 import logging
-import multiprocessing as mp
 import time
-from typing import Any
 
 import pulp
 
@@ -18,7 +11,6 @@ from orion.config import MILPConfig
 from orion.milp.constraints import add_all_constraints
 from orion.milp.objective import build_objective
 from orion.milp.variables import MILPVariables, create_variables
-from orion.slicing.slice_request import slice_request_from_dict, slice_request_to_dict
 from orion.substrate.graph_model import SubstrateNetwork
 from orion.types import MILPSolution, PlacementPlan, SliceRequest
 
@@ -117,7 +109,7 @@ def _parse_solution(
 
 
 class MILPSolver:
-    """Solves the static VNF embedding MILP (evaluation / oracle mode)."""
+    """Solves the static VNF embedding MILP."""
 
     def __init__(self, config: MILPConfig) -> None:
         self.config = config
@@ -127,7 +119,7 @@ class MILPSolver:
         substrate: SubstrateNetwork,
         slices: list[SliceRequest],
     ) -> MILPSolution:
-        """Solve the full MILP for a single (substrate, slice_batch) instance."""
+        """Solve the full MILP for a (substrate, slice_batch) instance."""
         prob = pulp.LpProblem("ORION_slice_embedding", pulp.LpMaximize)
         vars = create_variables(prob, slices, substrate)
         add_all_constraints(prob, vars, slices, substrate, self.config)
@@ -157,35 +149,3 @@ class MILPSolver:
             },
         )
         return solution
-
-    def solve_batch(
-        self,
-        instances: list[tuple[SubstrateNetwork, list[SliceRequest]]],
-        n_workers: int = 4,
-    ) -> list[MILPSolution]:
-        """Solve independent (substrate, slices) instances in parallel."""
-        config_dict = self.config.model_dump()
-        args = [
-            (
-                substrate.to_dict(),
-                [slice_request_to_dict(r) for r in slices],
-                config_dict,
-            )
-            for substrate, slices in instances
-        ]
-
-        with mp.Pool(processes=n_workers) as pool:
-            solutions = pool.map(_solve_worker, args)
-
-        return solutions
-
-
-def _solve_worker(
-    args: tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]],
-) -> MILPSolution:
-    """Worker function for multiprocessing.Pool (must be module-level)."""
-    substrate_dict, request_dicts, config_dict = args
-    substrate = SubstrateNetwork.from_dict(substrate_dict)
-    slices = [slice_request_from_dict(r) for r in request_dicts]
-    config = MILPConfig(**config_dict)
-    return MILPSolver(config).solve(substrate, slices)
