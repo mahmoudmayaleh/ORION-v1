@@ -1,0 +1,47 @@
+[project]
+name = "orion"
+version = "0.1.0"
+description = "Slice Orchestrator Assistant for Multi-Domain 6G Network Slicing"
+requires-python = ">=3.11"
+dependencies = [
+    "networkx>=3.2",
+    "pulp>=2.8",
+    "gymnasium>=0.29",
+    "stable-baselines3>=2.3",
+    "torch>=2.2",
+    "numpy>=1.26",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "pyyaml>=6.0",
+    "structlog>=24.1",
+    "anthropic>=0.40",
+    "httpx>=0.27",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "pandas>=2.2",
+    "tqdm>=4.66",
+    "rich>=13.7",
+    "scipy>=1.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov", "ruff", "mypy", "pre-commit"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --cov=src/orion"
