@@ -2,6 +2,8 @@
 
 Usage:
     python scripts/demo_solver.py
+or:
+    .venv/bin/python3 scripts/demo_solver.py 
 """
 from __future__ import annotations
 

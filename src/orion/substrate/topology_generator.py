@@ -14,7 +14,6 @@ from orion.substrate.graph_model import SubstrateNetwork
 from orion.types import InfrastructureTier, LinkType
 
 # Tier-to-capacity lookup tables.
-# Values match the specification in phase_3b_topology_generator.md.
 _TIER_CPU_RANGE: dict[InfrastructureTier, tuple[float, float]] = {
     InfrastructureTier.RAN_EDGE:        (8.0,  16.0),
     InfrastructureTier.MEC:             (16.0, 32.0),
