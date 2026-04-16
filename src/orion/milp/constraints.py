@@ -207,7 +207,10 @@ def add_c7_e2e_delay(
     slices: list[SliceRequest],
     substrate: SubstrateNetwork,
 ) -> None:
-    """C7: Processing + propagation delay must not exceed the slice delay budget."""
+    """C7: Processing + propagation delay must not exceed the slice delay budget.
+
+    delta_{f,n} = node_base_delay * vnf.computational_intensity (v4 Remark 1).
+    """
     link_delay: dict[str, float] = {
         d["link_id"]: d["propagation_delay"]
         for _, _, d in substrate.graph.edges(data=True)
@@ -216,7 +219,9 @@ def add_c7_e2e_delay(
     for s in slices:
         sid = s.request_id
         proc_delay = pulp.lpSum(
-            substrate.graph.nodes[n_id]["processing_delay"] * vars.x[sid][f.vnf_id][n_id]
+            substrate.graph.nodes[n_id]["processing_delay"]
+            * f.computational_intensity
+            * vars.x[sid][f.vnf_id][n_id]
             for f in s.vnfs
             for n_id in f.permitted_nodes
         )
