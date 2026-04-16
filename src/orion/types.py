@@ -83,6 +83,8 @@ class VNF:
         ram_demand: r̃_f — minimum RAM allocation required in GB.
         permitted_nodes: D_f — subset of node_ids satisfying tier/domain rules
             for constraint C8.
+        computational_intensity: Multiplier for computing delta_{f,n} =
+            node_base_delay * computational_intensity (v4 Remark 1).
     """
 
     vnf_id: str
@@ -90,6 +92,7 @@ class VNF:
     cpu_demand: float
     ram_demand: float
     permitted_nodes: list[str]
+    computational_intensity: float = 1.0
 
 
 @dataclass
