@@ -26,29 +26,29 @@ from orion.types import (
 
 _VNF_TEMPLATES: dict[SliceType, list[dict]] = {
     SliceType.EMBB: [
-        {"type": "Firewall",   "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.8, "tiers": ["mec", "regional_cloud", "central_cloud"]},
-        {"type": "CDN",        "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.2, "tiers": ["mec", "regional_cloud"]},
-        {"type": "vEPC",       "cpu": (4, 8),  "ram": (4, 16), "intensity": 1.0, "tiers": ["regional_cloud", "central_cloud"]},
+        {"type": "Firewall",   "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.8, "vcr": 1.0, "tiers": ["mec", "regional_cloud", "central_cloud"]},
+        {"type": "CDN",        "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.2, "vcr": 0.7, "tiers": ["mec", "regional_cloud"]},
+        {"type": "vEPC",       "cpu": (4, 8),  "ram": (4, 16), "intensity": 1.0, "vcr": 1.0, "tiers": ["regional_cloud", "central_cloud"]},
     ],
     SliceType.URLLC: [
-        {"type": "Firewall",   "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.5, "tiers": ["ran_edge", "mec"]},
-        {"type": "vUPF",       "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.6, "tiers": ["ran_edge", "mec"]},
+        {"type": "Firewall",   "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.5, "vcr": 1.0, "tiers": ["ran_edge", "mec"]},
+        {"type": "vUPF",       "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.6, "vcr": 1.0, "tiers": ["ran_edge", "mec"]},
     ],
     SliceType.MMTC: [
-        {"type": "IoTGateway", "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.4, "tiers": ["ran_edge", "mec"]},
-        {"type": "Aggregator", "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.6, "tiers": ["mec", "regional_cloud"]},
-        {"type": "Analytics",  "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.5, "tiers": ["regional_cloud", "central_cloud"]},
+        {"type": "IoTGateway", "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.4, "vcr": 0.3, "tiers": ["ran_edge", "mec"]},
+        {"type": "Aggregator", "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.6, "vcr": 0.5, "tiers": ["mec", "regional_cloud"]},
+        {"type": "Analytics",  "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.5, "vcr": 1.0, "tiers": ["regional_cloud", "central_cloud"]},
     ],
     SliceType.V2X: [
-        {"type": "Firewall",   "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.5, "tiers": ["ran_edge", "mec"]},
-        {"type": "V2XController", "cpu": (2, 4), "ram": (4, 8), "intensity": 0.7, "tiers": ["mec"]},
-        {"type": "vEPC",       "cpu": (2, 4),  "ram": (2, 8),  "intensity": 1.0, "tiers": ["regional_cloud"]},
+        {"type": "Firewall",   "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.5, "vcr": 1.0, "tiers": ["ran_edge", "mec"]},
+        {"type": "V2XController", "cpu": (2, 4), "ram": (4, 8), "intensity": 0.7, "vcr": 1.0, "tiers": ["mec"]},
+        {"type": "vEPC",       "cpu": (2, 4),  "ram": (2, 8),  "intensity": 1.0, "vcr": 1.0, "tiers": ["regional_cloud"]},
     ],
     SliceType.XR: [
-        {"type": "Firewall",   "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.8, "tiers": ["mec"]},
-        {"type": "MediaProc",  "cpu": (8, 16), "ram": (16, 32), "intensity": 2.0, "tiers": ["mec", "regional_cloud"]},
-        {"type": "CDN",        "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.2, "tiers": ["regional_cloud", "central_cloud"]},
-        {"type": "vEPC",       "cpu": (2, 4),  "ram": (2, 8),  "intensity": 1.0, "tiers": ["central_cloud"]},
+        {"type": "Firewall",   "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.8, "vcr": 1.0, "tiers": ["mec"]},
+        {"type": "MediaProc",  "cpu": (8, 16), "ram": (16, 32), "intensity": 2.0, "vcr": 1.2, "tiers": ["mec", "regional_cloud"]},
+        {"type": "CDN",        "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.2, "vcr": 0.7, "tiers": ["regional_cloud", "central_cloud"]},
+        {"type": "vEPC",       "cpu": (2, 4),  "ram": (2, 8),  "intensity": 1.0, "vcr": 1.0, "tiers": ["central_cloud"]},
     ],
 }
 
@@ -126,13 +126,18 @@ def generate_slice_request(
             ram_demand=round(ram, 1),
             permitted_nodes=permitted,
             computational_intensity=tmpl["intensity"],
+            vcr=tmpl["vcr"],
         ))
 
-    # Flow edges between consecutive VNFs
-    bw_lo, bw_hi = qos_profile["bw_per_flow"]
+    # Flow edges: VCR-scaled bandwidth per v4 Eq. 3
+    # beta_{k,k+1} = beta_min * prod_{j=1}^{k} rho_{f_j}
+    beta_min = float(rng.uniform(*qos_profile["bw_per_flow"]))
     flow_edges: list[FlowEdge] = []
     for k in range(len(vnfs) - 1):
-        bw = float(rng.uniform(bw_lo, bw_hi))
+        vcr_product = 1.0
+        for j in range(k + 1):
+            vcr_product *= vnfs[j].vcr
+        bw = beta_min * vcr_product
         flow_edges.append(FlowEdge(
             source_vnf=vnfs[k].vnf_id,
             target_vnf=vnfs[k + 1].vnf_id,

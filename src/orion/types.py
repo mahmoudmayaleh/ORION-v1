@@ -85,6 +85,9 @@ class VNF:
             for constraint C8.
         computational_intensity: Multiplier for computing delta_{f,n} =
             node_base_delay * computational_intensity (v4 Remark 1).
+        vcr: Volume Change Ratio rho_f. rho < 1 for compression,
+            rho ~ 1 for pass-through, rho > 1 for expansion.
+            Used to compute per-edge bandwidth via v4 Eq. 3.
     """
 
     vnf_id: str
@@ -93,6 +96,7 @@ class VNF:
     ram_demand: float
     permitted_nodes: list[str]
     computational_intensity: float = 1.0
+    vcr: float = 1.0
 
 
 @dataclass

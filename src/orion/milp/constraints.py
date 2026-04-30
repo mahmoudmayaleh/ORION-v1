@@ -154,16 +154,16 @@ def add_c5b_throughput_floor(
     slices: list[SliceRequest],
     substrate: SubstrateNetwork,
 ) -> None:
-    """C5b: Per-flow throughput must meet the slice QoS minimum.
-    Since C5 linearization forces a_b=0 when y=0, the product a_b*y = a_b.
+    """C5b: Per-flow bandwidth must meet the VCR-scaled per-edge requirement.
+    Each flow edge already carries its VCR-scaled bandwidth_demand (v4 Eq. 3).
     """
     for s in slices:
         sid = s.request_id
-        beta_min = s.qos.min_throughput
         for edge in s.flow_edges:
             flow_key = (edge.source_vnf, edge.target_vnf)
             prob += (
-                pulp.lpSum(vars.a_b[sid][flow_key].values()) >= beta_min * vars.z[sid],
+                pulp.lpSum(vars.a_b[sid][flow_key].values())
+                >= edge.bandwidth_demand * vars.z[sid],
                 f"C5b_{sid}_{flow_key[0]}_{flow_key[1]}",
             )
 
