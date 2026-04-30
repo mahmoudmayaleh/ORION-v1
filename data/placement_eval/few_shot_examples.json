@@ -1,0 +1,119 @@
+[
+  {
+    "slice_request": {
+      "request_id": "urllc_factory_002",
+      "slice_type": "URLLC",
+      "vnfs": [
+        {"vnf_id": "urllc_factory_002_f1", "vnf_type": "Firewall",
+         "cpu_demand": 9.0, "ram_demand": 16.0,
+         "permitted_tiers": ["ran_edge", "mec"], "vcr": 1.0},
+        {"vnf_id": "urllc_factory_002_f2", "vnf_type": "vUPF",
+         "cpu_demand": 8.0, "ram_demand": 16.0,
+         "permitted_tiers": ["ran_edge", "mec"], "vcr": 1.0}
+      ],
+      "flow_edges": [
+        {"source_vnf": "urllc_factory_002_f1", "target_vnf": "urllc_factory_002_f2",
+         "bandwidth_demand": 80.0}
+      ],
+      "qos": {"max_e2e_delay": 3.0, "min_throughput": 80.0}
+    },
+    "placement_plan": {
+      "plan_id": "urllc_factory_002_plan",
+      "vnf_assignments": [
+        {"vnf_id": "urllc_factory_002_f1", "domain": "d0",
+         "required_tier": "ran_edge", "cpu_demand": 9.0, "ram_demand": 16.0},
+        {"vnf_id": "urllc_factory_002_f2", "domain": "d1",
+         "required_tier": "mec", "cpu_demand": 8.0, "ram_demand": 16.0}
+      ],
+      "flow_requirements": [
+        {"source_vnf": "urllc_factory_002_f1", "target_vnf": "urllc_factory_002_f2",
+         "min_bandwidth_mbps": 80.0, "crosses_domain_boundary": true}
+      ],
+      "rationale": "Both VNFs permit ran_edge/mec, so co-locating in d0 seems natural. However d0 has only 12 CPU residual. Firewall alone takes 9 CPU, leaving 3 — insufficient for vUPF (8 CPU). Co-location in d0 violates C4. vUPF is placed in d1 which also satisfies the mec tier requirement and has 25 CPU residual. The f1→f2 flow crosses the d0→d1 boundary (500 Mbps available, 80 Mbps required)."
+    }
+  },
+  {
+    "slice_request": {
+      "request_id": "mmtc_city_003",
+      "slice_type": "mMTC",
+      "vnfs": [
+        {"vnf_id": "mmtc_city_003_f1", "vnf_type": "IoTGateway",
+         "cpu_demand": 10.0, "ram_demand": 20.0,
+         "permitted_tiers": ["ran_edge", "mec"], "vcr": 0.3},
+        {"vnf_id": "mmtc_city_003_f2", "vnf_type": "Aggregator",
+         "cpu_demand": 8.0, "ram_demand": 15.0,
+         "permitted_tiers": ["mec", "regional_cloud"], "vcr": 0.5},
+        {"vnf_id": "mmtc_city_003_f3", "vnf_type": "Analytics",
+         "cpu_demand": 20.0, "ram_demand": 50.0,
+         "permitted_tiers": ["regional_cloud", "central_cloud"], "vcr": 1.0}
+      ],
+      "flow_edges": [
+        {"source_vnf": "mmtc_city_003_f1", "target_vnf": "mmtc_city_003_f2",
+         "bandwidth_demand": 30.0},
+        {"source_vnf": "mmtc_city_003_f2", "target_vnf": "mmtc_city_003_f3",
+         "bandwidth_demand": 15.0}
+      ],
+      "qos": {"max_e2e_delay": 100.0, "min_throughput": 15.0}
+    },
+    "placement_plan": {
+      "plan_id": "mmtc_city_003_plan",
+      "vnf_assignments": [
+        {"vnf_id": "mmtc_city_003_f1", "domain": "d0",
+         "required_tier": "ran_edge", "cpu_demand": 10.0, "ram_demand": 20.0},
+        {"vnf_id": "mmtc_city_003_f2", "domain": "d1",
+         "required_tier": "mec", "cpu_demand": 8.0, "ram_demand": 15.0},
+        {"vnf_id": "mmtc_city_003_f3", "domain": "d2",
+         "required_tier": "regional_cloud", "cpu_demand": 20.0, "ram_demand": 50.0}
+      ],
+      "flow_requirements": [
+        {"source_vnf": "mmtc_city_003_f1", "target_vnf": "mmtc_city_003_f2",
+         "min_bandwidth_mbps": 30.0, "crosses_domain_boundary": true},
+        {"source_vnf": "mmtc_city_003_f2", "target_vnf": "mmtc_city_003_f3",
+         "min_bandwidth_mbps": 15.0, "crosses_domain_boundary": true}
+      ],
+      "rationale": "IoTGateway placed in d0 (ran_edge tier, 10 CPU fits within 12 residual, leaving 2 CPU). Aggregator permits mec/regional_cloud. Co-locating with IoTGateway in d0 is impossible: d0 would need 10+8=18 CPU > 12. d1 (mec tier, 25 CPU residual) is the correct home. Analytics requires regional/central_cloud — only d2 qualifies. Both inter-domain flows have sufficient bandwidth on their respective links."
+    }
+  },
+  {
+    "slice_request": {
+      "request_id": "embb_stream_004",
+      "slice_type": "eMBB",
+      "vnfs": [
+        {"vnf_id": "embb_stream_004_f1", "vnf_type": "Firewall",
+         "cpu_demand": 4.0, "ram_demand": 8.0,
+         "permitted_tiers": ["ran_edge", "mec"], "vcr": 1.0},
+        {"vnf_id": "embb_stream_004_f2", "vnf_type": "CDN",
+         "cpu_demand": 18.0, "ram_demand": 40.0,
+         "permitted_tiers": ["mec", "regional_cloud"], "vcr": 0.7},
+        {"vnf_id": "embb_stream_004_f3", "vnf_type": "vEPC",
+         "cpu_demand": 15.0, "ram_demand": 35.0,
+         "permitted_tiers": ["regional_cloud", "central_cloud"], "vcr": 1.0}
+      ],
+      "flow_edges": [
+        {"source_vnf": "embb_stream_004_f1", "target_vnf": "embb_stream_004_f2",
+         "bandwidth_demand": 400.0},
+        {"source_vnf": "embb_stream_004_f2", "target_vnf": "embb_stream_004_f3",
+         "bandwidth_demand": 200.0}
+      ],
+      "qos": {"max_e2e_delay": 50.0, "min_throughput": 200.0}
+    },
+    "placement_plan": {
+      "plan_id": "embb_stream_004_plan",
+      "vnf_assignments": [
+        {"vnf_id": "embb_stream_004_f1", "domain": "d1",
+         "required_tier": "mec", "cpu_demand": 4.0, "ram_demand": 8.0},
+        {"vnf_id": "embb_stream_004_f2", "domain": "d1",
+         "required_tier": "mec", "cpu_demand": 18.0, "ram_demand": 40.0},
+        {"vnf_id": "embb_stream_004_f3", "domain": "d2",
+         "required_tier": "regional_cloud", "cpu_demand": 15.0, "ram_demand": 35.0}
+      ],
+      "flow_requirements": [
+        {"source_vnf": "embb_stream_004_f1", "target_vnf": "embb_stream_004_f2",
+         "min_bandwidth_mbps": 400.0, "crosses_domain_boundary": false},
+        {"source_vnf": "embb_stream_004_f2", "target_vnf": "embb_stream_004_f3",
+         "min_bandwidth_mbps": 200.0, "crosses_domain_boundary": true}
+      ],
+      "rationale": "Firewall permits ran_edge/mec — both d0 and d1 are valid. Placing Firewall in d0 would require the f1→f2 flow (400 Mbps) to cross d0→d1 (only 500 Mbps available — tight). Instead, co-locating Firewall with CDN in d1 eliminates that inter-domain hop entirely and keeps the 400 Mbps flow intra-domain. d1 CPU check: 4+18=22 < 25 ✓. vEPC requires regional/central_cloud, placed in d2. The only inter-domain flow is f2→f3 (200 Mbps) on l_d1_d2 (1000 Mbps available ✓)."
+    }
+  }
+]

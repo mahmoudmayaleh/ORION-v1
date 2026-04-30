@@ -44,6 +44,17 @@ Tier placement rules (permitted_tiers per VNF type):
 - mec / regional_cloud: mid-tier (CDN, Aggregator, MediaProc, V2XController)
 - regional_cloud / central_cloud: heavy compute (vEPC, Analytics)
 
+Volume Change Ratio (VCR) per VNF type — how each VNF transforms the data rate:
+- Firewall: vcr=1.0 (pass-through)
+- vUPF: vcr=1.0 (pass-through)
+- IoTGateway: vcr=0.3 (heavy compression/aggregation)
+- Aggregator: vcr=0.5 (moderate compression)
+- CDN: vcr=0.7 (caching compression)
+- MediaProc: vcr=1.2 (transcoding expansion)
+- V2XController: vcr=1.0 (pass-through)
+- vEPC: vcr=1.0 (pass-through)
+- Analytics: vcr=1.0 (pass-through)
+
 Respond ONLY with a single JSON object matching this schema exactly:
 {
   "request_id": "<string>",
@@ -55,7 +66,7 @@ Respond ONLY with a single JSON object matching this schema exactly:
       "cpu_demand": <float>,
       "ram_demand": <float>,
       "permitted_tiers": ["<tier>", ...],
-      "computational_intensity": <float>
+      "vcr": <float, volume change ratio>
     }
   ],
   "flow_edges": [

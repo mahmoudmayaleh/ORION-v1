@@ -137,7 +137,8 @@ def load_slice_request(substrate: SubstrateNetwork) -> SliceRequest:
             cpu_demand=v["cpu_demand"],
             ram_demand=v["ram_demand"],
             permitted_nodes=list(dict.fromkeys(permitted)),   # deduplicate, keep order
-            computational_intensity=v.get("computational_intensity", 1.0),
+            computational_intensity=1.0,
+            vcr=v.get("vcr", 1.0),
         ))
 
     flow_edges = [
