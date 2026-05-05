@@ -26,6 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov", "ruff", "mypy", "pre-commit"]
+retrieval = ["faiss-cpu>=1.8.0", "rank-bm25>=0.2.2", "sentence-transformers>=3.0.0"]
 
 [build-system]
 requires = ["setuptools>=68"]

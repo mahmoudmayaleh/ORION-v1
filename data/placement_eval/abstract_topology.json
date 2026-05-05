@@ -1,0 +1,55 @@
+{
+  "domains": [
+    {
+      "domain_id": "d0",
+      "label": "RAN/Edge",
+      "dominant_tiers": ["ran_edge", "mec"],
+      "cpu_residual": 12.0,
+      "ram_residual": 24.0
+    },
+    {
+      "domain_id": "d1",
+      "label": "MEC/Regional",
+      "dominant_tiers": ["mec", "regional_cloud"],
+      "cpu_residual": 25.0,
+      "ram_residual": 60.0
+    },
+    {
+      "domain_id": "d2",
+      "label": "Regional/Central Cloud",
+      "dominant_tiers": ["regional_cloud", "central_cloud"],
+      "cpu_residual": 100.0,
+      "ram_residual": 240.0
+    }
+  ],
+  "inter_domain_links": [
+    {
+      "link_id": "l_d0_d1",
+      "source_domain": "d0",
+      "target_domain": "d1",
+      "bandwidth_residual_mbps": 500.0,
+      "propagation_delay_ms": 2.0
+    },
+    {
+      "link_id": "l_d1_d0",
+      "source_domain": "d1",
+      "target_domain": "d0",
+      "bandwidth_residual_mbps": 500.0,
+      "propagation_delay_ms": 2.0
+    },
+    {
+      "link_id": "l_d1_d2",
+      "source_domain": "d1",
+      "target_domain": "d2",
+      "bandwidth_residual_mbps": 1000.0,
+      "propagation_delay_ms": 5.0
+    },
+    {
+      "link_id": "l_d2_d1",
+      "source_domain": "d2",
+      "target_domain": "d1",
+      "bandwidth_residual_mbps": 1000.0,
+      "propagation_delay_ms": 5.0
+    }
+  ]
+}

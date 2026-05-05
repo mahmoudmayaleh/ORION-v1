@@ -1,0 +1,18 @@
+[
+  {
+    "topic": "Infrastructure tier definitions and resource profiles",
+    "slice_type_tag": "all",
+    "topology_tag": "all",
+    "content": "The operator network defines four infrastructure tiers. ran_edge: 8-16 vCPU, 16-32 GB RAM, propagation delay to UE < 1 ms, intended for lightweight latency-critical functions (Firewall, vUPF, IoTGateway). mec: 16-32 vCPU, 32-128 GB RAM, 1-3 ms from ran_edge, general-purpose mid-tier for CDN, Aggregator, V2XController and overflow from ran_edge. regional_cloud: 32-64 vCPU, 128-256 GB RAM, 3-8 ms from mec, hosts compute-heavy functions (vEPC, Analytics, MediaProc). central_cloud: 64+ vCPU, 256+ GB RAM, 5-15 ms from regional_cloud, last resort for delay-tolerant heavy workloads. Inter-domain hop delays are cumulative along the SFC path.",
+    "version": "1.0",
+    "author": "operator"
+  },
+  {
+    "topic": "Standard VNF families — resource demands and VCR",
+    "slice_type_tag": "all",
+    "topology_tag": "all",
+    "content": "Firewall: 1-2 vCPU, 1-2 GB RAM, VCR=1.0 (pass-through). vUPF: 2-4 vCPU, 2-4 GB RAM, VCR=1.0. IoTGateway: 1-2 vCPU, 1-2 GB RAM, VCR=0.3 (protocol aggregation compresses 70%). Aggregator: 2-4 vCPU, 4-8 GB RAM, VCR=0.5 (data reduction). CDN: 2-4 vCPU, 4-8 GB RAM, VCR=0.7 (caching reduces 30%). MediaProc: 8-16 vCPU, 16-32 GB RAM, VCR=1.2 (transcoding expands 20%). Analytics: 4-8 vCPU, 8-16 GB RAM, VCR=0.1 (outputs summaries). V2XController: 2-4 vCPU, 4-8 GB RAM, VCR=0.8. vEPC: 4-8 vCPU, 8-16 GB RAM, VCR=1.0. Per-edge bandwidth is computed as beta_min * product of upstream VCRs.",
+    "version": "1.0",
+    "author": "operator"
+  }
+]
