@@ -1,8 +1,9 @@
 """Structural constraint checker for Agent B abstract plans.
 
-Validates C4 (resource sufficiency at domain level) and C8 (tier placement
-rules) before a plan reaches the MDO. Runs in O(|F_s| + |E_s|) time on
-the abstract topology — no per-node substrate access needed.
+Validates C4 (resource sufficiency), C5 (inter-domain bandwidth), C8 (tier
+placement rules), and schema consistency before a plan reaches the MDO.
+Runs in O(|F_s| + |E_s|) time on the abstract topology — no per-node
+substrate access needed.
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ def check_plan(
     slice_request: dict,
     abstract_topology: dict,
 ) -> CheckResult:
-    """Validate an Agent B abstract plan against C4 and C8.
+    """Validate an Agent B abstract plan against C4, C5, C8, and schema.
 
     Args:
         plan: Agent B output with ``vnf_assignments`` and ``flow_requirements``.
@@ -194,6 +195,87 @@ def check_plan(
                 detail=(
                     f"Domain '{domain_id}' RAM overcommit: "
                     f"{ram_used:.1f} demanded > {ram_avail:.1f} residual."
+                ),
+            ))
+
+    # ── C5 / SCHEMA: Inter-domain bandwidth and boundary flag checks ────
+
+    # Build inter-domain link lookup: (src, dst) -> link
+    link_map: dict[tuple[str, str], dict] = {}
+    for link in abstract_topology.get("inter_domain_links", []):
+        src = link.get("source_domain")
+        dst = link.get("target_domain")
+        if src and dst:
+            link_map[(src, dst)] = link
+
+    # Aggregate bandwidth demand per directed inter-domain link
+    link_bw_demand: dict[tuple[str, str], float] = {}
+
+    for flow in plan.get("flow_requirements", []):
+        src_vnf = flow.get("source_vnf")
+        dst_vnf = flow.get("target_vnf")
+        bw = flow.get("min_bandwidth_mbps", 0.0)
+        crosses = flow.get("crosses_domain_boundary", False)
+
+        src_domain = assignment_map.get(src_vnf, {}).get("domain")
+        dst_domain = assignment_map.get(dst_vnf, {}).get("domain")
+
+        if src_domain is None or dst_domain is None:
+            continue  # VNFs not found — already caught by schema checks
+
+        actually_crosses = src_domain != dst_domain
+
+        # Boundary flag mismatch
+        if actually_crosses and not crosses:
+            violations.append(Violation(
+                constraint="SCHEMA",
+                vnf_id=src_vnf,
+                detail=(
+                    f"Flow {src_vnf}->{dst_vnf} crosses domains "
+                    f"({src_domain}->{dst_domain}) but "
+                    f"crosses_domain_boundary=False."
+                ),
+            ))
+        elif not actually_crosses and crosses:
+            violations.append(Violation(
+                constraint="SCHEMA",
+                vnf_id=src_vnf,
+                detail=(
+                    f"Flow {src_vnf}->{dst_vnf} is intra-domain "
+                    f"({src_domain}) but crosses_domain_boundary=True."
+                ),
+            ))
+
+        # Inter-domain bandwidth checks
+        if actually_crosses:
+            pair = (src_domain, dst_domain)
+            if pair not in link_map:
+                violations.append(Violation(
+                    constraint="C5",
+                    vnf_id=None,
+                    detail=(
+                        f"No inter-domain link exists between "
+                        f"'{src_domain}' and '{dst_domain}' for flow "
+                        f"{src_vnf}->{dst_vnf}."
+                    ),
+                ))
+            else:
+                link_bw_demand[pair] = link_bw_demand.get(pair, 0.0) + bw
+
+    # Check aggregate bandwidth per link
+    for pair, demanded in link_bw_demand.items():
+        link = link_map.get(pair)
+        if link is None:
+            continue  # Already reported as missing
+        residual = link.get("bandwidth_residual_mbps", 0.0)
+        if demanded > residual:
+            violations.append(Violation(
+                constraint="C5",
+                vnf_id=None,
+                detail=(
+                    f"Inter-domain link {pair[0]}->{pair[1]} bandwidth "
+                    f"overcommit: {demanded:.1f} Mbps demanded > "
+                    f"{residual:.1f} Mbps residual."
                 ),
             ))
 

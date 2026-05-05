@@ -5,8 +5,8 @@
     {
       "vnf_id": "xr_telepresence_005_f1",
       "vnf_type": "Firewall",
-      "cpu_demand": 4.0,
-      "ram_demand": 8.0,
+      "cpu_demand": 2.0,
+      "ram_demand": 2.0,
       "permitted_tiers": ["ran_edge", "mec"],
       "vcr": 1.0
     },
@@ -21,16 +21,16 @@
     {
       "vnf_id": "xr_telepresence_005_f3",
       "vnf_type": "CDN",
-      "cpu_demand": 10.0,
-      "ram_demand": 25.0,
+      "cpu_demand": 4.0,
+      "ram_demand": 8.0,
       "permitted_tiers": ["mec", "regional_cloud"],
       "vcr": 0.7
     },
     {
       "vnf_id": "xr_telepresence_005_f4",
       "vnf_type": "vEPC",
-      "cpu_demand": 18.0,
-      "ram_demand": 45.0,
+      "cpu_demand": 6.0,
+      "ram_demand": 12.0,
       "permitted_tiers": ["regional_cloud", "central_cloud"],
       "vcr": 1.0
     }
@@ -44,12 +44,12 @@
     {
       "source_vnf": "xr_telepresence_005_f2",
       "target_vnf": "xr_telepresence_005_f3",
-      "bandwidth_demand": 250.0
+      "bandwidth_demand": 360.0
     },
     {
       "source_vnf": "xr_telepresence_005_f3",
       "target_vnf": "xr_telepresence_005_f4",
-      "bandwidth_demand": 150.0
+      "bandwidth_demand": 252.0
     }
   ],
   "qos": {
@@ -57,6 +57,6 @@
     "min_throughput": 150.0
   },
   "arrival_time": 0.0,
-  "lifetime": 0.0,
+  "lifetime": 3600.0,
   "intent_summary": "4K XR telepresence session requiring media processing and content delivery with moderate latency tolerance."
 }

@@ -14,5 +14,69 @@
     "content": "Firewall: 1-2 vCPU, 1-2 GB RAM, VCR=1.0 (pass-through). vUPF: 2-4 vCPU, 2-4 GB RAM, VCR=1.0. IoTGateway: 1-2 vCPU, 1-2 GB RAM, VCR=0.3 (protocol aggregation compresses 70%). Aggregator: 2-4 vCPU, 4-8 GB RAM, VCR=0.5 (data reduction). CDN: 2-4 vCPU, 4-8 GB RAM, VCR=0.7 (caching reduces 30%). MediaProc: 8-16 vCPU, 16-32 GB RAM, VCR=1.2 (transcoding expands 20%). Analytics: 4-8 vCPU, 8-16 GB RAM, VCR=0.1 (outputs summaries). V2XController: 2-4 vCPU, 4-8 GB RAM, VCR=0.8. vEPC: 4-8 vCPU, 8-16 GB RAM, VCR=1.0. Per-edge bandwidth is computed as beta_min * product of upstream VCRs.",
     "version": "1.0",
     "author": "operator"
+  },
+  {
+    "topic": "URLLC ultra-low latency placement rules",
+    "slice_type_tag": "URLLC",
+    "topology_tag": "all",
+    "content": "URLLC slices require end-to-end latency below 5 ms. Firewall and vUPF must be placed at ran_edge to minimise propagation delay to the UE. When possible, co-locate all URLLC VNFs within the same ran_edge domain to eliminate inter-domain hop latency (each hop adds 2-5 ms). Never place latency-critical URLLC VNFs beyond the mec tier. If two consecutive URLLC VNFs cannot share the same domain, verify that the inter-domain link propagation delay fits within the remaining latency budget. A ran_edge domain pair hop is 2 ms; ran_edge to mec is acceptable for URLLC only when the chain budget allows.",
+    "version": "1.0",
+    "author": "operator"
+  },
+  {
+    "topic": "eMBB throughput optimisation and co-location patterns",
+    "slice_type_tag": "eMBB",
+    "topology_tag": "all",
+    "content": "eMBB slices prioritise high throughput over latency. CDN VNFs (VCR=0.7) should be co-located with upstream Firewall VNFs in the mec tier to avoid crossing a high-bandwidth inter-domain link with the full pre-CDN traffic volume. MediaProc (VCR=1.2) expands traffic by 20% and should be placed at mec or regional_cloud where RAM is abundant (16-32 GB). vEPC belongs at regional_cloud or central_cloud. For eMBB, co-locating Firewall and CDN in the same mec domain eliminates the high-bandwidth f1→f2 inter-domain flow. The expanded downstream traffic from MediaProc must be verified against the downstream link residual.",
+    "version": "1.0",
+    "author": "operator"
+  },
+  {
+    "topic": "Multi-domain placement anti-patterns",
+    "slice_type_tag": "all",
+    "topology_tag": "all",
+    "content": "Avoid the following anti-patterns: (1) Splitting consecutive high-bandwidth VNFs across domains when the link residual is insufficient — verify the aggregate min_bandwidth_mbps for all flows on each directed link before committing. (2) Placing a VNF in a domain that supports none of its permitted_tiers — always check that at least one permitted_tier is in the domain's dominant_tiers. (3) Placing latency-critical functions (vUPF, Firewall for URLLC) beyond the mec tier. (4) Marking crosses_domain_boundary=False when source and target VNFs are assigned to different domains. (5) Assigning more CPU or RAM to a domain than its residual capacity allows (C4 violation).",
+    "version": "1.0",
+    "author": "operator"
+  },
+  {
+    "topic": "mMTC IoT placement and traffic aggregation",
+    "slice_type_tag": "mMTC",
+    "topology_tag": "all",
+    "content": "mMTC slices are delay-tolerant (max E2E delay 100-1000 ms) but handle massive device counts. IoTGateway (VCR=0.3) compresses 70% of incoming traffic and should be placed at ran_edge. Aggregator (VCR=0.5) further reduces traffic and belongs at mec or regional_cloud. Analytics (VCR=0.1) produces summary data and can reside at regional_cloud or central_cloud. Multi-domain chaining is acceptable for mMTC. The dramatic traffic reduction across the chain (beta_min -> 0.3*beta_min -> 0.15*beta_min after IoTGateway and Aggregator) means inter-domain link bandwidth is rarely the bottleneck for mMTC.",
+    "version": "1.0",
+    "author": "operator"
+  },
+  {
+    "topic": "XR immersive media placement rules",
+    "slice_type_tag": "XR",
+    "topology_tag": "all",
+    "content": "XR slices require end-to-end latency below 20 ms for comfortable telepresence. Place Firewall at ran_edge or mec. MediaProc (VCR=1.2, 8-16 vCPU, 16-32 GB RAM) expands traffic and should be placed at mec or regional_cloud. CDN (VCR=0.7, 2-4 vCPU, 4-8 GB RAM) reduces downstream traffic by 30% and can be co-located with MediaProc in mec or regional_cloud. vEPC belongs at regional_cloud or central_cloud. For a 4-VNF chain spanning d0->d1->d2, cumulative propagation delay is d0->d1 (2 ms) + d1->d2 (5 ms) = 7 ms, leaving 13 ms for intra-domain processing within a 20 ms budget.",
+    "version": "1.0",
+    "author": "operator"
+  },
+  {
+    "topic": "V2X vehicular latency and reliability requirements",
+    "slice_type_tag": "V2X",
+    "topology_tag": "all",
+    "content": "V2X slices require URLLC-class reliability and latency below 5 ms. V2XController (VCR=0.8, 2-4 vCPU, 4-8 GB RAM) must be placed at mec or ran_edge to ensure sub-3 ms round-trip to the vehicle. Firewall for V2X should be at ran_edge. Never place V2XController at regional_cloud or central_cloud due to propagation latency. Co-locating V2XController with vUPF in the same mec domain eliminates inter-domain latency on the critical control path. V2X control plane traffic is compact and latency-sensitive; data plane offload to regional_cloud is acceptable only for delay-tolerant analytics.",
+    "version": "1.0",
+    "author": "operator"
+  },
+  {
+    "topic": "VNF co-location heuristics for resource efficiency",
+    "slice_type_tag": "all",
+    "topology_tag": "all",
+    "content": "Co-locate consecutive VNFs in the same domain when: (1) the flow bandwidth between them is high (> 200 Mbps) and crossing the domain boundary would consume significant link residual; (2) both VNFs share at least one permitted_tier with the domain's dominant_tiers; (3) the domain has sufficient residual CPU and RAM for both VNFs combined. Split across domains when: (1) the domain lacks sufficient resources for both; (2) one VNF has a strict tier requirement incompatible with the other (e.g., vEPC requires regional_cloud while Firewall requires ran_edge/mec); (3) distributing load across domains improves admission probability for future slices.",
+    "version": "1.0",
+    "author": "operator"
+  },
+  {
+    "topic": "Bandwidth planning using VCR chain product",
+    "slice_type_tag": "all",
+    "topology_tag": "all",
+    "content": "Per-edge bandwidth on the SFC chain equals beta_min multiplied by the product of VCR values of all upstream VNFs. Example for chain Firewall(VCR=1.0) -> MediaProc(VCR=1.2) -> CDN(VCR=0.7) -> vEPC(VCR=1.0) with beta_min=300 Mbps: edge f1->f2: 300*1.0=300 Mbps; edge f2->f3: 300*1.0*1.2=360 Mbps (MediaProc transcoding expands traffic); edge f3->f4: 300*1.0*1.2*0.7=252 Mbps (CDN caching reduces traffic). Each cross-domain flow's min_bandwidth_mbps must be set to the VCR-computed value. Aggregate all flows on a directed inter-domain link and verify the total does not exceed the link's bandwidth_residual_mbps.",
+    "version": "1.0",
+    "author": "operator"
   }
 ]

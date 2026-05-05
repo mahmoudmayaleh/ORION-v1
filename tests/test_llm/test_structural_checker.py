@@ -33,22 +33,27 @@ def few_shot_examples() -> list[dict]:
 def _valid_plan() -> dict:
     """A hand-verified valid plan for xr_telepresence_005.
 
-    f1 (Firewall) -> d0: CPU 4/12, RAM 8/24
-    f2 (MediaProc) + f3 (CDN) -> d1: CPU 14+10=24/25, RAM 30+25=55/60
-    f4 (vEPC) -> d2: CPU 18/100, RAM 45/240
+    VCR-correct bandwidth: beta_min=300, VCRs=[1.0, 1.2, 0.7, 1.0]
+      f1->f2: 300 * 1.0 = 300 Mbps
+      f2->f3: 300 * 1.0 * 1.2 = 360 Mbps
+      f3->f4: 300 * 1.0 * 1.2 * 0.7 = 252 Mbps
+
+    f1 (Firewall) -> d0: CPU 2/12, RAM 2/24
+    f2 (MediaProc) + f3 (CDN) -> d1: CPU 14+4=18/25, RAM 30+8=38/60
+    f4 (vEPC) -> d2: CPU 6/100, RAM 12/240
     """
     return {
         "plan_id": "xr_telepresence_005_plan",
         "vnf_assignments": [
             {"vnf_id": "xr_telepresence_005_f1", "domain": "d0",
-             "required_tier": "mec", "cpu_demand": 4.0, "ram_demand": 8.0},
+             "required_tier": "mec", "cpu_demand": 2.0, "ram_demand": 2.0},
             {"vnf_id": "xr_telepresence_005_f2", "domain": "d1",
              "required_tier": "mec", "cpu_demand": 14.0, "ram_demand": 30.0},
             {"vnf_id": "xr_telepresence_005_f3", "domain": "d1",
-             "required_tier": "mec", "cpu_demand": 10.0, "ram_demand": 25.0},
+             "required_tier": "mec", "cpu_demand": 4.0, "ram_demand": 8.0},
             {"vnf_id": "xr_telepresence_005_f4", "domain": "d2",
-             "required_tier": "regional_cloud", "cpu_demand": 18.0,
-             "ram_demand": 45.0},
+             "required_tier": "regional_cloud", "cpu_demand": 6.0,
+             "ram_demand": 12.0},
         ],
         "flow_requirements": [
             {"source_vnf": "xr_telepresence_005_f1",
@@ -56,10 +61,10 @@ def _valid_plan() -> dict:
              "min_bandwidth_mbps": 300.0, "crosses_domain_boundary": True},
             {"source_vnf": "xr_telepresence_005_f2",
              "target_vnf": "xr_telepresence_005_f3",
-             "min_bandwidth_mbps": 250.0, "crosses_domain_boundary": False},
+             "min_bandwidth_mbps": 360.0, "crosses_domain_boundary": False},
             {"source_vnf": "xr_telepresence_005_f3",
              "target_vnf": "xr_telepresence_005_f4",
-             "min_bandwidth_mbps": 150.0, "crosses_domain_boundary": True},
+             "min_bandwidth_mbps": 252.0, "crosses_domain_boundary": True},
         ],
     }
 
@@ -89,23 +94,23 @@ class TestValidPlans:
 class TestC4Violations:
 
     def test_cpu_overcommit_detected(self, slice_request, topology):
-        """Sonnet 4.6's actual mistake: f1+f2+f3 all in d1 = 28 CPU > 25."""
+        """Move all VNFs to d0 to exceed its 12 CPU residual."""
         plan = _valid_plan()
-        # Move f1 from d0 to d1
-        plan["vnf_assignments"][0]["domain"] = "d1"
-        plan["vnf_assignments"][0]["required_tier"] = "mec"
+        # Move f2 (14 CPU) to d0 — d0 already has f1 (2 CPU), total 16 > 12
+        plan["vnf_assignments"][1]["domain"] = "d0"
+        plan["vnf_assignments"][1]["required_tier"] = "mec"
 
         result = check_plan(plan, slice_request, topology)
         assert not result.is_valid
         c4_violations = [v for v in result.violations if v.constraint == "C4"]
         assert len(c4_violations) >= 1
         assert "CPU overcommit" in c4_violations[0].detail
-        assert "d1" in c4_violations[0].detail
+        assert "d0" in c4_violations[0].detail
 
     def test_ram_overcommit_detected(self, slice_request, topology):
         topo = copy.deepcopy(topology)
-        # Shrink d1 RAM so the valid plan fails
-        topo["domains"][1]["ram_residual"] = 50.0  # Need 55
+        # Shrink d1 RAM so the valid plan fails (needs 30+8=38)
+        topo["domains"][1]["ram_residual"] = 30.0
 
         plan = _valid_plan()
         result = check_plan(plan, slice_request, topo)
@@ -187,8 +192,8 @@ class TestSchemaViolations:
 class TestBandwidthChecks:
 
     def test_link_bw_overcommit(self, slice_request, topology):
+        """f1->f2 demands 300 Mbps on d0->d1; shrink link to 200 Mbps."""
         topo = copy.deepcopy(topology)
-        # Shrink d0->d1 link to less than the 300 Mbps flow
         for link in topo["inter_domain_links"]:
             if link["link_id"] == "l_d0_d1":
                 link["bandwidth_residual_mbps"] = 200.0
@@ -198,10 +203,11 @@ class TestBandwidthChecks:
         assert not result.is_valid
         c5_violations = [v for v in result.violations if v.constraint == "C5"]
         assert len(c5_violations) >= 1
+        assert "overcommit" in c5_violations[0].detail
 
     def test_nonexistent_link_detected(self, slice_request, topology):
+        """f1(d0)->f2(d1) requires a d0->d1 link; remove it."""
         topo = copy.deepcopy(topology)
-        # Remove d0->d1 link entirely
         topo["inter_domain_links"] = [
             l for l in topo["inter_domain_links"]
             if l["link_id"] != "l_d0_d1"
@@ -219,9 +225,9 @@ class TestViolationFeedback:
 
     def test_summary_contains_all_violations(self, slice_request, topology):
         plan = _valid_plan()
-        # Move f1 to d1 (CPU overcommit) AND set wrong tier
-        plan["vnf_assignments"][0]["domain"] = "d1"
-        plan["vnf_assignments"][0]["required_tier"] = "central_cloud"
+        # Move f2 to d0 (CPU overcommit: 2+14=16 > 12) AND set wrong tier
+        plan["vnf_assignments"][1]["domain"] = "d0"
+        plan["vnf_assignments"][1]["required_tier"] = "central_cloud"
 
         result = check_plan(plan, slice_request, topology)
         assert not result.is_valid
@@ -231,7 +237,9 @@ class TestViolationFeedback:
 
     def test_violation_text_for_prompt_nonempty(self, slice_request, topology):
         plan = _valid_plan()
-        plan["vnf_assignments"][0]["domain"] = "d1"
+        # Move f2 to d0 (CPU overcommit: 2+14=16 > 12)
+        plan["vnf_assignments"][1]["domain"] = "d0"
+        plan["vnf_assignments"][1]["required_tier"] = "mec"
 
         result = check_plan(plan, slice_request, topology)
         text = result.violation_text_for_prompt()
