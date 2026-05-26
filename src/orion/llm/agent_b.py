@@ -19,6 +19,11 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from orion.llm.episodic_memory import EpisodicMemory
+    from orion.llm.semantic_memory import SemanticMemory
 
 from orion.llm.llm_backend import LLMBackend, extract_json
 from orion.llm.structural_checker import CheckResult, check_plan
@@ -247,3 +252,52 @@ class AgentB:
             violation_feedback = result.violation_text_for_prompt()
 
         return plan, result
+
+    def generate_with_memory(
+        self,
+        slice_request: dict,
+        abstract_topology: dict,
+        kb: SemanticMemory | None = None,
+        mb: EpisodicMemory | None = None,
+        max_retries: int = 1,
+    ) -> tuple[dict, CheckResult]:
+        """Generate a plan using K^B semantic and M^B episodic memory.
+
+        Retrieves relevant context from both memory systems and feeds it
+        into generate_and_check().
+
+        Args:
+            slice_request: Slice request dict.
+            abstract_topology: Abstract topology dict.
+            kb: Optional semantic memory (K^B) for reference knowledge.
+            mb: Optional episodic memory (M^B) for few-shot examples.
+            max_retries: Number of regeneration attempts on structural failure.
+
+        Returns:
+            Tuple of (plan_dict, CheckResult).
+        """
+        from orion.llm.semantic_memory import build_query_from_slice
+
+        query = build_query_from_slice(slice_request)
+
+        reference_knowledge: str | None = None
+        if kb is not None:
+            kb_entries = kb.retrieve(query, top_k=5)
+            formatted = kb.format_for_prompt(kb_entries)
+            if formatted:
+                reference_knowledge = formatted
+
+        few_shot_examples: list[dict] | None = None
+        if mb is not None:
+            mb_entries = mb.retrieve(query, top_k=3)
+            converted = mb.to_few_shot(mb_entries)
+            if converted:
+                few_shot_examples = converted
+
+        return self.generate_and_check(
+            slice_request,
+            abstract_topology,
+            few_shot_examples=few_shot_examples,
+            max_retries=max_retries,
+            reference_knowledge=reference_knowledge,
+        )

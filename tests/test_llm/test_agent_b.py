@@ -267,3 +267,181 @@ class TestAbstractTopologyIntegration:
             nodes = substrate.nodes_in_domain(did)
             expected_cpu = sum(substrate.graph.nodes[n]["cpu_capacity"] for n in nodes)
             assert abs(dom["cpu_residual"] - expected_cpu) < 0.1
+
+
+# -- Tests: Agent B memory integration (few-shot bridge + generate_with_memory)
+
+class TestAgentBMemoryIntegration:
+    """Tests for the episodic/semantic memory integration with Agent B."""
+
+    MINIMAL_TOPO = {
+        "domains": [
+            {
+                "domain_id": 0,
+                "cpu_residual": 100,
+                "ram_residual": 200,
+                "dominant_tiers": ["mec"],
+            }
+        ],
+        "inter_domain_links": [],
+    }
+
+    MINIMAL_SLICE = {
+        "request_id": "test_001",
+        "slice_type": "eMBB",
+        "vnfs": [
+            {
+                "vnf_id": "f0",
+                "vnf_type": "Firewall",
+                "cpu_demand": 2,
+                "ram_demand": 4,
+                "permitted_tiers": ["mec"],
+            }
+        ],
+        "flow_edges": [],
+        "qos": {"max_e2e_delay": 50, "min_throughput": 100},
+    }
+
+    @staticmethod
+    def _make_episodic_memory():
+        """Create an EpisodicMemory using keyword-only retrieval (no embeddings)."""
+        from orion.retrieval import RetrievalConfig, RetrievalMode
+        from orion.llm.episodic_memory import EpisodicMemory
+
+        config = RetrievalConfig(mode=RetrievalMode.KEYWORD_ONLY)
+        return EpisodicMemory(config=config)
+
+    def test_to_few_shot_parses_stored_entries(self):
+        """Record success + failure entries, retrieve, convert to few-shot dicts."""
+        mb = self._make_episodic_memory()
+
+        # Success entry (reward >= 0.8, so it will be recorded)
+        mb.record(
+            slice_spec={"slice_type": "eMBB", "vnfs": [{"vnf_id": "f0"}]},
+            plan={"plan_id": "p1", "vnf_assignments": []},
+            m_committed=10.0,
+            constraints_violated=[],
+            reward=0.9,
+        )
+        # Failure entry (has violations, so it will be recorded)
+        mb.record(
+            slice_spec={"slice_type": "URLLC", "vnfs": [{"vnf_id": "f1"}]},
+            plan={"plan_id": "p2", "vnf_assignments": []},
+            m_committed=5.0,
+            constraints_violated=["C4"],
+            reward=-0.6,
+        )
+
+        entries = mb.retrieve("eMBB placement", top_k=5)
+        few_shot = mb.to_few_shot(entries)
+
+        assert isinstance(few_shot, list)
+        assert len(few_shot) > 0
+        for item in few_shot:
+            assert "slice_request" in item
+            assert "placement_plan" in item
+            assert isinstance(item["slice_request"], dict)
+            assert isinstance(item["placement_plan"], dict)
+
+    def test_to_few_shot_empty_returns_empty(self):
+        """Passing an empty list returns an empty list."""
+        mb = self._make_episodic_memory()
+        assert mb.to_few_shot([]) == []
+
+    def test_to_few_shot_skips_unparseable(self):
+        """Malformed content (no 'Slice:' line) is skipped, not crashed."""
+        from orion.retrieval import MemoryEntry, ScoredEntry
+
+        mb = self._make_episodic_memory()
+
+        bad_entry = MemoryEntry(
+            entry_id="bad_001",
+            topic="malformed episode",
+            content="This content has no Slice or Plan lines at all.",
+            tags={},
+        )
+        scored = [ScoredEntry(entry=bad_entry, score=1.0, stage_scores={})]
+        result = mb.to_few_shot(scored)
+        assert result == []
+
+    def test_generate_with_memory_uses_kb_and_mb(self):
+        """LLM prompt includes both reference knowledge and few-shot examples."""
+        from orion.llm.semantic_memory import SemanticMemory
+
+        kb_path = Path(__file__).resolve().parents[2] / "data" / "memory" / "kb_agent_b.json"
+        kb = SemanticMemory.from_json(kb_path)
+
+        mb = self._make_episodic_memory()
+        mb.record(
+            slice_spec={"slice_type": "eMBB", "vnfs": [{"vnf_id": "f0"}]},
+            plan={"plan_id": "p1", "vnf_assignments": []},
+            m_committed=10.0,
+            constraints_violated=[],
+            reward=0.9,
+        )
+
+        # Retrieve KB and MB content
+        kb_entries = kb.retrieve("eMBB Firewall mec", top_k=3)
+        reference_knowledge = kb.format_for_prompt(kb_entries)
+
+        mb_entries = mb.retrieve("eMBB placement", top_k=3)
+        few_shot = mb.to_few_shot(mb_entries)
+
+        # Mock LLM and call generate_plan with memory content
+        mock_llm = _make_mock_llm([_valid_plan_json()])
+        agent = AgentB(llm=mock_llm)
+        agent.generate_plan(
+            self.MINIMAL_SLICE,
+            self.MINIMAL_TOPO,
+            few_shot_examples=few_shot if few_shot else None,
+            reference_knowledge=reference_knowledge if reference_knowledge else None,
+        )
+
+        assert mock_llm.complete.call_count == 1
+        user_msg = mock_llm.complete.call_args[0][1]
+
+        # Prompt should contain both memory sources
+        assert "Reference Knowledge" in user_msg
+        assert "Past Plans" in user_msg or "Example" in user_msg
+
+    def test_generate_with_memory_kb_only(self):
+        """With mb=None the prompt has reference knowledge but no past plans."""
+        from orion.llm.semantic_memory import SemanticMemory
+
+        kb_path = Path(__file__).resolve().parents[2] / "data" / "memory" / "kb_agent_b.json"
+        kb = SemanticMemory.from_json(kb_path)
+
+        kb_entries = kb.retrieve("eMBB Firewall mec", top_k=3)
+        reference_knowledge = kb.format_for_prompt(kb_entries)
+
+        mock_llm = _make_mock_llm([_valid_plan_json()])
+        agent = AgentB(llm=mock_llm)
+        agent.generate_plan(
+            self.MINIMAL_SLICE,
+            self.MINIMAL_TOPO,
+            few_shot_examples=None,
+            reference_knowledge=reference_knowledge if reference_knowledge else None,
+        )
+
+        assert mock_llm.complete.call_count == 1
+        user_msg = mock_llm.complete.call_args[0][1]
+        assert "Reference Knowledge" in user_msg
+        assert "Past Plans" not in user_msg
+        assert "Example 1" not in user_msg
+
+    def test_generate_with_memory_no_memory(self):
+        """With kb=None and mb=None the call still works (no extras in prompt)."""
+        mock_llm = _make_mock_llm([_valid_plan_json()])
+        agent = AgentB(llm=mock_llm)
+
+        plan = agent.generate_plan(
+            self.MINIMAL_SLICE,
+            self.MINIMAL_TOPO,
+            few_shot_examples=None,
+            reference_knowledge=None,
+        )
+
+        assert mock_llm.complete.call_count == 1
+        user_msg = mock_llm.complete.call_args[0][1]
+        assert "Reference Knowledge" not in user_msg
+        assert "Past Plans" not in user_msg
