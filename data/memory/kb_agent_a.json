@@ -1,0 +1,62 @@
+[
+  {
+    "topic": "Slice type definitions and service characteristics",
+    "slice_type_tag": "all",
+    "content": "The system supports 5 slice types. eMBB (enhanced Mobile Broadband): high throughput for video streaming, web browsing, and file downloads; tolerates moderate latency (20-100 ms) but demands 50-500 Mbps throughput. URLLC (Ultra-Reliable Low-Latency Communication): mission-critical control with strict latency (1-10 ms) and moderate throughput (10-100 Mbps); used for industrial automation, remote surgery. mMTC (massive Machine-Type Communication): massive IoT with relaxed latency (50-500 ms) and low throughput (1-10 Mbps); sensor networks and smart metering. V2X (Vehicle-to-Everything): vehicular communication requiring low latency (5-20 ms) and moderate throughput (20-100 Mbps); autonomous driving and cooperative awareness. XR (Extended Reality): immersive media with tight latency (5-30 ms) and very high throughput (100-1000 Mbps); VR/AR telepresence and holographic streaming."
+  },
+  {
+    "topic": "Output schema reference for structured slice requests",
+    "slice_type_tag": "all",
+    "content": "Agent A must produce a JSON object with these fields. request_id (string): unique identifier, e.g. 'req_0001'. slice_type (string): one of 'eMBB', 'URLLC', 'mMTC', 'V2X', 'XR'. vnfs (array of objects): each VNF has vnf_id (string, e.g. 'req_0001_f0'), vnf_type (string from the VNF catalog), cpu_demand (float, vCPUs), ram_demand (float, GB), permitted_tiers (list of tier strings from 'ran_edge', 'mec', 'regional_cloud', 'central_cloud'), vcr (float, Volume Change Ratio), computational_intensity (float). flow_edges (array of objects): each has source_vnf (string), target_vnf (string), bandwidth_demand (float, Mbps). qos (object): max_e2e_delay (float, ms), min_throughput (float, Mbps). VNFs must be ordered to form a linear service function chain."
+  },
+  {
+    "topic": "VNF type catalog with resource ranges and VCR values",
+    "slice_type_tag": "all",
+    "content": "Firewall: cpu 1-4, ram 1-8, VCR=1.0 (pass-through), intensity 0.5-0.8. CDN: cpu 4-8, ram 8-16, VCR=0.7 (caching reduces 30%), intensity 1.2. vEPC: cpu 2-8, ram 2-16, VCR=1.0 (pass-through), intensity 1.0. vUPF: cpu 2-4, ram 2-8, VCR=1.0 (pass-through), intensity 0.6. IoTGateway: cpu 1-2, ram 1-4, VCR=0.3 (protocol aggregation compresses 70%), intensity 0.4. Aggregator: cpu 2-4, ram 2-8, VCR=0.5 (data reduction), intensity 0.6. Analytics: cpu 4-8, ram 8-16, VCR=1.0, intensity 1.5. MediaProc: cpu 8-16, ram 16-32, VCR=1.2 (transcoding expands 20%), intensity 2.0. V2XController: cpu 2-4, ram 4-8, VCR=1.0, intensity 0.7."
+  },
+  {
+    "topic": "Tier placement rules per VNF type",
+    "slice_type_tag": "all",
+    "content": "Each VNF type has permitted tiers that vary by slice type context. ran_edge: edge-close, latency-critical functions. Firewall (URLLC, V2X), vUPF (URLLC), IoTGateway (mMTC). mec: mid-tier general-purpose processing. Firewall (eMBB, URLLC, V2X, XR), CDN (eMBB), MediaProc (XR), V2XController (V2X), IoTGateway (mMTC), Aggregator (mMTC). regional_cloud: heavy compute workloads. vEPC (eMBB, V2X), CDN (eMBB, XR), MediaProc (XR), Analytics (mMTC), Aggregator (mMTC). central_cloud: centralized, delay-tolerant functions. vEPC (eMBB, XR), CDN (XR), Firewall (eMBB), Analytics (mMTC). The permitted_tiers list for a VNF must be drawn from the correct slice-type-specific template."
+  },
+  {
+    "topic": "SFC templates per slice type",
+    "slice_type_tag": "all",
+    "content": "eMBB chain: Firewall -> CDN -> vEPC (3 VNFs, may be shortened to 2). URLLC chain: Firewall -> vUPF (2 VNFs, always full length). mMTC chain: IoTGateway -> Aggregator -> Analytics (3 VNFs, may be shortened to 2). V2X chain: Firewall -> V2XController -> vEPC (3 VNFs, may be shortened to 2). XR chain: Firewall -> MediaProc -> CDN -> vEPC (4 VNFs, may be shortened to 2 or 3). Chains are always ordered from ingress to core. When shortened, only the first N VNFs are kept (minimum 2). The VNF ordering within a chain is fixed and must not be rearranged."
+  },
+  {
+    "topic": "QoS conventions and realistic ranges per slice type",
+    "slice_type_tag": "all",
+    "content": "Each slice type has a QoS profile defining valid ranges. eMBB: max_e2e_delay 20-100 ms, min_throughput 50-500 Mbps, per-flow bandwidth 50-200 Mbps. URLLC: max_e2e_delay 1-10 ms, min_throughput 10-100 Mbps, per-flow bandwidth 10-50 Mbps. mMTC: max_e2e_delay 50-500 ms, min_throughput 1-10 Mbps, per-flow bandwidth 1-10 Mbps. V2X: max_e2e_delay 5-20 ms, min_throughput 20-100 Mbps, per-flow bandwidth 20-80 Mbps. XR: max_e2e_delay 5-30 ms, min_throughput 100-1000 Mbps, per-flow bandwidth 100-500 Mbps. Values must fall within these ranges to be realistic."
+  },
+  {
+    "topic": "VCR and per-edge bandwidth calculation",
+    "slice_type_tag": "all",
+    "content": "Per-edge bandwidth is computed using the Volume Change Ratio (VCR) chain product. For a chain of VNFs f0, f1, ..., fN, the bandwidth on edge (fk, fk+1) equals beta_min * product(vcr(fj) for j in 0..k). beta_min is the base per-flow bandwidth drawn from the slice type QoS profile. Example: chain Firewall(VCR=1.0) -> MediaProc(VCR=1.2) -> CDN(VCR=0.7) with beta_min=100 Mbps yields edge f0->f1: 100*1.0=100 Mbps, edge f1->f2: 100*1.0*1.2=120 Mbps. VCR < 1.0 means the VNF compresses traffic (IoTGateway, Aggregator, CDN). VCR > 1.0 means expansion (MediaProc). VCR = 1.0 means pass-through (Firewall, vUPF, vEPC, Analytics)."
+  },
+  {
+    "topic": "Flow edge construction rules",
+    "slice_type_tag": "all",
+    "content": "Flow edges connect consecutive VNFs in the SFC chain. For a chain with N VNFs, there are exactly N-1 flow edges. Each flow edge has: source_vnf set to the vnf_id of VNF at position k, target_vnf set to vnf_id at position k+1, and bandwidth_demand computed via the VCR chain product formula. Flow edges must follow the chain ordering and must not skip VNFs or create branches. The vnf_id format is '{request_id}_f{index}' where index is the zero-based position in the chain."
+  },
+  {
+    "topic": "Common intent patterns for natural language mapping",
+    "slice_type_tag": "all",
+    "content": "Natural language intents map to slice types as follows. eMBB triggers: 'video streaming', 'HD video', 'file download', 'web browsing', 'high bandwidth', 'mobile broadband', 'content delivery'. URLLC triggers: 'remote surgery', 'industrial control', 'factory automation', 'ultra-low latency', 'mission critical', 'robotic control', 'haptic feedback'. mMTC triggers: 'sensor network', 'smart metering', 'IoT', 'thousands of devices', 'environmental monitoring', 'smart agriculture', 'asset tracking'. V2X triggers: 'autonomous driving', 'vehicle communication', 'platooning', 'traffic management', 'connected vehicles', 'cooperative awareness'. XR triggers: 'virtual reality', 'augmented reality', 'holographic', 'immersive', 'telepresence', '3D rendering', 'mixed reality'. When an intent combines aspects of multiple types, choose the type whose latency and throughput constraints are most restrictive for the use case."
+  },
+  {
+    "topic": "Anti-patterns in intent translation",
+    "slice_type_tag": "all",
+    "content": "Common mistakes to avoid: (1) Assigning cloud-only VNFs to ran_edge, e.g. placing vEPC or Analytics at ran_edge when their templates restrict them to regional_cloud or central_cloud. (2) Unrealistic QoS combinations, e.g. setting max_e2e_delay=2 ms for eMBB (valid range is 20-100 ms) or min_throughput=500 Mbps for mMTC (valid range is 1-10 Mbps). (3) Forgetting VCR for compression VNFs, e.g. setting IoTGateway VCR=1.0 instead of 0.3 or CDN VCR=1.0 instead of 0.7. (4) Reordering the VNF chain, e.g. placing CDN before Firewall in an eMBB chain. (5) Using VNF types that do not belong to the chosen slice type template, e.g. including MediaProc in an mMTC chain. (6) Setting bandwidth_demand on flow edges without applying the VCR chain product. (7) Producing fewer than 2 VNFs in a chain."
+  },
+  {
+    "topic": "eMBB intent translation details",
+    "slice_type_tag": "eMBB",
+    "content": "For eMBB intents, produce a chain of Firewall -> CDN -> vEPC (or shortened to Firewall -> CDN). Firewall: cpu 2-4, ram 2-8, intensity 0.8, VCR 1.0, tiers [mec, regional_cloud, central_cloud]. CDN: cpu 4-8, ram 8-16, intensity 1.2, VCR 0.7, tiers [mec, regional_cloud]. vEPC: cpu 4-8, ram 4-16, intensity 1.0, VCR 1.0, tiers [regional_cloud, central_cloud]. QoS: delay 20-100 ms, throughput 50-500 Mbps, per-flow BW 50-200 Mbps. The CDN VCR of 0.7 means downstream bandwidth drops by 30% after the CDN node."
+  },
+  {
+    "topic": "Latency-critical slice translation details for URLLC and V2X",
+    "slice_type_tag": "URLLC",
+    "content": "URLLC chain: Firewall -> vUPF. Both VNFs are restricted to ran_edge and mec tiers only. Firewall: cpu 1-2, ram 1-4, intensity 0.5, VCR 1.0. vUPF: cpu 2-4, ram 2-8, intensity 0.6, VCR 1.0. QoS: delay 1-10 ms, throughput 10-100 Mbps, per-flow BW 10-50 Mbps. V2X chain: Firewall -> V2XController -> vEPC. Firewall at ran_edge/mec (cpu 1-2, ram 1-4). V2XController at mec only (cpu 2-4, ram 4-8). vEPC at regional_cloud only (cpu 2-4, ram 2-8). V2X QoS: delay 5-20 ms, throughput 20-100 Mbps, per-flow BW 20-80 Mbps. Both URLLC and V2X demand edge-close placement; never assign their ingress VNFs to regional_cloud or central_cloud."
+  }
+]
