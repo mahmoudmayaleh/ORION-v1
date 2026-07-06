@@ -51,6 +51,23 @@ class PlanFragment:
 
 
 @dataclass
+class ActorStepRecord:
+    """Per-VNF placement inputs for PPO re-evaluation (CTDE).
+
+    Stored during collection so the PPO update can re-evaluate the action
+    under the current policy. graph_data and tensors are detached — they
+    are replay inputs, not part of the gradient graph.
+    """
+
+    graph_data: object                # PyG Data (detached)
+    vnf_context: torch.Tensor         # [VNF_CONTEXT_DIM]
+    action_mask: torch.Tensor         # [N] boolean
+    action_idx: int                   # chosen node (or DomainPolicy.NULL_ACTION)
+    log_prob: float                   # scalar log-prob at collection time
+    entropy: float
+
+
+@dataclass
 class DomainResponse:
     """Output of a domain actor after placement and routing.
 
@@ -68,6 +85,7 @@ class DomainResponse:
     actions: list[int] = field(default_factory=list)
     log_probs: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     entropy: float = 0.0
+    step_records: list[ActorStepRecord] = field(default_factory=list)
 
     @staticmethod
     def empty(domain_id: int) -> DomainResponse:

@@ -208,6 +208,36 @@ def check_plan(
         if src and dst:
             link_map[(src, dst)] = link
 
+    # Build domain reachability graph for multi-hop routing check.
+    # The checker validates that cross-domain flows can be routed through
+    # some path of inter-domain links, not just direct adjacency. The actual
+    # router finds multi-hop paths (e.g., d3→d2→d1) even when no direct
+    # d3→d1 link exists.
+    domain_ids = {d["domain_id"] for d in abstract_topology["domains"]}
+    domain_adj: dict[str, set[str]] = {d: set() for d in domain_ids}
+    for link in abstract_topology.get("inter_domain_links", []):
+        src = link.get("source_domain")
+        dst = link.get("target_domain")
+        if src and dst:
+            domain_adj.setdefault(src, set()).add(dst)
+            domain_adj.setdefault(dst, set()).add(src)
+
+    def domains_reachable(src_dom: str, dst_dom: str) -> bool:
+        """BFS reachability check on the domain-level graph."""
+        if src_dom == dst_dom:
+            return True
+        visited = {src_dom}
+        queue = [src_dom]
+        while queue:
+            current = queue.pop(0)
+            for neighbor in domain_adj.get(current, set()):
+                if neighbor == dst_dom:
+                    return True
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+        return False
+
     # Aggregate bandwidth demand per directed inter-domain link
     link_bw_demand: dict[tuple[str, str], float] = {}
 
@@ -246,27 +276,30 @@ def check_plan(
                 ),
             ))
 
-        # Inter-domain bandwidth checks
+        # Inter-domain reachability and bandwidth checks
         if actually_crosses:
-            pair = (src_domain, dst_domain)
-            if pair not in link_map:
+            if not domains_reachable(src_domain, dst_domain):
                 violations.append(Violation(
                     constraint="C5",
                     vnf_id=None,
                     detail=(
-                        f"No inter-domain link exists between "
-                        f"'{src_domain}' and '{dst_domain}' for flow "
+                        f"Domains '{src_domain}' and '{dst_domain}' are not "
+                        f"reachable via any inter-domain link path for flow "
                         f"{src_vnf}->{dst_vnf}."
                     ),
                 ))
             else:
-                link_bw_demand[pair] = link_bw_demand.get(pair, 0.0) + bw
+                # If direct link exists, accumulate BW demand for that link
+                pair = (src_domain, dst_domain)
+                if pair in link_map:
+                    link_bw_demand[pair] = link_bw_demand.get(pair, 0.0) + bw
 
-    # Check aggregate bandwidth per link
+    # Check aggregate bandwidth per direct link (BW check only on direct links;
+    # multi-hop BW feasibility is deferred to the actual router)
     for pair, demanded in link_bw_demand.items():
         link = link_map.get(pair)
         if link is None:
-            continue  # Already reported as missing
+            continue
         residual = link.get("bandwidth_residual_mbps", 0.0)
         if demanded > residual:
             violations.append(Violation(

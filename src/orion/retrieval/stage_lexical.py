@@ -35,13 +35,22 @@ class LexicalRetriever:
         self._corpus_tokens: list[list[str]] = []
 
     def build_index(self, documents: list[str]) -> None:
-        """Build BM25 index from document texts."""
+        """Build BM25 index from document texts.
+
+        Hard-fails if rank_bm25 is missing. A silent BM25 fallback degrades M^B
+        retrieval to recency-only (content-blind) without any error — the
+        project's recurring "component present but silently not firing" failure
+        mode. If BM25 is genuinely not wanted, set enable_bm25=False explicitly
+        so the intent is in the config, not an absent dependency.
+        """
         if not _bm25_available:
-            logger.warning(
-                "rank_bm25 not installed — Stage 3 (BM25) disabled. "
-                "Install with: pip install rank-bm25"
+            raise RuntimeError(
+                "rank_bm25 is not installed but BM25 retrieval is enabled — this "
+                "would silently degrade M^B retrieval to recency-only. Install the "
+                "retrieval extra: `uv pip install -e '.[retrieval]'` (or "
+                "`pip install rank-bm25`). To run without BM25 on purpose, set "
+                "RetrievalConfig(enable_bm25=False)."
             )
-            return
 
         self._corpus_tokens = [telecom_tokenize(doc) for doc in documents]
         self._bm25 = BM25Okapi(self._corpus_tokens)

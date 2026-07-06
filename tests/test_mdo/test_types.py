@@ -49,7 +49,7 @@ class TestRetryHistory:
         ])
         vecs = h.last_violation_vectors(2)
         assert len(vecs) == 2
-        assert vecs[0] == (False, True, False, False)
+        assert vecs[0] == (False, True, False, False, False)
 
     def test_num_attempts(self):
         h = RetryHistory(attempts=[
@@ -67,7 +67,7 @@ class TestPlanSummary:
 class TestViolationInfo:
     def test_violation_vector(self):
         v = ViolationInfo(c5b_violated=True, c9_violated=True)
-        assert v.violation_vector == (True, False, True, False)
+        assert v.violation_vector == (True, False, True, False, False)
         assert v.has_violation is True
 
     def test_no_violation(self):

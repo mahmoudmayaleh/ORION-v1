@@ -206,17 +206,18 @@ class TestBandwidthChecks:
         assert "overcommit" in c5_violations[0].detail
 
     def test_nonexistent_link_detected(self, slice_request, topology):
-        """f1(d0)->f2(d1) requires a d0->d1 link; remove it."""
+        """f1(d0)->f2(d1) requires d0-d1 reachability; isolate d0 completely."""
         topo = copy.deepcopy(topology)
+        # Remove ALL links involving d0 to make it truly unreachable
         topo["inter_domain_links"] = [
             l for l in topo["inter_domain_links"]
-            if l["link_id"] != "l_d0_d1"
+            if l["source_domain"] != "d0" and l["target_domain"] != "d0"
         ]
 
         plan = _valid_plan()
         result = check_plan(plan, slice_request, topo)
         assert not result.is_valid
-        assert any("No inter-domain link" in v.detail for v in result.violations)
+        assert any("not reachable" in v.detail for v in result.violations)
 
 
 # ── Tests: violation feedback for retry ──────────────────────────────────────

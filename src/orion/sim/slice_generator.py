@@ -52,12 +52,22 @@ _VNF_TEMPLATES: dict[SliceType, list[dict]] = {
     ],
 }
 
+# Per-slice-type QoS sampling ranges.
+#
+# `beta_in` is the slice's ingress data rate β_in (Mbps). The C5b throughput
+# floor and the per-flow demands β_{k,k+1} are BOTH derived from β_in via
+# v4 Eq. 3: β_{k,k+1} = β_in · ∏_{j=1}^{k} ρ_{f_j}. There is no independent
+# "throughput" requirement in the formulation — that would be a free variable
+# the model does not have. Older versions of this profile drew throughput
+# independently of beta_in; that bug let slices be born with
+# min_throughput > β_{k,k+1}, making C5b structurally unsatisfiable for
+# compressing VCRs (∏ρ < 1) and silently breaking acceptance-rate eval.
 _QOS_PROFILES: dict[SliceType, dict] = {
-    SliceType.EMBB:  {"delay": (20.0, 100.0), "throughput": (50.0, 500.0), "bw_per_flow": (50.0, 200.0)},
-    SliceType.URLLC: {"delay": (1.0, 10.0),   "throughput": (10.0, 100.0), "bw_per_flow": (10.0, 50.0)},
-    SliceType.MMTC:  {"delay": (50.0, 500.0), "throughput": (1.0, 10.0),   "bw_per_flow": (1.0, 10.0)},
-    SliceType.V2X:   {"delay": (5.0, 20.0),   "throughput": (20.0, 100.0), "bw_per_flow": (20.0, 80.0)},
-    SliceType.XR:    {"delay": (5.0, 30.0),   "throughput": (100.0, 1000.0), "bw_per_flow": (100.0, 500.0)},
+    SliceType.EMBB:  {"delay": (20.0, 100.0),  "beta_in": (50.0, 500.0)},
+    SliceType.URLLC: {"delay": (1.0, 10.0),    "beta_in": (10.0, 50.0)},
+    SliceType.MMTC:  {"delay": (50.0, 500.0),  "beta_in": (1.0, 10.0)},
+    SliceType.V2X:   {"delay": (5.0, 20.0),    "beta_in": (20.0, 80.0)},
+    SliceType.XR:    {"delay": (5.0, 30.0),    "beta_in": (100.0, 500.0)},
 }
 
 _SLICE_TYPE_WEIGHTS = {
@@ -104,7 +114,9 @@ def generate_slice_request(
     if slice_type is None:
         types = list(_SLICE_TYPE_WEIGHTS.keys())
         weights = [_SLICE_TYPE_WEIGHTS[t] for t in types]
-        slice_type = rng.choice(types, p=weights)
+        # rng.choice returns a numpy element (numpy.str_ for StrEnum); coerce
+        # back to a real SliceType so downstream `.value` access works.
+        slice_type = SliceType(rng.choice(types, p=weights))
 
     templates = _VNF_TEMPLATES[slice_type]
     qos_profile = _QOS_PROFILES[slice_type]
@@ -129,15 +141,18 @@ def generate_slice_request(
             vcr=tmpl["vcr"],
         ))
 
-    # Flow edges: VCR-scaled bandwidth per v4 Eq. 3
-    # beta_{k,k+1} = beta_min * prod_{j=1}^{k} rho_{f_j}
-    beta_min = float(rng.uniform(*qos_profile["bw_per_flow"]))
+    # Single source of truth for the slice's bandwidth: the ingress rate β_in.
+    # Per-edge flow demands AND the C5b throughput floor are both derived
+    # from it. This is what v4 Eq. 3 prescribes.
+    beta_in = float(rng.uniform(*qos_profile["beta_in"]))
+
     flow_edges: list[FlowEdge] = []
     for k in range(len(vnfs) - 1):
+        # β_{k,k+1} = β_in · ∏_{j=1}^{k+1} ρ_{f_j}  (v4 Eq. 3)
         vcr_product = 1.0
         for j in range(k + 1):
             vcr_product *= vnfs[j].vcr
-        bw = beta_min * vcr_product
+        bw = beta_in * vcr_product
         flow_edges.append(FlowEdge(
             source_vnf=vnfs[k].vnf_id,
             target_vnf=vnfs[k + 1].vnf_id,
@@ -145,7 +160,6 @@ def generate_slice_request(
         ))
 
     delay = float(rng.uniform(*qos_profile["delay"]))
-    throughput = float(rng.uniform(*qos_profile["throughput"]))
 
     return SliceRequest(
         request_id=request_id,
@@ -154,7 +168,10 @@ def generate_slice_request(
         flow_edges=flow_edges,
         qos=QoSRequirements(
             max_e2e_delay=round(delay, 1),
-            min_throughput=round(throughput, 1),
+            # min_throughput IS β_in. C5b is satisfied iff every flow's
+            # per-link allocation ≥ its derived β_{k,k+1} demand; the
+            # verifier checks under-allocation, not an independent threshold.
+            min_throughput=round(beta_in, 1),
         ),
         arrival_time=arrival_time,
         lifetime=lifetime,

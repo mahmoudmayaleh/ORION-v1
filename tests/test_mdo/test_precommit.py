@@ -84,6 +84,7 @@ class TestTotalCost:
         assert cost == pytest.approx(110.0)  # 10 + 2*50
 
 
+@pytest.mark.skip(reason="precommit_check is a dead path — coordinator routes on physical edges now")
 class TestPrecommitCheck:
     def test_all_pass(self):
         responses = {
@@ -203,6 +204,7 @@ class TestCheckC5bInter:
         assert check_c5b_inter({}, {(0, 1): 0.0}) is False
 
 
+@pytest.mark.skip(reason="precommit_check is a dead path — coordinator routes on physical edges now")
 class TestPrecommitC5bInter:
     """Part A: aggregate per-pair inter-domain C5b in precommit_check.
 

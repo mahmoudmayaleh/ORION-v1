@@ -21,6 +21,8 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
+from pydantic import BaseModel
+
 if TYPE_CHECKING:
     from orion.llm.episodic_memory import EpisodicMemory
     from orion.llm.semantic_memory import SemanticMemory
@@ -29,6 +31,45 @@ from orion.llm.llm_backend import LLMBackend, extract_json
 from orion.llm.structural_checker import CheckResult, check_plan
 
 logger = logging.getLogger("orion.llm.agent_b")
+
+
+# ── Output schema (grammar-constrained decoding) ─────────────────────────────
+# Passed to the LLM endpoint as a json_object *schema*; llama.cpp converts it to
+# a GBNF grammar and constrains decoding to exactly this structure. Format drift
+# (wrong/missing keys) becomes impossible by construction, so the structural
+# checker only ever sees well-formed JSON and validates *semantics*. This mirrors
+# the prompt's OUTPUT FORMAT block field-for-field.
+
+class _AssignmentSchema(BaseModel):
+    vnf_id: str
+    domain: str
+    required_tier: str
+    cpu_demand: float
+    ram_demand: float
+
+
+class _FlowSchema(BaseModel):
+    source_vnf: str
+    target_vnf: str
+    min_bandwidth_mbps: float
+    crosses_domain_boundary: bool
+
+
+class AgentBPlanSchema(BaseModel):
+    plan_id: str
+    vnf_assignments: list[_AssignmentSchema]
+    flow_requirements: list[_FlowSchema]
+
+
+AGENT_B_PLAN_JSON_SCHEMA = AgentBPlanSchema.model_json_schema()
+
+
+class PlanTruncationError(ValueError):
+    """Raised when the completion hit the context window (finish_reason=length)
+    rather than closing naturally. Subclasses ValueError so existing parse-error
+    handling still catches it, but lets callers count truncation distinctly from
+    a genuine malformed-JSON parse failure (Amendment 3)."""
+
 
 # ── System prompt ────────────────────────────────────────────────────────────
 
@@ -77,9 +118,7 @@ OUTPUT FORMAT — respond ONLY with a single JSON object:
       "min_bandwidth_mbps": <float>,
       "crosses_domain_boundary": <true|false>
     }
-  ],
-  "rationale": "<paragraph: for each domain, show CPU arithmetic and \
-explain why co-location was chosen or rejected>"
+  ]
 }
 
 Output only the JSON, no prose."""
@@ -184,8 +223,31 @@ class AgentB:
             slice_request, abstract_topology,
             few_shot_examples, violation_feedback, reference_knowledge,
         )
-        raw = self.llm.complete(self.system_prompt, user_msg)
-        return extract_json(raw)
+        raw = self.llm.complete(
+            self.system_prompt, user_msg,
+            response_format={"type": "json_object", "schema": AGENT_B_PLAN_JSON_SCHEMA},
+        )
+        # Distinguish context-window truncation from a genuine parse failure:
+        # a truncated grammar-constrained completion is cut-off JSON, but the
+        # cause (prompt too large for n_ctx) and the fix are entirely different.
+        if getattr(self.llm, "last_finish_reason", None) == "length":
+            raise PlanTruncationError(
+                "Agent B completion truncated at n_ctx "
+                f"(prompt_tokens={getattr(self.llm, 'last_prompt_tokens', None)}, "
+                f"n_ctx={getattr(self.llm.config, 'n_ctx', None)})"
+            )
+        plan = extract_json(raw)
+        # Defensive secondary check (v6.5): with grammar-constrained decoding this
+        # must already hold. If it ever fires, the constrained path has regressed —
+        # log loudly rather than silently repair the model's output.
+        try:
+            AgentBPlanSchema.model_validate(plan)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "agent_b_schema_defensive_fired",
+                extra={"error": str(exc)[:200]},
+            )
+        return plan
 
     def generate_and_check(
         self,
@@ -213,6 +275,10 @@ class AgentB:
             if all retries exhausted — the caller must check result.is_valid.
         """
         violation_feedback = None
+        # Fence: grammar-constrained decoding makes a JSON parse failure
+        # unreachable, but initialise so the parse-failure branch can never
+        # return an unbound `plan` (the former UnboundLocalError at max_retries=0).
+        plan: dict = {}
 
         for attempt in range(1 + max_retries):
             try:
@@ -220,6 +286,17 @@ class AgentB:
                     slice_request, abstract_topology,
                     few_shot_examples, violation_feedback, reference_knowledge,
                 )
+            except PlanTruncationError as exc:
+                # Context-window exhaustion, NOT malformed output. Counted
+                # distinctly so an arm-asymmetric truncation regression is
+                # visible in results rather than hiding as a parse failure.
+                logger.warning(
+                    "agent_b_completion_truncated",
+                    extra={"attempt": attempt + 1, "detail": str(exc)[:200]},
+                )
+                result = CheckResult(is_valid=False, violations=[])
+                violation_feedback = "Your previous response was cut off. Respond with a single, complete, minimal JSON object."
+                continue
             except ValueError:
                 logger.warning(
                     "agent_b_json_parse_failed",

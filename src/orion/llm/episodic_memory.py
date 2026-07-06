@@ -1,8 +1,18 @@
-"""Episodic memory M^B for Agent B — past placement experiences.
+"""Episodic memory M^B for Agent B — plan-layer adaptation memory.
 
-Records successful and failed placement plans with their outcomes.
-Retrieval uses the same hybrid pipeline with recency weighting enabled.
-Selective write: only records episodes with significant learning signal.
+Records plan-layer decisions and their survival outcomes against topology
+signatures. M^B learns which tier assignments and plan shapes survive on
+which topology families — the mechanism for cross-topology adaptation.
+
+Schema (repointed 2026-07-02):
+  Primary record: (topology_signature, slice_spec, plan_shape, survival, violation_tag)
+  plan_shape includes: strategy label, tier assignment, cut points, inter-domain links
+  Violation tags: C5b and C7 are first-class
+  Retrieval keyed on topology signature + slice spec features
+
+Routing-critical recoveries store split structure and inter-domain links used,
+since that is precisely what distinguishes them from search failures and what
+retrieval needs to reproduce them on similar topology signatures.
 """
 
 from __future__ import annotations
@@ -59,44 +69,76 @@ class EpisodicMemory:
         m_committed: float,
         constraints_violated: list[str],
         reward: float,
+        topology_signature: dict[str, Any] | None = None,
+        plan_shape: dict[str, Any] | None = None,
+        violation_tag: str | None = None,
     ) -> bool:
         """Record an episode if it carries significant learning signal.
 
-        Selective write criteria:
-          - High reward (success worth remembering)
-          - Constraint violations (failure to learn from)
-          - Unusual slice characteristics
+        Args:
+            slice_spec: Slice request features (type, VNF count, tier requirements).
+            plan: The placement plan produced by Agent B.
+            m_committed: Committed cost of the plan.
+            constraints_violated: List of constraint codes that fired.
+            reward: Terminal reward for this episode.
+            topology_signature: Topology features for retrieval keying
+                (tier coverage, CPU/domain, inter-BW stats, connectivity).
+            plan_shape: Plan strategy details for routing-critical recoveries:
+                - strategy: "co-locate" | "split"
+                - tier_assignment: per-VNF tier labels
+                - cut_points: which VNF pairs cross domains
+                - inter_domain_links: link IDs used for cross-domain flows
+            violation_tag: First-class violation label (e.g., "C5b", "C7",
+                "actor_infeasible"). None for successful admissions.
 
         Returns:
             True if the episode was recorded.
         """
-        # Selective write: only record if strong signal
         if not self._should_record(reward, constraints_violated):
             return False
 
         success = len(constraints_violated) == 0 and reward > 0
         label = "success" if success else "failure"
 
-        content_parts = [
-            f"Slice: {json.dumps(slice_spec, default=str)}",
-            f"Plan: {json.dumps(plan, default=str)}",
-            f"Reward: {reward:.4f}",
-            f"Committed cost: {m_committed:.2f}",
-        ]
+        content_parts = []
+
+        # Topology signature (primary retrieval key)
+        if topology_signature:
+            content_parts.append(f"Topology: {json.dumps(topology_signature, default=str)}")
+
+        content_parts.append(f"Slice: {json.dumps(slice_spec, default=str)}")
+
+        # Plan shape (strategy, tier assignment, cut points, inter-domain links)
+        if plan_shape:
+            content_parts.append(f"PlanShape: {json.dumps(plan_shape, default=str)}")
+        content_parts.append(f"Plan: {json.dumps(plan, default=str)}")
+
+        content_parts.append(f"Reward: {reward:.4f}")
+        content_parts.append(f"Committed cost: {m_committed:.2f}")
+
         if constraints_violated:
             content_parts.append(f"Violations: {', '.join(constraints_violated)}")
+        if violation_tag:
+            content_parts.append(f"ViolationTag: {violation_tag}")
 
         topic = f"{label}: {slice_spec.get('slice_type', 'unknown')} placement"
         content = "\n".join(content_parts)
+
+        # Tags for filtering — violation type is first-class
+        tags: dict[str, list[str]] = {
+            "label": [label],
+            "slice_type": [slice_spec.get("slice_type", "unknown")],
+        }
+        if violation_tag:
+            tags["violation"] = [violation_tag]
+        if plan_shape and plan_shape.get("strategy"):
+            tags["strategy"] = [plan_shape["strategy"]]
 
         entry = MemoryEntry(
             entry_id=str(uuid.uuid4()),
             topic=topic,
             content=content,
-            tags={
-                "label": [label],
-                "slice_type": [slice_spec.get("slice_type", "unknown")],
-            },
+            tags=tags,
             created_at=datetime.now(),
             last_accessed_at=datetime.now(),
         )
@@ -104,7 +146,6 @@ class EpisodicMemory:
         self._entries.append(entry)
         self._pipeline.add_entry(entry)
 
-        # Evict if over capacity
         if len(self._entries) > self._max_entries:
             self._evict()
 
@@ -157,29 +198,33 @@ class EpisodicMemory:
     def to_few_shot(self, entries: list[ScoredEntry]) -> list[dict]:
         """Convert retrieved episodes to Agent B's few-shot format.
 
-        Parses the stored content to extract slice_spec and plan dicts.
-        Entries that fail to parse are skipped.
+        Parses the stored content to extract slice_spec, plan, plan_shape,
+        topology signature, and violation info. Entries that fail to parse
+        are skipped.
         """
         results: list[dict] = []
         for se in entries:
             try:
-                slice_dict = None
-                plan_dict = None
+                parsed: dict[str, Any] = {}
                 for line in se.entry.content.splitlines():
-                    if line.startswith("Slice: "):
-                        slice_dict = json.loads(line[len("Slice: "):])
+                    if line.startswith("Topology: "):
+                        parsed["topology"] = json.loads(line[len("Topology: "):])
+                    elif line.startswith("Slice: "):
+                        parsed["slice_request"] = json.loads(line[len("Slice: "):])
+                    elif line.startswith("PlanShape: "):
+                        parsed["plan_shape"] = json.loads(line[len("PlanShape: "):])
                     elif line.startswith("Plan: "):
-                        plan_dict = json.loads(line[len("Plan: "):])
-                if slice_dict is None or plan_dict is None:
+                        parsed["placement_plan"] = json.loads(line[len("Plan: "):])
+                    elif line.startswith("ViolationTag: "):
+                        parsed["violation_tag"] = line[len("ViolationTag: "):]
+
+                if "slice_request" not in parsed or "placement_plan" not in parsed:
                     logger.warning(
                         "to_few_shot_missing_fields",
                         extra={"entry_id": se.entry.entry_id},
                     )
                     continue
-                results.append({
-                    "slice_request": slice_dict,
-                    "placement_plan": plan_dict,
-                })
+                results.append(parsed)
             except (json.JSONDecodeError, AttributeError) as exc:
                 logger.warning(
                     "to_few_shot_parse_failed",
@@ -205,6 +250,53 @@ class EpisodicMemory:
 
         self._entries = [MemoryEntry(**d) for d in data]
         self._pipeline.build(self._entries)
+
+    def _create_entry(
+        self,
+        slice_spec: dict[str, Any],
+        plan: dict[str, Any],
+        m_committed: float,
+        constraints_violated: list[str],
+        reward: float,
+        topology_signature: dict[str, Any] | None = None,
+        plan_shape: dict[str, Any] | None = None,
+        violation_tag: str | None = None,
+    ) -> MemoryEntry:
+        """Create a MemoryEntry without filtering. Used by FIFO write-all."""
+        success = len(constraints_violated) == 0 and reward > 0
+        label = "success" if success else "failure"
+
+        content_parts = []
+        if topology_signature:
+            content_parts.append(f"Topology: {json.dumps(topology_signature, default=str)}")
+        content_parts.append(f"Slice: {json.dumps(slice_spec, default=str)}")
+        if plan_shape:
+            content_parts.append(f"PlanShape: {json.dumps(plan_shape, default=str)}")
+        content_parts.append(f"Plan: {json.dumps(plan, default=str)}")
+        content_parts.append(f"Reward: {reward:.4f}")
+        content_parts.append(f"Committed cost: {m_committed:.2f}")
+        if constraints_violated:
+            content_parts.append(f"Violations: {', '.join(constraints_violated)}")
+        if violation_tag:
+            content_parts.append(f"ViolationTag: {violation_tag}")
+
+        tags: dict[str, list[str]] = {
+            "label": [label],
+            "slice_type": [slice_spec.get("slice_type", "unknown")],
+        }
+        if violation_tag:
+            tags["violation"] = [violation_tag]
+        if plan_shape and plan_shape.get("strategy"):
+            tags["strategy"] = [plan_shape["strategy"]]
+
+        return MemoryEntry(
+            entry_id=str(uuid.uuid4()),
+            topic=f"{label}: {slice_spec.get('slice_type', 'unknown')} placement",
+            content="\n".join(content_parts),
+            tags=tags,
+            created_at=datetime.now(),
+            last_accessed_at=datetime.now(),
+        )
 
     def _should_record(self, reward: float, violations: list[str]) -> bool:
         """Determine if an episode has enough learning signal to store."""

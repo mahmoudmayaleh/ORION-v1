@@ -105,6 +105,7 @@ class ViolationInfo:
     c7_violated: bool = False
     c9_violated: bool = False
     actor_infeasible: bool = False  # any z^m = 0
+    cross_domain_infeasible: bool = False
     e2e_delay: float = 0.0
     e2e_budget: float = 0.0
     total_bw: float = 0.0
@@ -113,9 +114,12 @@ class ViolationInfo:
     max_inter_domain_hops: int = 0
 
     @property
-    def violation_vector(self) -> tuple[bool, bool, bool, bool]:
-        """(C5b, C7, C9, actor_infeasible) for stability detection."""
-        return (self.c5b_violated, self.c7_violated, self.c9_violated, self.actor_infeasible)
+    def violation_vector(self) -> tuple[bool, ...]:
+        """(C5b, C7, C9, actor_infeasible, cross_domain_infeasible) for stability detection."""
+        return (
+            self.c5b_violated, self.c7_violated, self.c9_violated,
+            self.actor_infeasible, self.cross_domain_infeasible,
+        )
 
     @property
     def has_violation(self) -> bool:
@@ -132,6 +136,8 @@ class PartitionAttempt:
     e2e_delay: float = 0.0
     total_cost: float = 0.0
     value_estimate: float = 0.0  # V^MDO_ψ output
+    log_probs: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
+    entropy: float = 0.0
 
 
 @dataclass
@@ -180,6 +186,8 @@ class MDOResult:
     admitted: bool
     partition: list[int] | None = None  # final committed partition
     domain_responses: dict[int, DomainResponse] = field(default_factory=dict)
+    cross_domain_routes: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    cross_domain_bw: dict[tuple[str, str], float] = field(default_factory=dict)
     e2e_delay: float = 0.0
     total_cost: float = 0.0
     reward: RewardComponents = field(default_factory=RewardComponents)
@@ -188,6 +196,9 @@ class MDOResult:
     log_probs: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     entropy: float = 0.0
     value_estimate: float = 0.0
+    obs_tensor: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
+    tier_mask: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
+    num_vnfs: int = 0
 
 
 # --- Population-level strategy monitor types (logic deferred to Phase 5) ---

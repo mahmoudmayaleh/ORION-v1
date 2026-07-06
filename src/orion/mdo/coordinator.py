@@ -24,10 +24,16 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from torch.distributions import Categorical
 
 if TYPE_CHECKING:
     from orion.actors.domain_actor import DomainActor
 
+from orion.actors.routing import (
+    allocate_route_bw,
+    deallocate_route_bw,
+    route_cross_domain_flow,
+)
 from orion.actors.types import DomainResponse, PlanFragment, VNFAssignment
 from orion.mdo.observation import (
     build_mdo_observation,
@@ -35,10 +41,6 @@ from orion.mdo.observation import (
     observation_to_tensor,
 )
 from orion.mdo.policy import MDOPolicy
-from orion.mdo.precommit_check import (
-    inter_domain_residual_by_pair,
-    precommit_check,
-)
 from orion.mdo.rejection import check_rejection_triggers
 from orion.mdo.types import (
     MDOAction,
@@ -48,9 +50,10 @@ from orion.mdo.types import (
     RejectReason,
     RetryHistory,
     RewardComponents,
+    ViolationInfo,
 )
 from orion.substrate.graph_model import SubstrateNetwork
-from orion.types import QoSRequirements, SliceRequest
+from orion.types import FlowEdge, QoSRequirements, SliceRequest
 
 logger = logging.getLogger(__name__)
 
@@ -125,20 +128,17 @@ class MDOCoordinator:
         bw_demands = plan.bw_demands
         cfg = self.config
 
-        # Inter-domain C5b residual source (aggregate per domain-pair).
-        # Built once per arrival: inter-domain reservation happens at COMMIT
-        # (slice departure releases it — Phase 5), so the residual is constant
-        # across this arrival's retry loop.
-        # SCAFFOLD (Part B): replace this substrate-derived aggregate with the
-        # live per-pair residual counter that the reserve/release path
-        # maintains and the observation also reads. See _reserve_inter_domain_bw
-        # and docs/c5b_inter_domain_changeset.md.
-        inter_domain_residuals = inter_domain_residual_by_pair(
-            obs_struct.inter_domain_links,
-        )
+        # Map canonical indices (policy output) to actual domain IDs.
+        # Domain summaries are sorted by (tier_type, domain_id), so
+        # canonical index i corresponds to domain_summaries[i].domain_id.
+        canonical_to_domain = [
+            s.domain_id for s in obs_struct.domain_summaries
+        ]
 
         committed_partition: list[int] | None = None
         committed_responses: dict[int, DomainResponse] = {}
+        committed_cross_routes: dict[tuple[str, str], list[str]] = {}
+        committed_cross_bw: dict[tuple[str, str], float] = {}
         committed_e2e = 0.0
         committed_cost = 0.0
         final_action = MDOAction.REJECT
@@ -148,60 +148,137 @@ class MDOCoordinator:
         last_value = 0.0
 
         for j in range(cfg.n_part):
-            # --- Sample partition ---
-            partition, log_probs, _logits, entropy, value = self._sample_partition(
+            # --- Sample partition (canonical indices) ---
+            partition_canonical, log_probs, _logits, entropy, value = self._sample_partition(
                 obs_tensor, tier_mask, plan, mode,
+                canonical_to_domain=canonical_to_domain,
             )
             all_log_probs.append(log_probs)
             all_entropy += entropy
             last_value = value
 
+            # Map canonical indices to actual domain IDs
+            partition = [canonical_to_domain[c] for c in partition_canonical]
+
+            # --- Snapshot substrate CPU/RAM before actor dispatch ---
+            node_snapshot = self._snapshot_node_residuals(substrate, partition)
+
             # --- Split into PlanFragments and dispatch ---
-            fragments = self._build_fragments(plan, partition, slice_req)
+            fragments, cross_domain_flows = self._build_fragments(
+                plan, partition, slice_req,
+            )
             responses = self._dispatch_to_actors(substrate, fragments)
 
-            # --- Pre-commit check ---
-            passes, violation, e2e, cost = precommit_check(
-                partition=partition,
-                domain_responses=responses,
-                inter_domain_delays=inter_domain_delays,
-                qos=slice_req.qos,
-                bw_demands=bw_demands,
+            # --- Route cross-domain flows on full graph ---
+            actor_infeasible = any(
+                not r.feasible for r in responses.values()
+            )
+            cross_feasible = True
+            cross_routes: dict[tuple[str, str], list[str]] = {}
+            cross_bw: dict[tuple[str, str], float] = {}
+            cross_delay = 0.0
+            cross_hops = 0
+
+            if not actor_infeasible and cross_domain_flows:
+                intra_delay = sum(
+                    r.intra_delay for r in responses.values()
+                )
+                remaining_delay = slice_req.qos.max_e2e_delay - intra_delay
+                (
+                    cross_feasible, cross_routes, cross_bw,
+                    cross_delay, cross_hops,
+                ) = self._route_cross_domain_flows(
+                    substrate, cross_domain_flows, responses,
+                    delay_budget=remaining_delay,
+                )
+
+            # --- Build violation info from actual routing ---
+            intra_delay = sum(r.intra_delay for r in responses.values())
+            e2e = intra_delay + cross_delay
+            inter_bw = sum(cross_bw.values())
+            # Intra-domain routes use subgraph(domain_set) — no inter-domain
+            # edges. All inter-domain hops come from cross-domain routing.
+            total_inter_hops = cross_hops
+
+            violation = ViolationInfo(
+                c7_violated=e2e > slice_req.qos.max_e2e_delay,
+                c9_violated=total_inter_hops > cfg.max_inter_domain_hops,
+                actor_infeasible=actor_infeasible,
+                cross_domain_infeasible=not cross_feasible,
+                e2e_delay=e2e,
+                e2e_budget=slice_req.qos.max_e2e_delay,
+                total_bw=inter_bw,
+                min_bw=slice_req.qos.min_throughput,
+                inter_domain_hops=total_inter_hops,
                 max_inter_domain_hops=cfg.max_inter_domain_hops,
-                gamma_inter=cfg.gamma_inter,
-                inter_domain_residuals=inter_domain_residuals,
             )
 
+            passes = not violation.has_violation
+
+            # Compute cost
+            intra_cost = sum(r.resource_cost for r in responses.values())
+            cost = intra_cost + cfg.gamma_inter * inter_bw
+
             # --- Record attempt ---
+            # Store canonical partition for PPO re-evaluation (policy space).
             attempt = PartitionAttempt(
                 trial_index=j,
-                partition=partition,
+                partition=partition_canonical,
                 domain_responses=responses,
                 violation=violation if not passes else None,
                 e2e_delay=e2e,
                 total_cost=cost,
                 value_estimate=value,
+                log_probs=log_probs.detach(),
+                entropy=entropy,
             )
             history.attempts.append(attempt)
 
             if passes:
-                # COMMIT
+                # Frame-consistency asserts: certify canonical↔domain-ID
+                # round-trip and tier feasibility at the dispatch site.
+                domain_to_canonical = {d: i for i, d in enumerate(canonical_to_domain)}
+                roundtrip = [domain_to_canonical[d] for d in partition]
+                assert roundtrip == partition_canonical, (
+                    f"Canonical round-trip failed: {partition_canonical} -> "
+                    f"{partition} -> {roundtrip}"
+                )
+                domain_tiers = {
+                    s.domain_id: s.supported_tiers
+                    for s in obs_struct.domain_summaries
+                }
+                for k, domain_id in enumerate(partition):
+                    required = plan.required_tiers[k]
+                    assert required in domain_tiers.get(domain_id, []), (
+                        f"VNF {k} requires {required} but domain {domain_id} "
+                        f"supports {domain_tiers.get(domain_id, [])}"
+                    )
+
+                # COMMIT — restore substrate to pre-dispatch state.
+                # The episode runner's allocate() applies the definitive
+                # allocation from the PlacementPlan (which now includes
+                # cross-domain routes). Undo all provisional mutations.
+                self._restore_node_residuals(substrate, node_snapshot)
+                for resp in responses.values():
+                    if resp.feasible:
+                        self._rollback_domain(substrate, resp)
+                self._rollback_cross_domain(substrate, cross_routes, cross_bw)
+
                 final_action = MDOAction.COMMIT
                 committed_partition = partition
                 committed_responses = responses
+                committed_cross_routes = cross_routes
+                committed_cross_bw = cross_bw
                 committed_e2e = e2e
                 committed_cost = cost
-                # Reserve inter-domain bandwidth for the committed partition.
-                # SCAFFOLD (Part B) — currently a no-op; see method docstring.
-                self._reserve_inter_domain_bw(substrate, partition, bw_demands)
                 break
 
             # --- Rollback substrate state ---
-            # Domain actors handle their own rollback on infeasible results,
-            # but committed BW/CPU needs rollback for feasible-but-failed-precommit
+            self._restore_node_residuals(substrate, node_snapshot)
             for resp in responses.values():
                 if resp.feasible:
                     self._rollback_domain(substrate, resp)
+            self._rollback_cross_domain(substrate, cross_routes, cross_bw)
 
             # --- Check rejection triggers ---
             reject_reason = check_rejection_triggers(
@@ -242,6 +319,8 @@ class MDOCoordinator:
             admitted=admitted,
             partition=committed_partition,
             domain_responses=committed_responses,
+            cross_domain_routes=committed_cross_routes,
+            cross_domain_bw=committed_cross_bw,
             e2e_delay=committed_e2e,
             total_cost=committed_cost,
             reward=reward,
@@ -250,6 +329,9 @@ class MDOCoordinator:
             log_probs=stacked,
             entropy=all_entropy / max(history.num_attempts, 1),
             value_estimate=last_value,
+            obs_tensor=obs_tensor.detach(),
+            tier_mask=tier_mask.detach(),
+            num_vnfs=plan.num_vnfs,
         )
 
     def _sample_partition(
@@ -258,16 +340,25 @@ class MDOCoordinator:
         tier_mask: torch.Tensor,
         plan: PlanSummary,
         mode: str,
+        canonical_to_domain: list[int] | None = None,
     ) -> tuple[list[int], torch.Tensor, torch.Tensor, float, float]:
         """Sample a partition using the specified mode.
 
-        Returns: (partition, log_probs, logits, entropy, value_estimate)
+        Returns: (partition_canonical, log_probs, logits, entropy, value_estimate)
+        All partition outputs use canonical indices (policy space). The caller
+        maps to actual domain IDs via canonical_to_domain.
         """
         K = plan.num_vnfs
         M = tier_mask.shape[1]
 
         if mode == "follow_prior":
-            partition = list(plan.suggested_domains)
+            # Convert domain IDs to canonical indices
+            domain_to_canonical = {}
+            if canonical_to_domain:
+                domain_to_canonical = {d: i for i, d in enumerate(canonical_to_domain)}
+            partition = [
+                domain_to_canonical.get(d, d) for d in plan.suggested_domains
+            ]
             log_probs = torch.zeros(K)
             logits = torch.zeros(K, M)
             return partition, log_probs, logits, 0.0, 0.0
@@ -288,6 +379,9 @@ class MDOCoordinator:
         if self.policy is None:
             raise ValueError(f"Policy required for mode '{mode}' but is None")
 
+        if mode == "sequential_argmax":
+            return self._sequential_argmax(obs_tensor, tier_mask, K)
+
         deterministic = mode == "deterministic"
         with torch.no_grad() if deterministic else torch.enable_grad():
             partition, log_probs, logits, entropy = self.policy(
@@ -297,15 +391,75 @@ class MDOCoordinator:
 
         return partition, log_probs, logits, entropy, value
 
+    def _sequential_argmax(
+        self,
+        obs_tensor: torch.Tensor,
+        tier_mask: torch.Tensor,
+        num_vnfs: int,
+    ) -> tuple[list[int], torch.Tensor, torch.Tensor, float, float]:
+        """Capacity-aware sequential argmax: decode VNFs in order, penalizing
+        domains already loaded by prior VNFs of this slice.
+
+        Uses the trained policy's logits but decodes autoregressively at
+        inference time. No retraining. Discriminates "policy preferences are
+        useful but independent argmax destroys them" from "policy has no
+        useful preferences."
+        """
+        assert self.policy is not None
+        with torch.no_grad():
+            if obs_tensor.dim() == 1:
+                obs_tensor_b = obs_tensor.unsqueeze(0)
+            else:
+                obs_tensor_b = obs_tensor
+            h = self.policy.encoder(obs_tensor_b)
+            raw = self.policy.actor_head(h).view(
+                -1, self.policy.max_vnfs, self.policy.num_domains,
+            ).squeeze(0)
+            logits = raw[:num_vnfs]
+
+            neg_inf = torch.tensor(float("-inf"), dtype=logits.dtype)
+            masked = torch.where(tier_mask[:num_vnfs], logits, neg_inf)
+
+            M = self.policy.num_domains
+            domain_count = [0] * M
+            partition = []
+            log_prob_list = []
+            entropy_sum = 0.0
+
+            for k in range(num_vnfs):
+                adjusted = masked[k].clone()
+                for m in range(M):
+                    if adjusted[m] != float("-inf"):
+                        adjusted[m] -= 2.0 * domain_count[m]
+                dist = Categorical(logits=adjusted)
+                action = adjusted.argmax()
+                partition.append(action.item())
+                log_prob_list.append(dist.log_prob(action))
+                entropy_sum += dist.entropy().item()
+                domain_count[action.item()] += 1
+
+            log_probs = torch.stack(log_prob_list)
+            entropy = entropy_sum / num_vnfs if num_vnfs > 0 else 0.0
+            value = self.policy.get_value(obs_tensor).item()
+
+        return partition, log_probs, logits, entropy, value
+
     def _build_fragments(
         self,
         plan: PlanSummary,
         partition: list[int],
         slice_req: SliceRequest,
-    ) -> dict[int, PlanFragment]:
-        """Split the abstract plan into per-domain PlanFragments."""
+    ) -> tuple[dict[int, PlanFragment], list[FlowEdge]]:
+        """Split the abstract plan into per-domain PlanFragments.
+
+        Returns:
+            (fragments, cross_domain_flows) — fragments for domain actors,
+            plus cross-domain flows that the coordinator routes on the full
+            graph after actor dispatch.
+        """
         fragments: dict[int, list[VNFAssignment]] = {}
         domain_flows: dict[int, list[FlowEdge]] = {}
+        cross_domain_flows: list[FlowEdge] = []
 
         for k, vnf in enumerate(slice_req.vnfs):
             domain_id = partition[k]
@@ -313,7 +467,6 @@ class MDOCoordinator:
                 fragments[domain_id] = []
                 domain_flows[domain_id] = []
 
-            # Determine adjacent domains for border-node awareness
             adj_domains: set[int] = set()
             if k > 0 and partition[k - 1] != domain_id:
                 adj_domains.add(partition[k - 1])
@@ -338,7 +491,6 @@ class MDOCoordinator:
             )
             fragments[domain_id].append(assignment)
 
-        # Build intra-domain flows
         for fe in slice_req.flow_edges:
             src_idx = next(
                 i for i, v in enumerate(slice_req.vnfs) if v.vnf_id == fe.source_vnf
@@ -351,8 +503,9 @@ class MDOCoordinator:
                 if domain_id not in domain_flows:
                     domain_flows[domain_id] = []
                 domain_flows[domain_id].append(fe)
+            else:
+                cross_domain_flows.append(fe)
 
-        # Assemble PlanFragments
         result: dict[int, PlanFragment] = {}
         all_domains = set(partition)
         for domain_id in all_domains:
@@ -371,7 +524,7 @@ class MDOCoordinator:
                 target_domain_ids=target_doms,
             )
 
-        return result
+        return result, cross_domain_flows
 
     def _dispatch_to_actors(
         self,
@@ -393,60 +546,135 @@ class MDOCoordinator:
 
         return responses
 
+    def _snapshot_node_residuals(
+        self,
+        substrate: SubstrateNetwork,
+        partition: list[int],
+    ) -> dict[str, tuple[float, float]]:
+        """Snapshot CPU/RAM residuals for all nodes in domains touched by the partition."""
+        domains = set(partition)
+        snapshot: dict[str, tuple[float, float]] = {}
+        g = substrate.graph
+        for d in domains:
+            for nid in substrate.nodes_in_domain(d):
+                snapshot[nid] = (g.nodes[nid]["cpu_residual"], g.nodes[nid]["ram_residual"])
+        return snapshot
+
+    def _restore_node_residuals(
+        self,
+        substrate: SubstrateNetwork,
+        snapshot: dict[str, tuple[float, float]],
+    ) -> None:
+        """Restore CPU/RAM residuals from a snapshot."""
+        g = substrate.graph
+        for nid, (cpu, ram) in snapshot.items():
+            g.nodes[nid]["cpu_residual"] = cpu
+            g.nodes[nid]["ram_residual"] = ram
+
+    def _route_cross_domain_flows(
+        self,
+        substrate: SubstrateNetwork,
+        cross_domain_flows: list[FlowEdge],
+        responses: dict[int, DomainResponse],
+        delay_budget: float,
+    ) -> tuple[
+        bool,
+        dict[tuple[str, str], list[str]],
+        dict[tuple[str, str], float],
+        float,
+        int,
+    ]:
+        """Route cross-domain flows on the full substrate graph.
+
+        Called after domain actors have placed VNFs and routed intra-domain
+        flows. Uses the actual VNF placements from domain responses to
+        determine src/dst nodes, then routes each cross-domain flow on the
+        full directed graph (multi-hop through transit domains).
+
+        Provisionally debits BW on routed edges so subsequent flows in the
+        same partition see updated residuals. On failure, the caller must
+        rollback all provisional debits.
+
+        Args:
+            substrate: Current substrate state (actors already mutated it).
+            cross_domain_flows: Flows between VNFs in different domains.
+            responses: Domain actor responses with VNF placements.
+            delay_budget: Remaining delay budget after intra-domain routing.
+
+        Returns:
+            (feasible, routes, bw_allocated, total_delay, inter_hops)
+        """
+        all_placements: dict[str, str] = {}
+        for resp in responses.values():
+            all_placements.update(resp.placements)
+
+        routes: dict[tuple[str, str], list[str]] = {}
+        bw_allocated: dict[tuple[str, str], float] = {}
+        total_delay = 0.0
+        inter_hops = 0
+        remaining_delay = delay_budget
+
+        for fe in cross_domain_flows:
+            src_node = all_placements.get(fe.source_vnf)
+            dst_node = all_placements.get(fe.target_vnf)
+            if src_node is None or dst_node is None:
+                return False, {}, {}, 0.0, 0
+
+            result = route_cross_domain_flow(
+                substrate, src_node, dst_node,
+                bw_demand=fe.bandwidth_demand,
+                delay_budget=remaining_delay,
+            )
+
+            if not result.feasible:
+                # Rollback all previously allocated cross-domain BW
+                for prev_key, prev_bw in bw_allocated.items():
+                    prev_links = routes[prev_key]
+                    deallocate_route_bw(substrate, prev_links, prev_bw)
+                return False, {}, {}, 0.0, 0
+
+            flow_key = (fe.source_vnf, fe.target_vnf)
+            routes[flow_key] = result.path_links
+            bw_allocated[flow_key] = fe.bandwidth_demand
+            total_delay += result.propagation_delay
+            remaining_delay -= result.propagation_delay
+
+            # Count inter-domain hops on this path
+            g = substrate.graph
+            for link_id in result.path_links:
+                for u, v, d in g.edges(data=True):
+                    if d["link_id"] == link_id:
+                        if g.nodes[u]["domain_id"] != g.nodes[v]["domain_id"]:
+                            inter_hops += 1
+                        break
+
+            # Provisional BW debit for subsequent flows in same partition
+            allocate_route_bw(substrate, result.path_links, fe.bandwidth_demand)
+
+        return True, routes, bw_allocated, total_delay, inter_hops
+
+    def _rollback_cross_domain(
+        self,
+        substrate: SubstrateNetwork,
+        routes: dict[tuple[str, str], list[str]],
+        bw_allocated: dict[tuple[str, str], float],
+    ) -> None:
+        """Rollback provisional BW debits from cross-domain routing."""
+        for flow_key, bw in bw_allocated.items():
+            links = routes.get(flow_key, [])
+            if links:
+                deallocate_route_bw(substrate, links, bw)
+
     def _rollback_domain(
         self,
         substrate: SubstrateNetwork,
         response: DomainResponse,
     ) -> None:
-        """Roll back substrate state for a domain that passed actor placement
-        but failed the MDO pre-commit check.
-
-        Restores link BW from the response's allocations. Node CPU/RAM
-        rollback requires the substrate snapshot/restore mechanism — domain
-        actors handle their own rollback on infeasible results, but
-        feasible-but-precommit-failed paths need explicit BW deallocation.
-        Full node rollback is wired in Phase 5 via SubstrateNetwork.restore().
-        """
-        from orion.actors.routing import deallocate_route_bw
-
+        """Roll back BW allocations from a domain actor's intra-domain routing."""
         for flow_key, bw in response.bw_allocated.items():
             route_links = response.routes.get(flow_key, [])
             if route_links:
                 deallocate_route_bw(substrate, route_links, bw)
-
-    def _reserve_inter_domain_bw(
-        self,
-        substrate: SubstrateNetwork,  # noqa: ARG002 — used by Part B
-        partition: list[int],  # noqa: ARG002 — used by Part B
-        bw_demands: list[float],  # noqa: ARG002 — used by Part B
-    ) -> None:
-        """Reserve inter-domain bandwidth for a committed partition.
-
-        SCAFFOLD (Part B, Phase 5) — currently a no-op. This is the second
-        half of the C5b work item; Part A (the check in precommit_check) is
-        live but reads capacity-not-residual until this lands.
-
-        When implemented, this decrements an aggregate per-domain-pair
-        residual counter by the cross-domain demand
-        (`inter_domain_demand_by_pair(partition, bw_demands)`), and that SAME
-        counter is what feeds both precommit_check's `inter_domain_residuals`
-        and the MDO observation's inter-domain link features. Keeping one
-        counter is load-bearing: split sources reintroduce the stale-residual
-        bug (the policy trained to believe inter-domain links never deplete).
-
-        Reservation happens at COMMIT; the matching release happens at slice
-        DEPARTURE in the simulator lifecycle (Phase 5), not on a failed retry —
-        failed trials never reserved inter-domain BW under commit-time
-        reservation, so there is no per-trial inter-domain rollback. This must
-        land together with the substrate snapshot/restore so the counter is
-        restored cleanly across episodes.
-
-        Design pin: the MDO reserves against the AGGREGATE per-pair counter
-        (summary granularity). Concrete per-edge charging — choosing which
-        physical inter-domain link to debit — is the simulator's ground-truth
-        job, not the MDO's; the MDO has no per-edge information to make that
-        choice well. See docs/c5b_inter_domain_changeset.md.
-        """
         # SCAFFOLD: no-op until Part B.
 
     def _compute_reward(
@@ -462,27 +690,25 @@ class MDOCoordinator:
 
         SMDP credit assignment: this terminal reward is shared across all
         partition trials within this arrival. No bootstrapping between retries.
+
+        Efficiency uses normalized cost ratio (cost/cost_greedy) so the
+        penalty stays bounded relative to the admission bonus mu.
         """
         cfg = self.config
 
-        # Admission
         admission = cfg.mu if admitted else 0.0
 
-        # Efficiency
-        efficiency = -cfg.alpha * cost if admitted else 0.0
+        efficiency = 0.0
+        if admitted and cost_greedy is not None and cost_greedy > 0:
+            efficiency = -cfg.alpha * (cost / cost_greedy)
 
-        # Hard penalty (fires when pre-commit check was wrong under actual load)
-        # At Phase 4, this is always 0 — the simulator's ground-truth check
-        # is wired in Phase 5.
         hard_penalty = 0.0
 
-        # Quality shaping via LocalScore
         quality_shaping = 0.0
         if admitted and cost_greedy is not None and cost_greedy > 0:
             local_score = max(0.0, (cost_greedy - cost) / cost_greedy)
             quality_shaping = cfg.eta * local_score
 
-        # Trial penalty
         trial_penalty = -cfg.xi * max(0, num_trials - 1)
 
         return RewardComponents(

@@ -46,18 +46,17 @@ def analytical_kl(
     Masked positions are set to -inf logit before softmax so they receive
     zero probability mass and contribute zero to the KL sum.
     """
-    if mask is not None:
-        # Set infeasible domain logits to -inf so softmax assigns zero prob
-        neg_inf = torch.tensor(float("-inf"), dtype=logits_mdo.dtype, device=logits_mdo.device)
-        logits_mdo = torch.where(mask, logits_mdo, neg_inf)
-        logits_prior = torch.where(mask, logits_prior, neg_inf)
+    # Use a large negative finite value instead of -inf to avoid NaN gradients.
+    # -inf in logits → 0 prob after softmax, but 0 * log(0) = NaN in autograd.
+    # -1e9 gives effectively zero prob (~exp(-1e9)) with clean gradients.
+    NEGINF_SAFE = torch.tensor(-1e9, dtype=logits_mdo.dtype, device=logits_mdo.device)
 
-        # Zero-feasible-domain defense: if any VNF slot has all-False mask,
-        # return 0 KL for that slot (structural checker should catch this
-        # upstream, but defense in depth matters).
+    if mask is not None:
+        logits_mdo = torch.where(mask, logits_mdo, NEGINF_SAFE)
+        logits_prior = torch.where(mask, logits_prior, NEGINF_SAFE)
+
         valid_per_slot = mask.any(dim=-1)  # [K]
         if not valid_per_slot.all():
-            # Compute KL only over slots with at least one feasible domain
             valid_logits_mdo = logits_mdo[valid_per_slot]
             valid_logits_prior = logits_prior[valid_per_slot]
             if valid_logits_mdo.numel() == 0:
@@ -68,14 +67,7 @@ def analytical_kl(
     log_q = F.log_softmax(logits_prior, dim=-1)
     p = log_p.exp()
 
-    # KL = Σ p * (log_p - log_q), only over valid (non-zero prob) entries
-    # Replace NaN from 0 * (-inf) with 0 — masked positions have p=0
     kl_elementwise = p * (log_p - log_q)
-    kl_elementwise = torch.where(
-        torch.isnan(kl_elementwise),
-        torch.zeros_like(kl_elementwise),
-        kl_elementwise,
-    )
     kl_per_slot = kl_elementwise.sum(dim=-1)  # [K]
 
     # Clamp to zero to handle numerical noise
@@ -110,10 +102,9 @@ def build_prior_logits(
         # Place a peak on the suggested domain
         logits[k, d] = 1.0 / temperature
 
-    # Mask infeasible domains with -inf (handled by analytical_kl, but
-    # also good to set here for clarity)
-    neg_inf = torch.tensor(float("-inf"))
-    logits = torch.where(tier_masks, logits, neg_inf)
+    # Mask infeasible domains with large negative value (analytical_kl
+    # also masks, but setting here keeps prior logits self-consistent)
+    logits = torch.where(tier_masks, logits, torch.tensor(-1e9))
 
     return logits
 

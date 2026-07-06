@@ -126,13 +126,14 @@ def build_mdo_observation(
     )
 
 
-def observation_to_tensor(obs: MDOObservation) -> torch.Tensor:
+def observation_to_tensor(obs: MDOObservation, max_vnfs: int = 10) -> torch.Tensor:
     """Flatten the MDO observation into a fixed-size tensor for the policy.
 
     Layout: [domain_features | link_features | plan_features | retry_stats]
 
-    Domain features are already canonically sorted. Padded to a fixed max
-    if needed for batching (caller's responsibility for max_domains/max_links).
+    Domain features are already canonically sorted. Plan features are
+    padded to max_vnfs so the tensor has constant size regardless of
+    the actual number of VNFs in the slice.
     """
     parts = []
 
@@ -168,15 +169,18 @@ def observation_to_tensor(obs: MDOObservation) -> torch.Tensor:
     max_ram_d = max(obs.plan.ram_demands, default=1.0) or 1.0
     max_bw_d = max(obs.plan.bw_demands, default=1.0) or 1.0
 
-    for k in range(obs.plan.num_vnfs):
-        tier_idx = _TIER_ORDER.get(obs.plan.required_tiers[k], 0)
-        parts.extend([
-            obs.plan.cpu_demands[k] / max_cpu_d,
-            obs.plan.ram_demands[k] / max_ram_d,
-            tier_idx / 3.0,
-            obs.plan.vcrs[k],
-            obs.plan.bw_demands[k] / max_bw_d if k < len(obs.plan.bw_demands) else 0.0,
-        ])
+    for k in range(max_vnfs):
+        if k < obs.plan.num_vnfs:
+            tier_idx = _TIER_ORDER.get(obs.plan.required_tiers[k], 0)
+            parts.extend([
+                obs.plan.cpu_demands[k] / max_cpu_d,
+                obs.plan.ram_demands[k] / max_ram_d,
+                tier_idx / 3.0,
+                obs.plan.vcrs[k],
+                obs.plan.bw_demands[k] / max_bw_d if k < len(obs.plan.bw_demands) else 0.0,
+            ])
+        else:
+            parts.extend([0.0, 0.0, 0.0, 0.0, 0.0])
 
     # Retry statistics: aggregate-only encoding (count + per-violation-type rate).
     # Design choice: for N_part = 3-5, aggregate statistics are sufficient.

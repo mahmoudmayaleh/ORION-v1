@@ -213,7 +213,8 @@ def domain_sequence_from_partition(partition: list[int]) -> list[int]:
     return seq
 
 
-def precommit_check(
+def precommit_check(  # DEAD PATH — coordinator routes cross-domain flows on physical edges now.
+
     partition: list[int],
     domain_responses: dict[int, DomainResponse],
     inter_domain_delays: dict[tuple[int, int], float],
@@ -272,6 +273,11 @@ def precommit_check(
     Returns:
         (passes, violation_info, e2e_delay, total_cost)
     """
+    raise RuntimeError(
+        "precommit_check is a dead path — the coordinator routes cross-domain "
+        "flows on physical edges now. If you're seeing this, someone re-wired "
+        "the aggregate per-pair scaffold back into the live path. Don't."
+    )
     # Check all actors feasible
     actor_infeasible = any(
         not r.feasible for r in domain_responses.values()

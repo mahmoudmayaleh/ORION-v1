@@ -19,6 +19,125 @@ import torch.nn as nn
 from torch.distributions import Categorical
 
 
+class DirectJointPolicy(nn.Module):
+    """Single Categorical over enumerated feasible joint partitions.
+
+    Maximally expressive: represents the full joint π(a¹,a²,...,aᴷ) with no
+    factorization. For small instances (M^K ≤ few hundred), this is the clean
+    test of representation vs credit assignment.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        num_domains: int,
+        max_chain_length: int = 5,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+    ) -> None:
+        super().__init__()
+        self.num_domains = num_domains
+        self.max_chain_length = max_chain_length
+        self.max_joint = num_domains ** max_chain_length
+
+        layers: list[nn.Module] = []
+        in_dim = obs_dim
+        for _ in range(num_layers):
+            layers.extend([
+                nn.Linear(in_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+            ])
+            in_dim = hidden_dim
+        self.encoder = nn.Sequential(*layers)
+        self.actor_head = nn.Linear(hidden_dim, self.max_joint)
+        self.aux_value_head = nn.Linear(hidden_dim, 1)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        for module in self.encoder.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=2**0.5)
+
+    def _enumerate_and_mask(
+        self, tier_mask: torch.Tensor, num_vnfs: int,
+    ) -> tuple[list[tuple[int, ...]], torch.Tensor]:
+        import itertools
+        partitions = list(itertools.product(range(self.num_domains), repeat=num_vnfs))
+        mask = torch.ones(len(partitions), dtype=torch.bool)
+        for i, p in enumerate(partitions):
+            for k, d in enumerate(p):
+                if not tier_mask[k, d]:
+                    mask[i] = False
+                    break
+        return partitions, mask
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        tier_mask: torch.Tensor,
+        num_vnfs: int,
+        deterministic: bool = False,
+    ) -> tuple[list[int], torch.Tensor, torch.Tensor, float]:
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+        h = self.encoder(obs)
+        raw_logits = self.actor_head(h).squeeze(0)
+
+        partitions, mask = self._enumerate_and_mask(tier_mask, num_vnfs)
+        n_joint = len(partitions)
+        logits = raw_logits[:n_joint]
+        neg_inf = torch.tensor(float("-inf"), dtype=logits.dtype)
+        masked_logits = torch.where(mask, logits, neg_inf)
+
+        dist = Categorical(logits=masked_logits)
+        if deterministic:
+            action_idx = masked_logits.argmax()
+        else:
+            action_idx = dist.sample()
+
+        partition = list(partitions[action_idx.item()])
+        log_prob = dist.log_prob(action_idx)
+        entropy = dist.entropy().item()
+        return partition, log_prob.unsqueeze(0), masked_logits.unsqueeze(0), entropy
+
+    def evaluate_actions(
+        self,
+        obs: torch.Tensor,
+        tier_mask: torch.Tensor,
+        actions: torch.Tensor,
+        num_vnfs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+        h = self.encoder(obs)
+        raw_logits = self.actor_head(h).squeeze(0)
+
+        partitions, mask = self._enumerate_and_mask(tier_mask, num_vnfs)
+        n_joint = len(partitions)
+        logits = raw_logits[:n_joint]
+        neg_inf = torch.tensor(float("-inf"), dtype=logits.dtype)
+        masked_logits = torch.where(mask, logits, neg_inf)
+
+        target = tuple(actions.tolist())
+        action_idx = torch.tensor(partitions.index(target), dtype=torch.long)
+        dist = Categorical(logits=masked_logits)
+        log_prob = dist.log_prob(action_idx)
+        entropy = dist.entropy()
+        return log_prob.unsqueeze(0), entropy, masked_logits.unsqueeze(0)
+
+    def get_value(self, obs: torch.Tensor) -> torch.Tensor:
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+        h = self.encoder(obs)
+        return self.aux_value_head(h).squeeze(-1)
+
+
 class MDOPolicy(nn.Module):
     """Factored MaskedCategorical policy + auxiliary value head.
 
