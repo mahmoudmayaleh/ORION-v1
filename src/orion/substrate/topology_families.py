@@ -105,20 +105,25 @@ ALL_FAMILIES = [
 # ── Train/test split (family-level, fixed by design) ────────────────────────
 
 
-# Training families: regimes where the answer is clear
+# Training families: regimes where the answer is clear.
+# §P (2026-07-14): C+_T+_B- moved to held-out pre-run for coverage — an
+# all-hostile held-out set cannot show that memory does not HURT where
+# co-location already wins, nor support "no selective emphasis". One friendly
+# held-out family covers both. Swap dated, documented in the amendment.
 TRAIN_FAMILIES = [
     TopologyFamily(CapacityRegime.FRIENDLY, TierRegime.FRIENDLY, BWRegime.GENEROUS),
-    TopologyFamily(CapacityRegime.FRIENDLY, TierRegime.FRIENDLY, BWRegime.SCARCE),
     TopologyFamily(CapacityRegime.HOSTILE, TierRegime.HOSTILE, BWRegime.GENEROUS),
     TopologyFamily(CapacityRegime.HOSTILE, TierRegime.HOSTILE, BWRegime.SCARCE),
     TopologyFamily(CapacityRegime.FRIENDLY, TierRegime.HOSTILE, BWRegime.GENEROUS),
 ]
 
 # Test families: held-out regions — includes the mixed/load-dependent cases
+# plus one friendly family (C+_T+_B-) per the §P coverage swap above.
 TEST_FAMILIES = [
     TopologyFamily(CapacityRegime.HOSTILE, TierRegime.FRIENDLY, BWRegime.SCARCE),
     TopologyFamily(CapacityRegime.HOSTILE, TierRegime.FRIENDLY, BWRegime.GENEROUS),
     TopologyFamily(CapacityRegime.FRIENDLY, TierRegime.HOSTILE, BWRegime.SCARCE),
+    TopologyFamily(CapacityRegime.FRIENDLY, TierRegime.FRIENDLY, BWRegime.SCARCE),
 ]
 
 

@@ -49,6 +49,8 @@ class EpisodicMemory:
         config: RetrievalConfig | None = None,
         embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
         max_entries: int = 500,
+        write_policy: str = "selective",
+        evict_policy: str = "importance",
     ) -> None:
         if config is None:
             config = RetrievalConfig(
@@ -59,6 +61,13 @@ class EpisodicMemory:
         self.config = config
         self._embed_fn = embed_fn
         self._max_entries = max_entries
+        # Full-M^B: selective write + importance eviction (defaults).
+        # FIFO-M^B ablation: write_policy="write_all", evict_policy="fifo".
+        assert write_policy in ("selective", "write_all")
+        assert evict_policy in ("importance", "fifo")
+        self._write_policy = write_policy
+        self._evict_policy = evict_policy
+        self._last_retrieval: dict | None = None
         self._entries: list[MemoryEntry] = []
         self._pipeline = RetrievalPipeline(config, embed_fn)
 
@@ -94,7 +103,9 @@ class EpisodicMemory:
         Returns:
             True if the episode was recorded.
         """
-        if not self._should_record(reward, constraints_violated):
+        if self._write_policy == "selective" and not self._should_record(
+            reward, constraints_violated
+        ):
             return False
 
         success = len(constraints_violated) == 0 and reward > 0
@@ -164,6 +175,13 @@ class EpisodicMemory:
             top_k=top_k,
         )
         scored, _ = self._pipeline.retrieve(rq)
+
+        # §P read-only telemetry: composition of the last retrieval (count + the
+        # success/failure label mix of what was returned).
+        n_pos = sum(1 for se in scored
+                    if (se.entry.tags.get("label") or ["?"])[0] == "success")
+        self._last_retrieval = {"n": len(scored), "pos": n_pos,
+                                "neg": len(scored) - n_pos}
 
         # Update access metadata
         for se in scored:
@@ -309,26 +327,29 @@ class EpisodicMemory:
         return False
 
     def _evict(self) -> None:
-        """Evict entries with lowest importance score.
-
-        Importance = recency_weight * reward_proxy * retrieval_frequency.
-        """
-        now = datetime.now()
-        tau = self.config.recency_tau
-
-        scored: list[tuple[int, float]] = []
-        for i, entry in enumerate(self._entries):
-            delta_days = (now - entry.last_accessed_at).total_seconds() / 86400.0
-            recency = math.exp(-tau * delta_days)
-            frequency = math.log1p(entry.access_count)
-            importance = recency * (1.0 + frequency)
-            scored.append((i, importance))
-
-        scored.sort(key=lambda x: x[1])
-
-        # Remove the least important 10%
+        """Evict entries. Importance policy (Full-M^B) removes lowest
+        recency*reward*frequency; FIFO policy (FIFO-M^B ablation) removes
+        oldest-first (insertion order = front of the list)."""
         n_remove = max(1, len(self._entries) // 10)
-        remove_indices = {idx for idx, _ in scored[:n_remove]}
+
+        if self._evict_policy == "fifo":
+            remove_indices = set(range(n_remove))
+        else:
+            now = datetime.now()
+            tau = self.config.recency_tau
+
+            scored: list[tuple[int, float]] = []
+            for i, entry in enumerate(self._entries):
+                delta_days = (now - entry.last_accessed_at).total_seconds() / 86400.0
+                recency = math.exp(-tau * delta_days)
+                frequency = math.log1p(entry.access_count)
+                importance = recency * (1.0 + frequency)
+                scored.append((i, importance))
+
+            scored.sort(key=lambda x: x[1])
+
+            # Remove the least important 10%
+            remove_indices = {idx for idx, _ in scored[:n_remove]}
 
         removed_ids = [self._entries[i].entry_id for i in remove_indices]
         self._entries = [e for i, e in enumerate(self._entries) if i not in remove_indices]

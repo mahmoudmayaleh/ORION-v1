@@ -7,13 +7,104 @@ needed to swap providers.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
+import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from typing import Literal
 
 logger = logging.getLogger(__name__)
+
+
+class EmptyCompletionError(RuntimeError):
+    """A completion returned zero tokens / empty content. Raised loudly so an
+    empty response can never flow downstream as if it were model output (the
+    2026-07-15 wedge: the server answered HTTP 200 with 0 tokens and E.1 happily
+    consumed empty plans into a plausible-looking 18/100). Crash > silent corruption."""
+
+
+class LocalLLMBusyError(RuntimeError):
+    """Another local-LLM job already holds the single-slot server lock. Refuse to
+    start rather than wedge the server with concurrent load (the incident's cause)."""
+
+
+# ── Single-slot local-LLM lock (durable form of "never run two local-LLM jobs
+# concurrently"). One process holds it; a second refuses loudly. Localhost only —
+# frontier/API backends are never locked. Re-entrant within a PID (a runner may
+# build several LLMBackends). Stale locks (dead PID) are stolen. Opt out with
+# ORION_LLM_LOCK_DISABLE=1 for deliberate multi-port parallelism. Same discipline
+# class as the :8000 oracle guard and the dirty-tree guard. ──────────────────────
+_LOCK_PATH = os.path.join(tempfile.gettempdir(), "orion_local_llm.lock")
+_LOCK_OWNED_BY_US = False  # this PID holds it (module-global => re-entrant per process)
+
+
+def _is_local(base_url: str) -> bool:
+    return ("localhost" in base_url) or ("127.0.0.1" in base_url) or ("0.0.0.0" in base_url)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+
+
+def acquire_local_llm_lock() -> None:
+    """Acquire the single-slot local-LLM lock or raise LocalLLMBusyError."""
+    global _LOCK_OWNED_BY_US
+    if os.environ.get("ORION_LLM_LOCK_DISABLE"):
+        return
+    if _LOCK_OWNED_BY_US:
+        return  # re-entrant within this process
+    while True:
+        try:
+            fd = os.open(_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            _LOCK_OWNED_BY_US = True
+            atexit.register(release_local_llm_lock)
+            logger.info("local-LLM lock acquired (pid=%d, %s)", os.getpid(), _LOCK_PATH)
+            return
+        except FileExistsError:
+            try:
+                other = int(open(_LOCK_PATH).read().strip() or "-1")
+            except (ValueError, OSError):
+                other = -1
+            if other == os.getpid():
+                _LOCK_OWNED_BY_US = True
+                return
+            if other < 0 or not _pid_alive(other):
+                logger.warning("stealing stale local-LLM lock (dead pid=%s)", other)
+                try:
+                    os.unlink(_LOCK_PATH)
+                except OSError:
+                    pass
+                continue
+            raise LocalLLMBusyError(
+                f"\n*** REFUSING TO START: another local-LLM job holds the lock "
+                f"(pid={other}, {_LOCK_PATH}).\n"
+                f"*** The local llama.cpp server is single-slot; concurrent jobs wedge it.\n"
+                f"*** Wait for pid={other} to finish, or `kill {other}` if it is dead, "
+                f"or set ORION_LLM_LOCK_DISABLE=1 to override (only if you know the server "
+                f"can take it).")
+
+
+def release_local_llm_lock() -> None:
+    global _LOCK_OWNED_BY_US
+    if not _LOCK_OWNED_BY_US:
+        return
+    try:
+        if os.path.exists(_LOCK_PATH) and open(_LOCK_PATH).read().strip() == str(os.getpid()):
+            os.unlink(_LOCK_PATH)
+    except OSError:
+        pass
+    _LOCK_OWNED_BY_US = False
 
 
 @dataclass
@@ -39,6 +130,11 @@ class LLMBackend:
 
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
+        # Single-slot guard: a local-LLM backend acquires the process lock so a
+        # second concurrent local-LLM job refuses instead of wedging the server.
+        # Frontier/API backends (non-localhost) are never locked.
+        if _is_local(config.base_url):
+            acquire_local_llm_lock()
         self._client = self._make_client()
         # Per-call telemetry from the most recent completion (guardrails read these).
         self.last_finish_reason: str | None = None
@@ -197,7 +293,17 @@ class LLMBackend:
                     "headroom": self.config.n_ctx - self.last_prompt_tokens,
                 },
             )
-        return (choice.message.content or "").strip()
+        content = (choice.message.content or "").strip()
+        # Empty-completion assert: HTTP 200 with 0 tokens / empty body is exactly
+        # the wedge signature a process-liveness check cannot see. Raise loudly so
+        # an empty response can never be consumed downstream as model output.
+        if not content or self.last_completion_tokens == 0:
+            raise EmptyCompletionError(
+                f"LLM returned an empty completion (completion_tokens="
+                f"{self.last_completion_tokens}, finish_reason={self.last_finish_reason}, "
+                f"base_url={self.config.base_url}). The server is likely WEDGED — restart it "
+                f"(scripts/start_llm_gpu.sh) and re-run. Refusing to emit empty output.")
+        return content
 
 
 def extract_json(text: str) -> dict:

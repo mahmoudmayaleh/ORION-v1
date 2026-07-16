@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Item 6: Analysis script for the five-arm learning-curve experiment.
+"""Item 6: Analysis script for the three-arm learning-curve experiment.
 
-Reads data/five_arm_results.json and produces:
+Reads data/three_arm_results.json and produces:
   1. Per-family FoC bar charts (extrapolation + interpolation)
   2. Paired differences (Full-M^B minus best static) with spread
   3. Reject-reason breakdown per arm per family
@@ -30,14 +30,19 @@ import numpy as np
 
 B_MINUS_PRIMARY = ["C-_T+_B-", "C+_T-_B-"]
 CONTROL_FAMILY = "C-_T+_B+"
-ARM_ORDER = ["RA-ColocFB", "Plain-ColocFB", "Memory-off", "FIFO-M^B", "Full-M^B"]
-STATIC_ARMS = ["RA-ColocFB", "Plain-ColocFB"]
-LLM_ARMS = ["Memory-off", "FIFO-M^B", "Full-M^B"]
+ARM_ORDER = ["RA-ColocFB", "Memory-off", "Full-M^B"]
+STATIC_ARMS = ["RA-ColocFB"]
+LLM_ARMS = ["Memory-off", "Full-M^B"]
 
 
 def load_results(path: str) -> list[dict]:
     with open(path) as f:
-        return json.load(f)
+        data = json.load(f)
+    # §P tagged format wraps the record list with provenance; older runs are a
+    # bare list. Accept both.
+    if isinstance(data, dict) and "results" in data:
+        return data["results"]
+    return data
 
 
 def group_by(records, *keys):
@@ -63,7 +68,7 @@ def analyze(results: list[dict]):
     """Full analysis pipeline."""
 
     print("=" * 90)
-    print("FIVE-ARM EXPERIMENT ANALYSIS")
+    print("THREE-ARM EXPERIMENT ANALYSIS")
     print("=" * 90)
 
     seeds = sorted(set(r.get("seed", 0) for r in results))
@@ -218,13 +223,13 @@ def analyze(results: list[dict]):
                         print(f"  (Δ vs static: {gap:+.1f}pp → {status})", end="")
                 print()
 
-    # Secondary: Full vs FIFO, Full vs Memory-off
+    # Secondary: Full vs Memory-off
     print("\n  SECONDARY:")
     for phase_label in ["extrap", "interp"]:
         phase_r = [r for r in results if r["phase"] == phase_label]
         if not phase_r:
             continue
-        for a, b in [("Full-M^B", "FIFO-M^B"), ("Full-M^B", "Memory-off")]:
+        for a, b in [("Full-M^B", "Memory-off")]:
             a_focs = [r["foc"] for r in phase_r if r["arm"] == a]
             b_focs = [r["foc"] for r in phase_r if r["arm"] == b]
             if a_focs and b_focs:
@@ -256,14 +261,10 @@ def analyze(results: list[dict]):
                 else:
                     interp_gain = True
 
-    fifo_matches = True
     memoff_matches = True
     all_phase_r = [r for r in results if r["phase"] in ("extrap", "interp")]
     full_all = [r["foc"] for r in all_phase_r if r["arm"] == "Full-M^B"]
-    fifo_all = [r["foc"] for r in all_phase_r if r["arm"] == "FIFO-M^B"]
     memoff_all = [r["foc"] for r in all_phase_r if r["arm"] == "Memory-off"]
-    if full_all and fifo_all:
-        fifo_matches = abs(np.mean(full_all) - np.mean(fifo_all)) < 0.01
     if full_all and memoff_all:
         memoff_matches = abs(np.mean(full_all) - np.mean(memoff_all)) < 0.01
 
@@ -275,11 +276,6 @@ def analyze(results: list[dict]):
         print("  → NARROW: Memory helps on unseen combinations only")
     elif not extrap_gain and not interp_gain:
         print("  → NO GAIN: Plan layer does not need episodic memory (negative result)")
-
-    if fifo_matches:
-        print("  → FIFO matches Full-M^B: eviction policy irrelevant")
-    else:
-        print("  → FIFO differs from Full-M^B: eviction policy matters")
 
     if memoff_matches:
         print("  → Memory-off matches Full-M^B: LLM capability, not memory, drives result")
@@ -326,7 +322,7 @@ def analyze(results: list[dict]):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", default="data/five_arm_results.json",
+    parser.add_argument("--input", default="data/three_arm_results.json",
                         help="Path to results JSON")
     args = parser.parse_args()
 

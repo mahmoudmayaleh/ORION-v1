@@ -21,6 +21,7 @@ from orion.mdo.types import (
     PlanSummary,
     RetryHistory,
 )
+from orion.config import MDO_HEADROOM_CPU_REF, MDO_HEADROOM_RAM_REF
 from orion.substrate.graph_model import SubstrateNetwork
 from orion.types import InfrastructureTier
 
@@ -33,7 +34,8 @@ _TIER_ORDER = {
 }
 
 # Feature dimensions
-DOMAIN_FEAT_DIM = 5   # cpu_res_frac, ram_res_frac, cpu_cap_norm, ram_cap_norm, tier_dominant_idx
+DOMAIN_FEAT_DIM = 6   # cpu_res_frac, ram_res_frac, cpu_cap_norm, ram_cap_norm, tier_dominant_idx,
+                      # max_node_headroom  (h^m, PREREG 2026-07-11 §M.4-Δ)
 LINK_FEAT_DIM = 3     # bw_res_frac, bw_cap_norm, delay_norm
 VNF_FEAT_DIM = 5      # cpu_norm, ram_norm, tier_idx, vcr, bw_norm
 
@@ -62,6 +64,16 @@ def build_domain_summaries(substrate: SubstrateNetwork) -> list[DomainSummary]:
         cpu_cap = sum(g.nodes[n]["cpu_capacity"] for n in nodes)
         ram_cap = sum(g.nodes[n]["ram_capacity"] for n in nodes)
 
+        # h^m: single-node fragmentation headroom (PREREG 2026-07-11 §M.4-Δ3). Per node,
+        # min(cpu_res/c_ref, ram_res/r_ref) — the min binds on the scarce resource so a node
+        # rich in one dimension and starved in the other scores low; the domain reports its
+        # best-fitting node. Refs are FROZEN literals (config), not running maxima.
+        max_node_headroom = max(
+            (min(g.nodes[n]["cpu_residual"] / MDO_HEADROOM_CPU_REF,
+                 g.nodes[n]["ram_residual"] / MDO_HEADROOM_RAM_REF) for n in nodes),
+            default=0.0,
+        )
+
         tiers_in_domain = [g.nodes[n]["tier"] for n in nodes]
         unique_tiers = sorted(set(tiers_in_domain), key=lambda t: _TIER_ORDER.get(InfrastructureTier(t), 99))
         dominant = _dominant_tier(tiers_in_domain)
@@ -74,6 +86,7 @@ def build_domain_summaries(substrate: SubstrateNetwork) -> list[DomainSummary]:
             cpu_capacity=cpu_cap,
             ram_capacity=ram_cap,
             supported_tiers=[InfrastructureTier(t) for t in unique_tiers],
+            max_node_headroom=max_node_headroom,
         ))
 
     # Sort by canonical key: (tier_type, domain_id) — stable across state evolution
@@ -153,6 +166,7 @@ def observation_to_tensor(obs: MDOObservation, max_vnfs: int = 10) -> torch.Tens
             s.cpu_capacity / max_cpu_cap,
             s.ram_capacity / max_ram_cap,
             _TIER_ORDER.get(s.dominant_tier, 0) / 3.0,  # normalized tier index
+            s.max_node_headroom,  # h^m single-node fragmentation headroom (§M.4-Δ)
         ])
 
     # Inter-domain link features

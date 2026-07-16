@@ -42,6 +42,7 @@ from orion.mdo.observation import (
 )
 from orion.mdo.policy import MDOPolicy
 from orion.mdo.rejection import check_rejection_triggers
+from orion.profiling import profiled
 from orion.mdo.types import (
     MDOAction,
     MDOResult,
@@ -149,10 +150,11 @@ class MDOCoordinator:
 
         for j in range(cfg.n_part):
             # --- Sample partition (canonical indices) ---
-            partition_canonical, log_probs, _logits, entropy, value = self._sample_partition(
-                obs_tensor, tier_mask, plan, mode,
-                canonical_to_domain=canonical_to_domain,
-            )
+            with profiled("mdo.forward", {"trial": j}):
+                partition_canonical, log_probs, _logits, entropy, value = self._sample_partition(
+                    obs_tensor, tier_mask, plan, mode,
+                    canonical_to_domain=canonical_to_domain,
+                )
             all_log_probs.append(log_probs)
             all_entropy += entropy
             last_value = value
@@ -167,7 +169,8 @@ class MDOCoordinator:
             fragments, cross_domain_flows = self._build_fragments(
                 plan, partition, slice_req,
             )
-            responses = self._dispatch_to_actors(substrate, fragments)
+            with profiled("actor.place", {"trial": j, "n_domains": len(fragments)}):
+                responses = self._dispatch_to_actors(substrate, fragments)
 
             # --- Route cross-domain flows on full graph ---
             actor_infeasible = any(

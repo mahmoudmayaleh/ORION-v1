@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Five-arm learning-curve runner — implements the pre-registered protocol.
+"""Three-arm learning-curve runner — implements the pre-registered protocol.
 
 See docs/EXPERIMENT_PROTOCOL.md for the frozen specification.
 
 Arms:
   1. RA-ColocFB    — routability-aware co-location (static, no LLM)
   2. Memory-off    — Agent B + K^B, no M^B
-  3. FIFO-M^B      — Agent B + K^B + M^B (write-all, FIFO eviction, K=50)
-  4. Full-M^B      — Agent B + K^B + M^B (selective write, importance eviction, K=50)
-  5. Plain-ColocFB — co-location with FFD fallback (static, no LLM)
+  3. Full-M^B      — Agent B + K^B + M^B (selective write, importance eviction, K=50)
+
+(FIFO-M^B and Plain-ColocFB were dropped from the original five-arm design.)
 
 Usage:
   python scripts/five_arm_runner.py                    # real LLM (requires backend)
@@ -27,6 +27,7 @@ import math
 import sys
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -37,8 +38,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from orion.baselines.colocation_ffd import (
     colocation_ffd,
     routability_aware_colocation_ffd,
+    _select_node_in_domain,
 )
-from orion.baselines.greedy_ffd import GreedyConfig, _run_greedy_ffd
+from orion.baselines.greedy_ffd import (
+    GreedyConfig, GreedyResult, _PlacementState, _run_greedy_ffd,
+)
+from orion.types import PlacementPlan
 from orion.llm.abstract_topology import build_abstract_topology
 from orion.llm.episodic_memory import EpisodicMemory
 from orion.retrieval import RetrievalConfig, RetrievalMode
@@ -71,12 +76,25 @@ SERVICE_RATE = 0.02
 RUN_SEEDS = [42, 43, 44]
 N_STRUCT = 1  # No retries, 1 LLM call per arrival
 
+# §P (2026-07-14): C+_T+_B- moved to held-out (see topology_families.py) — warm-up
+# is now 4 train families; held-out = TEST_FAMILIES (4, incl. one friendly).
 WARM_UP_ORDER = [
-    "C+_T+_B+", "C+_T+_B-", "C-_T-_B+", "C-_T-_B-", "C+_T-_B+",
+    "C+_T+_B+", "C-_T-_B+", "C-_T-_B-", "C+_T-_B+",
 ]
 
-ARM_NAMES = ["RA-ColocFB", "Memory-off", "FIFO-M^B", "Full-M^B", "Plain-ColocFB"]
+# WP8 planning-layer ablation (greedy executor, NO RL): Plain-ColocFB and the
+# two LLM-partition arms all share the SAME plain co-location fill (held fixed),
+# so the figure isolates partition quality. RA-ColocFB is a REFERENCE line only
+# (full-information oracle: reads global CPU residuals + all inter-domain BW +
+# cross-domain path routing — not a deployable peer).
+ARM_NAMES = ["RA-ColocFB", "Plain-ColocFB", "Memory-off", "FIFO-M^B", "Full-M^B"]
+# Each LLM arm runs against its own llama.cpp server (own port) so the arms
+# execute concurrently. Keep in sync with the servers the supervisor launches.
+ARM_LLM_PORTS = {"Memory-off": 8000, "FIFO-M^B": 8002, "Full-M^B": 8001}
 STATIC_ARMS = {"RA-ColocFB", "Plain-ColocFB"}
+# Arms that write to an M^B store. FIFO-M^B = write-all + FIFO eviction
+# (§4.1 ablation); Full-M^B = selective write + importance eviction.
+MB_ARMS = {"Full-M^B", "FIFO-M^B"}
 LLM_ARMS = {"Memory-off", "FIFO-M^B", "Full-M^B"}
 
 
@@ -100,18 +118,26 @@ class InstanceResult:
 # ── Ceiling computation (enumerator, executor-independent) ──────────────────
 
 
-def compute_ceiling(substrate, arrival_seed):
+def compute_ceiling(substrate, arrival_seed, num_arrivals=None, slice_factory=None):
     """Count arrivals with at least one valid placement+routing.
 
     Uses the same logic as the frozen kill classifier v2 but only needs
     the binary feasible/infeasible answer, not the bin classification.
+
+    §O.6: pass `num_arrivals` equal to the eval episode's stream length so
+    the FoC denominator counts feasibles over the SAME arrivals the eval
+    actually sees (same seed => same stream prefix). Default keeps the
+    historical ARRIVALS_PER_INSTANCE for back-compat; all pre-§O absolute
+    FoC values were uniformly deflated by this mismatch (comparisons
+    unaffected).
     """
     import networkx as nx
     from orion.actors.routing import route_cross_domain_flow, allocate_route_bw, deallocate_route_bw
     from orion.sim.delay_model import node_sojourn, link_sojourn
 
     rng = np.random.default_rng(arrival_seed)
-    ap = ArrivalProcess(substrate, ARRIVALS_PER_INSTANCE, ARRIVAL_RATE, SERVICE_RATE, rng)
+    ap = ArrivalProcess(substrate, num_arrivals or ARRIVALS_PER_INSTANCE,
+                        ARRIVAL_RATE, SERVICE_RATE, rng, slice_factory=slice_factory)
     ap.generate()
 
     ceiling = 0
@@ -377,17 +403,89 @@ def _slice_request_to_dict(sr, substrate):
     }
 
 
+def _parse_abstract_domain(domain_label):
+    """Map an abstract-topology domain id ('d0', 'd1', ...) to the integer
+    domain_id used by the substrate/coordinator. Returns None if unparseable."""
+    if isinstance(domain_label, int):
+        return domain_label
+    s = str(domain_label)
+    if s.startswith("d"):
+        s = s[1:]
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        return None
+
+
 def _llm_plan_to_greedy_result(plan_dict, sr, substrate):
-    """Convert an LLM plan dict to a placement on the substrate."""
-    # Extract domain assignments from LLM plan
+    """Confine the concrete placer to the LLM-chosen domain per VNF (WP8 fix).
+
+    The LLM chooses the PARTITION (a domain per VNF via ``vnf_assignments``);
+    the fill then selects only a concrete node WITHIN that assigned domain,
+    using the SAME plain best-fit selection (``_select_node_in_domain``) that
+    Plain-ColocFB uses — so this figure isolates partition quality with the
+    fill held fixed.
+
+    If a VNF's assigned domain has no feasible node, that is a placement
+    FAILURE for the LLM arm (returns None). We do NOT fall back to a free
+    placement — that reintroduces the stub the diagnosis flagged.
+
+    Routing/verification is left to the shared coordinator pipeline
+    (``follow_prior`` → GreedyDomainActor → router), identical across arms;
+    this function only establishes the LLM domain (+ representative node/tier)
+    that ``plan_to_summary`` reads into ``PlanSummary.suggested_domains``.
+    """
     assignments = plan_dict.get("vnf_assignments", [])
     if not assignments:
         return None
-    # Use ColocFB as the executor (the LLM decides the partition,
-    # the executor places within domains)
-    # For now, map LLM's domain assignments to a ColocFB call
-    # constrained to those domains
-    return colocation_ffd(substrate, sr, GreedyConfig())
+
+    dom_of_vnf = {}
+    for a in assignments:
+        vid = a.get("vnf_id")
+        dom = _parse_abstract_domain(a.get("domain"))
+        if vid is None or dom is None:
+            return None
+        dom_of_vnf[vid] = dom
+
+    g = substrate.graph
+    domain_nodes: dict[int, set] = {}
+    for nid, nd in g.nodes(data=True):
+        domain_nodes.setdefault(nd.get("domain_id", -1), set()).add(nid)
+
+    state = _PlacementState()
+    # Largest-demand-first, matching the plain co-location fill order.
+    ordered_vnfs = sorted(
+        sr.vnfs, key=lambda v: (-v.cpu_demand, -v.ram_demand, v.vnf_id)
+    )
+    for vnf in ordered_vnfs:
+        dom = dom_of_vnf.get(vnf.vnf_id)
+        # Domain the LLM named must be a real substrate domain (guards the
+        # coordinator's unmapped-domain index-out-of-range caveat).
+        if dom is None or dom not in domain_nodes:
+            return None
+        nid = _select_node_in_domain(
+            substrate, vnf, state, sorted(domain_nodes[dom])
+        )
+        if nid is None:
+            return None  # assigned domain infeasible -> placement failure
+        state.running_cpu[nid] = state.cpu_after(substrate, nid) - vnf.cpu_demand
+        state.running_ram[nid] = state.ram_after(substrate, nid) - vnf.ram_demand
+        state.vnf_placements[vnf.vnf_id] = nid
+        state.cpu_allocations[vnf.vnf_id] = vnf.cpu_demand
+        state.ram_allocations[vnf.vnf_id] = vnf.ram_demand
+        state.resource_cost += vnf.cpu_demand + vnf.ram_demand
+
+    plan = PlacementPlan(
+        plan_id=f"{sr.request_id}_llm_partition",
+        vnf_placements=state.vnf_placements,
+        cpu_allocations=state.cpu_allocations,
+        ram_allocations=state.ram_allocations,
+        flow_routes={}, bw_allocations={},
+        is_structurally_valid=True, source="llm_partition",
+    )
+    return GreedyResult(feasible=True, cost=state.resource_cost, plan=plan,
+                        intra_bw=0.0, inter_bw=0.0,
+                        resource_cost=state.resource_cost)
 
 
 def _extract_plan_shape(result, sr, substrate):
@@ -445,35 +543,29 @@ def write_to_mb(mb, arm_name, sr, admitted, plan_dict, violations, topo_sig, pla
     reward = 1.0 if admitted else -1.0
     violation_tag = violations[0] if violations else None
 
-    if arm_name == "FIFO-M^B":
-        # Write-all: bypass selective filter, always record
-        mb._entries.append(mb._create_entry(
-            slice_spec, plan_dict, 0.0, violations, reward,
-            topo_sig, plan_shape, violation_tag,
-        ))
-        if len(mb._entries) > mb._max_entries:
-            # FIFO eviction: remove oldest
-            mb._entries.pop(0)
-    else:
-        # Full-M^B: selective write + importance eviction (default behavior)
-        mb.record(
-            slice_spec=slice_spec,
-            plan=plan_dict,
-            m_committed=0.0,
-            constraints_violated=violations,
-            reward=reward,
-            topology_signature=topo_sig,
-            plan_shape=plan_shape,
-            violation_tag=violation_tag,
-        )
+    # Full-M^B: selective write + importance eviction
+    mb.record(
+        slice_spec=slice_spec,
+        plan=plan_dict,
+        m_committed=0.0,
+        constraints_violated=violations,
+        reward=reward,
+        topology_signature=topo_sig,
+        plan_shape=plan_shape,
+        violation_tag=violation_tag,
+    )
 
 
 # ── Instance runner ─────────────────────────────────────────────────────────
 
 
 def run_instance(substrate, arrival_seed, arm_name, agent_b=None, kb=None,
-                 mb=None, topo_sig=None, mock_llm=False):
+                 mb=None, topo_sig=None, mock_llm=False, phase="warmup"):
     """Run one arm on one instance, return InstanceResult.
+
+    §P frozen-M^B: M^B is written ONLY during the warm-up phase. During held-out
+    (extrap) and interpolation eval the store is read-only, so the causal claim
+    is transfer across topology signatures, not in-family adaptation.
 
     ALL arms go through the same coordinator pipeline to equalize the gate:
       plan builder → PlanSummary (domain assignments) → coordinator (follow_prior)
@@ -503,6 +595,10 @@ def run_instance(substrate, arrival_seed, arm_name, agent_b=None, kb=None,
     admitted = 0
     total = 0
     reasons = Counter()
+    # §P read-only telemetry: retrieval-hit composition on held-out. If the
+    # eviction ablation (Full vs FIFO) differs, this is the first place the
+    # mechanism shows; if they tie, it tells us whether retrieval differentiated.
+    retr = {"q": 0, "hits": 0, "pos": 0, "neg": 0}
 
     for event in ap.events:
         if event.event_type != EventType.ARRIVAL or event.slice_request is None:
@@ -523,6 +619,13 @@ def run_instance(substrate, arrival_seed, arm_name, agent_b=None, kb=None,
         else:
             ok_builder, builder_result, plan_dict, violations, plan_shape = run_llm_arm(
                 arm_name, sr, substrate, agent_b, kb, mb, topo_sig, mock_llm)
+            # §P telemetry: accumulate what the agent actually retrieved from M^B.
+            if mb is not None and getattr(mb, "_last_retrieval", None) is not None:
+                lr = mb._last_retrieval
+                retr["q"] += 1
+                retr["hits"] += lr["n"]
+                retr["pos"] += lr["pos"]
+                retr["neg"] += lr["neg"]
             if not ok_builder or builder_result is None:
                 # `violations` may be structural-checker Violation dataclasses
                 # (unhashable) or strings. Reduce to hashable constraint tags for
@@ -531,7 +634,7 @@ def run_instance(substrate, arrival_seed, arm_name, agent_b=None, kb=None,
                 v_tags = [getattr(v, "constraint", v) for v in violations]
                 for vt in v_tags:
                     reasons[vt] += 1
-                if arm_name in ("FIFO-M^B", "Full-M^B"):
+                if arm_name in MB_ARMS and phase == "warmup":
                     write_to_mb(mb, arm_name, sr, False, plan_dict, v_tags,
                                topo_sig, plan_shape)
                 continue
@@ -569,7 +672,7 @@ def run_instance(substrate, arrival_seed, arm_name, agent_b=None, kb=None,
         if arm_name not in STATIC_ARMS:
             if ok and plan_shape is None:
                 plan_shape = _extract_plan_shape(builder_result, sr, substrate)
-            if arm_name in ("FIFO-M^B", "Full-M^B"):
+            if arm_name in MB_ARMS and phase == "warmup":
                 v_tag = None
                 if not ok and mdo_result.retry_history.attempts:
                     last = mdo_result.retry_history.attempts[-1]
@@ -583,6 +686,13 @@ def run_instance(substrate, arrival_seed, arm_name, agent_b=None, kb=None,
                 write_to_mb(mb, arm_name, sr, ok, plan_dict,
                            [v_tag] if v_tag else [], topo_sig, plan_shape)
 
+    # §P retrieval-composition telemetry (held-out only, where the store is frozen
+    # and read-only so the numbers reflect transfer, not in-family accumulation).
+    if arm_name in MB_ARMS and phase == "extrap" and retr["q"] > 0:
+        logger.info(
+            "  [retr %s] held-out: mean_hits=%.2f pos=%d neg=%d over %d queries",
+            arm_name, retr["hits"] / retr["q"], retr["pos"], retr["neg"], retr["q"])
+
     return admitted, total, dict(reasons)
 
 
@@ -595,13 +705,26 @@ def main():
                         help="Use FFD as mock Agent B (no real LLM calls)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Run a single seed (default: all 3)")
+    parser.add_argument("--tag", type=str, default="P",
+                        help="Run tag; output goes to data/five_arm_results_<tag>.json")
     args = parser.parse_args()
 
     seeds = [args.seed] if args.seed is not None else RUN_SEEDS
     mock_llm = args.mock_llm
 
+    # §P provenance (Δ3 discipline) via the shared recorder. The previous inline
+    # check passed --untracked-files=no, so untracked runners were invisible to it
+    # by construction — which is how the whole R family escaped provenance and how
+    # R.2|42 = 86.6% became unfalsifiable. git_provenance refuses on untracked code
+    # and fails closed if git itself errors (the old _git returned None => dirty=False).
+    from orion.provenance import git_provenance
+    _prov = git_provenance(tag=args.tag)
+    git_commit = _prov["git_commit"]
+    git_dirty = _prov["git_dirty"]
+    logger.info("  git_commit=%s dirty=%s tag=%s", git_commit, git_dirty, args.tag)
+
     logger.info("=" * 90)
-    logger.info("FIVE-ARM LEARNING-CURVE RUNNER")
+    logger.info("THREE-ARM LEARNING-CURVE RUNNER")
     logger.info("  Mock LLM: %s", mock_llm)
     logger.info("  Seeds: %s", seeds)
     logger.info("  Arms: %s", ARM_NAMES)
@@ -653,24 +776,83 @@ def main():
 
     all_results: list[InstanceResult] = []
 
+    # Checkpointing: each run_seed is independent (fresh M^B / Agent B / K^B), so
+    # the seed is the safe resume granularity. Completed seeds are persisted; on
+    # restart we reload them and skip re-computation. A crash mid-seed loses only
+    # that seed's progress. Writes are atomic (tmp + rename) so a kill mid-write
+    # never corrupts a checkpoint.
+    ckpt_dir = Path("data/checkpoints")
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    def _ir_to_dict(r):
+        return {
+            "family": r.family, "instance_seed": r.instance_seed,
+            "arm": r.arm, "phase": r.phase,
+            "admitted": r.admitted, "total": r.total,
+            "ceiling": r.ceiling, "foc": r.fraction_of_ceiling,
+            "reject_reasons": r.reject_reasons,
+        }
+
+    def _dict_to_ir(d):
+        return InstanceResult(
+            family=d["family"], instance_seed=d["instance_seed"], arm=d["arm"],
+            phase=d["phase"], admitted=d["admitted"], total=d["total"],
+            ceiling=d["ceiling"], fraction_of_ceiling=d["foc"],
+            reject_reasons=d["reject_reasons"],
+        )
+
+    def _save_seed_ckpt(run_seed, seed_results):
+        path = ckpt_dir / f"seed_{run_seed}.json"
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump([_ir_to_dict(r) for r in seed_results], f, indent=2)
+        tmp.replace(path)  # atomic on POSIX
+        logger.info("Checkpoint written: %s (%d results)", path, len(seed_results))
+
+    # Shared 2-worker pool so the two LLM arms overlap (one server each).
+    pool = ThreadPoolExecutor(max_workers=len(LLM_ARMS))
+
     for run_seed in seeds:
         logger.info("")
         logger.info("=" * 90)
         logger.info("SEED %d", run_seed)
         logger.info("=" * 90)
 
-        # Initialize M^B for FIFO and Full arms (empty, K=50)
-        mb_fifo = EpisodicMemory(
-            config=RetrievalConfig(mode=RetrievalMode.NO_RERANK, apply_recency=False, k_final=3),
-            max_entries=MEMORY_CAPACITY_K,
-        )
+        # Resume: skip a seed already completed in a prior run.
+        ckpt_path = ckpt_dir / f"seed_{run_seed}.json"
+        if ckpt_path.exists():
+            with open(ckpt_path) as f:
+                cached = [_dict_to_ir(d) for d in json.load(f)]
+            all_results.extend(cached)
+            logger.info("Seed %d already complete — loaded %d cached results, skipping.",
+                        run_seed, len(cached))
+            continue
+
+        seed_start = len(all_results)
+
+        # Initialize M^B stores (empty, K=50), one per M^B arm.
+        # Full-M^B: selective write + importance eviction.
         mb_full = EpisodicMemory(
             config=RetrievalConfig(mode=RetrievalMode.NO_RERANK, apply_recency=True, k_final=3),
             max_entries=MEMORY_CAPACITY_K,
+            write_policy="selective",
+            evict_policy="importance",
+        )
+        # FIFO-M^B (§4.1 ablation): write-all + FIFO eviction.
+        mb_fifo = EpisodicMemory(
+            config=RetrievalConfig(mode=RetrievalMode.NO_RERANK, apply_recency=True, k_final=3),
+            max_entries=MEMORY_CAPACITY_K,
+            write_policy="write_all",
+            evict_policy="fifo",
         )
 
-        # Agent B and K^B (shared across LLM arms within a seed)
-        agent_b = None
+        # Agent B PER LLM arm. Each arm gets its own LLMBackend pointed at its own
+        # llama.cpp server (Memory-off:8000, Full-M^B:8001) so the two arms run
+        # concurrently — the Python llama_cpp.server serializes requests behind a
+        # lock, so one server cannot overlap two arms. K^B is frozen and shared
+        # (read-only). Results are identical to the sequential path; only the two
+        # arms' wall-clock is overlapped (each arm's own computation is unchanged).
+        arm_agents = {}  # arm_name -> AgentB
         kb = None
         if not mock_llm:
             try:
@@ -678,15 +860,16 @@ def main():
                 from orion.llm.agent_b import AgentB
                 from orion.llm.semantic_memory import SemanticMemory
 
-                llm_config = LLMConfig(
-                    base_url="http://localhost:8000/v1",
-                    api_key="EMPTY",
-                    model="default",
-                    temperature=0.05,
-                    max_tokens=2048,
-                )
-                llm = LLMBackend(llm_config)
-                agent_b = AgentB(llm)
+                for arm_name_, port_ in ARM_LLM_PORTS.items():
+                    llm_config = LLMConfig(
+                        base_url=f"http://localhost:{port_}/v1",
+                        api_key="EMPTY",
+                        model="default",
+                        temperature=0.05,
+                        max_tokens=2048,
+                    )
+                    arm_agents[arm_name_] = AgentB(LLMBackend(llm_config))
+                    logger.info("Agent B for %s -> port %d", arm_name_, port_)
 
                 # Load K^B (frozen, identical across all LLM arms)
                 kb_path = Path(__file__).resolve().parent.parent / "data" / "kb_entries.json"
@@ -700,6 +883,37 @@ def main():
                 logger.warning("LLM backend unavailable: %s. Falling back to mock.", e)
                 mock_llm = True
 
+        # Per-instance arm runner: static arm(s) inline (cheap, no LLM), the two
+        # LLM arms concurrently via the shared 2-worker pool. Returns InstanceResults
+        # in ARM_NAMES order. mb_full is only ever touched by the single Full-M^B
+        # thread (one instance at a time), so no lock is needed.
+        def run_arms(sub, topo_sig, ceil_count, phase, fname, iseed):
+            raw = {}
+            futs = {}
+            for arm in ARM_NAMES:
+                if arm in LLM_ARMS:
+                    ab = arm_agents.get(arm) if not mock_llm else None
+                    mb = mb_full if arm == "Full-M^B" else (
+                        mb_fifo if arm == "FIFO-M^B" else None)
+                    futs[arm] = pool.submit(
+                        run_instance, sub, run_seed, arm, ab, kb, mb, topo_sig,
+                        mock_llm, phase)
+            for arm in ARM_NAMES:
+                if arm in STATIC_ARMS:
+                    raw[arm] = run_instance(
+                        sub, run_seed, arm, None, None, None, topo_sig, mock_llm, phase)
+            for arm, fut in futs.items():
+                raw[arm] = fut.result()
+            out = []
+            for arm in ARM_NAMES:
+                adm, total, reasons = raw[arm]
+                foc = adm / ceil_count if ceil_count > 0 else 0.0
+                out.append(InstanceResult(
+                    family=fname, instance_seed=iseed, arm=arm, phase=phase,
+                    admitted=adm, total=total, ceiling=ceil_count,
+                    fraction_of_ceiling=foc, reject_reasons=reasons))
+            return out
+
         # ── Warm-up phase ──────────────────────────────────────────────
 
         logger.info("\n--- WARM-UP PHASE ---")
@@ -710,43 +924,33 @@ def main():
                 topo_sig = compute_signature(sub, fname).to_dict()
                 total_ceil, ceil_count = ceilings[(fname, iseed, run_seed)]
 
-                for arm in ARM_NAMES:
-                    mb = None
-                    if arm == "FIFO-M^B":
-                        mb = mb_fifo
-                    elif arm == "Full-M^B":
-                        mb = mb_full
+                t0 = time.time()
+                irs = run_arms(sub, topo_sig, ceil_count, "warmup", fname, iseed)
+                elapsed = time.time() - t0
+                all_results.extend(irs)
 
-                    t0 = time.time()
-                    adm, total, reasons = run_instance(
-                        sub, run_seed, arm, agent_b, kb, mb, topo_sig, mock_llm)
-                    elapsed = time.time() - t0
-
-                    foc = adm / ceil_count if ceil_count > 0 else 0.0
-                    ir = InstanceResult(
-                        family=fname, instance_seed=iseed, arm=arm,
-                        phase="warmup", admitted=adm, total=total,
-                        ceiling=ceil_count, fraction_of_ceiling=foc,
-                        reject_reasons=reasons,
-                    )
-                    all_results.append(ir)
-
+                for ir in irs:
+                    extra = f" M^B={len(mb_full._entries)}" if ir.arm == "Full-M^B" else ""
                     logger.info("  %s i=%d %-14s: %d/%d (FoC=%.1f%%) [%.1fs]%s",
-                                fname, iseed, arm, adm, total, 100 * foc, elapsed,
-                                f" M^B={len(mb._entries)}" if mb else "")
+                                fname, iseed, ir.arm, ir.admitted, ir.total,
+                                100 * ir.fraction_of_ceiling, elapsed, extra)
 
-        logger.info("\nM^B sizes after warm-up: FIFO=%d, Full=%d",
-                    len(mb_fifo._entries), len(mb_full._entries))
+        logger.info("\nM^B size after warm-up: Full=%d", len(mb_full._entries))
 
         # ── Guardrail (Amendment 3): context-headroom gate ─────────────────
         # M^B is now populated, so warm-up has exercised the largest prompts the
         # run will produce. Verify none approached n_ctx (context exhaustion is
         # arm-asymmetric — only K^B+M^B arms grow — and silently truncates the
         # completion). Fail loudly here rather than emit void eval data.
-        if not mock_llm and agent_b is not None:
-            fr_counts = agent_b.llm.finish_reason_counts
-            max_pt = agent_b.llm.max_prompt_tokens_seen
-            n_ctx = agent_b.llm.config.n_ctx
+        if not mock_llm and arm_agents:
+            # Aggregate telemetry across both arms' backends (worst case).
+            fr_counts = Counter()
+            max_pt = 0
+            n_ctx = 8192
+            for _ab in arm_agents.values():
+                fr_counts.update(_ab.llm.finish_reason_counts)
+                max_pt = max(max_pt, _ab.llm.max_prompt_tokens_seen)
+                n_ctx = _ab.llm.config.n_ctx
             n_trunc = fr_counts.get("length", 0)
             logger.info("Warm-up LLM telemetry: finish_reasons=%s, "
                         "max_prompt_tokens=%d / n_ctx=%d", dict(fr_counts), max_pt, n_ctx)
@@ -779,29 +983,15 @@ def main():
                 topo_sig = compute_signature(sub, fname).to_dict()
                 total_ceil, ceil_count = ceilings[(fname, iseed, run_seed)]
 
-                for arm in ARM_NAMES:
-                    mb = None
-                    if arm == "FIFO-M^B":
-                        mb = mb_fifo
-                    elif arm == "Full-M^B":
-                        mb = mb_full
+                t0 = time.time()
+                irs = run_arms(sub, topo_sig, ceil_count, "extrap", fname, iseed)
+                elapsed = time.time() - t0
+                all_results.extend(irs)
 
-                    t0 = time.time()
-                    adm, total, reasons = run_instance(
-                        sub, run_seed, arm, agent_b, kb, mb, topo_sig, mock_llm)
-                    elapsed = time.time() - t0
-
-                    foc = adm / ceil_count if ceil_count > 0 else 0.0
-                    ir = InstanceResult(
-                        family=fname, instance_seed=iseed, arm=arm,
-                        phase="extrap", admitted=adm, total=total,
-                        ceiling=ceil_count, fraction_of_ceiling=foc,
-                        reject_reasons=reasons,
-                    )
-                    all_results.append(ir)
-
+                for ir in irs:
                     logger.info("  %s i=%d %-14s: %d/%d (FoC=%.1f%%) [%.1fs]",
-                                fname, iseed, arm, adm, total, 100 * foc, elapsed)
+                                fname, iseed, ir.arm, ir.admitted, ir.total,
+                                100 * ir.fraction_of_ceiling, elapsed)
 
         # ── Eval: interpolation (unseen instances, seen families) ──────
 
@@ -813,29 +1003,18 @@ def main():
             topo_sig = compute_signature(sub, fname).to_dict()
             total_ceil, ceil_count = ceilings[(fname, iseed, run_seed)]
 
-            for arm in ARM_NAMES:
-                mb = None
-                if arm == "FIFO-M^B":
-                    mb = mb_fifo
-                elif arm == "Full-M^B":
-                    mb = mb_full
+            t0 = time.time()
+            irs = run_arms(sub, topo_sig, ceil_count, "interp", fname, iseed)
+            elapsed = time.time() - t0
+            all_results.extend(irs)
 
-                t0 = time.time()
-                adm, total, reasons = run_instance(
-                    sub, run_seed, arm, agent_b, kb, mb, topo_sig, mock_llm)
-                elapsed = time.time() - t0
-
-                foc = adm / ceil_count if ceil_count > 0 else 0.0
-                ir = InstanceResult(
-                    family=fname, instance_seed=iseed, arm=arm,
-                    phase="interp", admitted=adm, total=total,
-                    ceiling=ceil_count, fraction_of_ceiling=foc,
-                    reject_reasons=reasons,
-                )
-                all_results.append(ir)
-
+            for ir in irs:
                 logger.info("  %s i=%d %-14s: %d/%d (FoC=%.1f%%) [%.1fs]",
-                            fname, iseed, arm, adm, total, 100 * foc, elapsed)
+                            fname, iseed, ir.arm, ir.admitted, ir.total,
+                            100 * ir.fraction_of_ceiling, elapsed)
+
+        # Seed complete — persist its results so a later crash resumes from here.
+        _save_seed_ckpt(run_seed, all_results[seed_start:])
 
     # ── Aggregate reporting ─────────────────────────────────────────────────
 
@@ -879,15 +1058,13 @@ def main():
 
         full_focs = [r.fraction_of_ceiling for r in extrap if r.arm == "Full-M^B"]
         ra_focs = [r.fraction_of_ceiling for r in extrap if r.arm == "RA-ColocFB"]
-        plain_focs = [r.fraction_of_ceiling for r in extrap if r.arm == "Plain-ColocFB"]
 
-        best_static = max(np.mean(ra_focs) if ra_focs else 0,
-                         np.mean(plain_focs) if plain_focs else 0)
+        best_static = np.mean(ra_focs) if ra_focs else 0
         full_mean = np.mean(full_focs) if full_focs else 0
         full_std = np.std(full_focs) if full_focs else 0
         delta = full_mean - best_static
 
-        logger.info("  %s: Full-M^B=%.1f%% vs BestStatic=%.1f%% → delta=%+.1f pp (spread=%.1f%%)",
+        logger.info("  %s: Full-M^B=%.1f%% vs RA-ColocFB=%.1f%% → delta=%+.1f pp (spread=%.1f%%)",
                     fname, 100 * full_mean, 100 * best_static, 100 * delta, 100 * full_std)
 
     # No-regression control
@@ -899,10 +1076,10 @@ def main():
             if focs:
                 logger.info("  Control %s: %s FoC=%.1f%%", control_family, arm, 100 * np.mean(focs))
 
-    # Secondary: Full vs FIFO, Full vs Memory-off
+    # Secondary: Full vs Memory-off
     for phase in ["extrap", "interp"]:
         phase_r = [r for r in all_results if r.phase == phase]
-        for arm_pair in [("Full-M^B", "FIFO-M^B"), ("Full-M^B", "Memory-off")]:
+        for arm_pair in [("Full-M^B", "Memory-off")]:
             a_focs = [r.fraction_of_ceiling for r in phase_r if r.arm == arm_pair[0]]
             b_focs = [r.fraction_of_ceiling for r in phase_r if r.arm == arm_pair[1]]
             if a_focs and b_focs:
@@ -913,18 +1090,28 @@ def main():
 
     logger.info("=" * 90)
 
-    # Save raw results
-    out_path = Path("data/five_arm_results.json")
+    # Save raw results (tagged, with provenance)
+    out_path = Path(f"data/five_arm_results_{args.tag}.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
-        json.dump([{
-            "family": r.family, "instance_seed": r.instance_seed,
-            "arm": r.arm, "phase": r.phase,
-            "admitted": r.admitted, "total": r.total,
-            "ceiling": r.ceiling, "foc": r.fraction_of_ceiling,
-            "reject_reasons": r.reject_reasons,
-        } for r in all_results], f, indent=2)
-    logger.info("\nRaw results saved to %s", out_path)
+        json.dump({
+            "tag": args.tag,
+            "git_commit": git_commit,
+            "git_dirty": git_dirty,
+            "arms": ARM_NAMES,
+            "train_families": WARM_UP_ORDER,
+            "held_out_families": [fam.short_name for fam in TEST_FAMILIES],
+            "seeds": seeds,
+            "arrivals_per_instance": ARRIVALS_PER_INSTANCE,
+            "results": [{
+                "family": r.family, "instance_seed": r.instance_seed,
+                "arm": r.arm, "phase": r.phase,
+                "admitted": r.admitted, "total": r.total,
+                "ceiling": r.ceiling, "foc": r.fraction_of_ceiling,
+                "reject_reasons": r.reject_reasons,
+            } for r in all_results],
+        }, f, indent=2)
+    logger.info("\nRaw results saved to %s (commit %s)", out_path, git_commit)
 
 
 if __name__ == "__main__":

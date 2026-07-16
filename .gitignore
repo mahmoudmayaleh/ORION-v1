@@ -1,9 +1,21 @@
-__pycache__/
-*.pyc
-*.egg-info/
-.pytest_cache/
+# Artifacts stay out (size, regenerable). Interpretation records do NOT:
+# RESULT.md files, banners and manifests are what the paper cites as a record
+# of interpretation, so they must be commits, not mutable files. Note the
+# `results/*` form is deliberate -- git cannot re-include a file whose parent
+# directory is excluded, so a bare `results/` + `!results/*.md` silently fails.
+results/*
+!results/*.md
+runs/
+llm-outputs/
+data/*.pt
+*.log
 .venv/
-.vscode/
-Papers/
-*.docx
-*.pdf
+__pycache__/
+.pytest_cache/
+scripts/audit/out/
+# Secrets — API keys never enter git (SS Q frontier arm)
+.env
+.env.*
+*.key
+*_secret*
+src/orion.egg-info/

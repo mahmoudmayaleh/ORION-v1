@@ -13,9 +13,15 @@ from enum import IntEnum
 
 import numpy as np
 
+from typing import Callable
+
 from orion.substrate.graph_model import SubstrateNetwork
 from orion.sim.slice_generator import generate_slice_request
 from orion.types import SliceRequest
+
+# A slice factory has the same call signature as generate_slice_request:
+#   (request_id, substrate, rng, arrival_time, lifetime) -> SliceRequest
+SliceFactory = Callable[..., SliceRequest]
 
 
 class EventType(IntEnum):
@@ -51,12 +57,17 @@ class ArrivalProcess:
         arrival_rate: float,
         service_rate: float,
         rng: np.random.Generator,
+        slice_factory: SliceFactory | None = None,
     ) -> None:
         self.substrate = substrate
         self.num_arrivals = num_arrivals
         self.arrival_rate = arrival_rate
         self.service_rate = service_rate
         self.rng = rng
+        # Defaults to the standard generator; the routing-critical (§Q) family
+        # injects its own cut-sensitive chain factory here. Same signature, so
+        # the ceiling enumerator and every arm draw the identical stream.
+        self.slice_factory: SliceFactory = slice_factory or generate_slice_request
         self.events: list[SimEvent] = []
         self._event_idx: int = 0
 
@@ -80,7 +91,7 @@ class ArrivalProcess:
             t_depart = t_arrive + float(lifetimes[i])
             req_id = f"req_{i:04d}"
 
-            request = generate_slice_request(
+            request = self.slice_factory(
                 request_id=req_id,
                 substrate=self.substrate,
                 rng=self.rng,

@@ -7,6 +7,23 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
+# --- MDO observation reference constants (frozen pre-run; PREREG 2026-07-11 §M.4-Δ4) ---
+# Largest per-VNF demand in the training spec generator (_VNF_TEMPLATES, MediaProc upper
+# bounds cpu=(8,16), ram=(16,32)) as of 2026-07-11. FROZEN LITERALS BY DESIGN: used to
+# normalize the per-domain single-node headroom feature h^m. If the VNF templates are later
+# edited, these reference constants must NOT silently move — do not replace with a lookup.
+MDO_HEADROOM_CPU_REF: float = 16.0
+MDO_HEADROOM_RAM_REF: float = 32.0
+
+# --- CPU energy estimation constant (PREREG 2026-07-11 §M.4-Δ7) ---
+# Measured CPU energy is UNAVAILABLE on the experiment box without root: RAPL sysfs is
+# permission-denied, the perf RAPL PMU is blocked (perf_event_paranoid=4), and k10temp exposes
+# no power sensor. CPU cost is therefore reported PRIMARILY as measured CPU-seconds; this
+# constant yields a clearly-labelled Joules ESTIMATE = cpu_seconds * MDO_CPU_WATT_PER_CORE.
+# Value = TDP / cores for the AMD Threadripper PRO 5975WX (280 W / 32 cores). Upper-bound-ish:
+# assumes full per-core active power, ignores DVFS/idle. NOT a measured counter. Frozen literal.
+MDO_CPU_WATT_PER_CORE: float = 8.75
+
 
 class TopologyConfig(BaseSettings):
     """Substrate network generation parameters."""

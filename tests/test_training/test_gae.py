@@ -62,3 +62,47 @@ class TestGAECorrectness:
             3.0 + 0.9 * 1.0 - 1.0,
         ])
         assert torch.allclose(adv, expected)
+
+
+class TestGAEConformanceToy:
+    """PREREG §N.1 / SCOPE_N C.1 — the toy that gates the conformance-fix merge.
+
+    Two assertions (ruling 1): a mechanics check, and — the one that actually
+    justifies the fix — a counterfactual showing a downstream reject *lowers*
+    the earlier decision's advantage. This is 'hotspot-now costs-you-later' in
+    test form, and it is what a per-arrival bandit cannot represent.
+    """
+
+    GAMMA = 0.99
+    LAM = 0.95
+    VALUES = torch.tensor([4.0, 1.0, 4.0, 0.0])  # per-step V + bootstrap tail 0
+    DONES = torch.tensor([0.0, 0.0, 1.0])  # single episode (stream), done only at the tail
+
+    def test_mechanics_single_stream(self) -> None:
+        # rewards = [admit, reject, admit]; values/dones as above.
+        rewards = torch.tensor([5.0, 0.0, 5.0])
+        adv, ret = compute_gae(rewards, self.VALUES, self.DONES, self.GAMMA, self.LAM)
+        # Hand-computed (see SCOPE_N C.1):
+        assert adv[0] == pytest.approx(5.6584, abs=1e-3)
+        assert adv[1] == pytest.approx(3.9005, abs=1e-3)
+        assert adv[2] == pytest.approx(1.0, abs=1e-6)
+        assert ret[0] == pytest.approx(9.6584, abs=1e-3)
+        # Contrast the OLD per-arrival bandit on the same inputs: adv = r - V.
+        bandit_adv = rewards - self.VALUES[:-1]
+        assert torch.allclose(bandit_adv, torch.tensor([1.0, -1.0, 1.0]))
+        # The pipelines differ — GAE couples across steps, the bandit does not.
+        assert not torch.allclose(adv, bandit_adv)
+
+    def test_counterfactual_reject_strictly_lowers_prior_advantage(self) -> None:
+        # Identical at t=0 and t=2; flip ONLY t=1 admit(5) -> reject(0).
+        stream_admit = torch.tensor([5.0, 5.0, 5.0])
+        stream_reject = torch.tensor([5.0, 0.0, 5.0])
+        adv_admit, _ = compute_gae(stream_admit, self.VALUES, self.DONES, self.GAMMA, self.LAM)
+        adv_reject, _ = compute_gae(stream_reject, self.VALUES, self.DONES, self.GAMMA, self.LAM)
+        # Arrival 0's advantage is STRICTLY lower when t=1 rejects...
+        assert adv_reject[0] < adv_admit[0]
+        # ...by exactly the γλ-propagated reward gap (one hop from t=0): (γλ)^1 · Δr₁.
+        delta_r1 = 5.0 - 0.0
+        assert (adv_admit[0] - adv_reject[0]).item() == pytest.approx(
+            self.GAMMA * self.LAM * delta_r1
+        )

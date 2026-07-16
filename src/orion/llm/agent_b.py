@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
 from orion.llm.llm_backend import LLMBackend, extract_json
 from orion.llm.structural_checker import CheckResult, check_plan
+from orion.profiling import profiled
 
 logger = logging.getLogger("orion.llm.agent_b")
 
@@ -62,6 +63,123 @@ class AgentBPlanSchema(BaseModel):
 
 
 AGENT_B_PLAN_JSON_SCHEMA = AgentBPlanSchema.model_json_schema()
+
+
+def tier_feasible_domains(vnf: dict, abstract_topology: dict) -> list[str]:
+    """D(tau_fk): domains whose dominant_tiers overlap the VNF's permitted_tiers (v6 5.2)."""
+    permitted = set(vnf.get("permitted_tiers", []))
+    out = []
+    for d in abstract_topology.get("domains", []):
+        if permitted & set(d.get("dominant_tiers", [])):
+            out.append(d["domain_id"])
+    return out
+
+
+def build_pinned_plan_schema(slice_request: dict, abstract_topology: dict) -> dict | None:
+    """Per-request JSON schema that PINS the interface contract, not just shape.
+
+    Beyond the shape the static AGENT_B_PLAN_JSON_SCHEMA fixes, this constrains decoding to the
+    v6 5.2 interface: each suggested domain m~(f_k) must lie in D(tau_fk), the tier-feasible set,
+    identical to the MDO action-space mask (5 3.4). It uses PER-POSITION (tuple) assignment
+    schemas (server honors both draft-07 items-list and 2020-12 prefixItems):
+      - position i is pinned to VNF i's id via a singleton enum (exact bijection, no omit/dup),
+      - domain at position i is an enum of ONLY that VNF's tier-feasible domains D(tau_fk),
+      - required_tier is a permissive enum (recomputed deterministically post-generation).
+    Grammar-valid output can no longer name a nonexistent VNF, an invalid domain, OR a
+    tier-infeasible domain (a contract violation the RL arms structurally cannot make). Only
+    genuine C4 (resource) / C5 (inter-domain bandwidth/reachability) infeasibility can remain --
+    exactly the prior-quality signal the model owns.
+
+    Returns None if any VNF has NO tier-feasible domain: the slice is genuinely unplaceable, so
+    the caller should structural-reject WITHOUT an LLM call (no schema can rescue it).
+    """
+    vnfs = slice_request.get("vnfs", [])
+    vnf_ids = [v["vnf_id"] for v in vnfs]
+
+    def assignment_for(v):
+        feas = tier_feasible_domains(v, abstract_topology)
+        if not feas:
+            return None  # signals genuine tier-infeasibility for this VNF
+        tiers = sorted(v.get("permitted_tiers", []))
+        return {
+            "type": "object",
+            "properties": {
+                "vnf_id": {"enum": [v["vnf_id"]]},          # pin position -> VNF
+                "domain": {"enum": feas},                    # D(tau_fk) only
+                "required_tier": ({"enum": tiers} if tiers else {"type": "string"}),
+                "cpu_demand": {"type": "number"},
+                "ram_demand": {"type": "number"},
+            },
+            "required": ["vnf_id", "domain", "required_tier", "cpu_demand", "ram_demand"],
+            "additionalProperties": False,
+        }
+
+    per_position = []
+    for v in vnfs:
+        a = assignment_for(v)
+        if a is None:
+            return None  # genuinely infeasible slice
+        per_position.append(a)
+
+    flow = {
+        "type": "object",
+        "properties": {
+            "source_vnf": {"enum": vnf_ids},
+            "target_vnf": {"enum": vnf_ids},
+            "min_bandwidth_mbps": {"type": "number"},
+            "crosses_domain_boundary": {"type": "boolean"},
+        },
+        "required": ["source_vnf", "target_vnf", "min_bandwidth_mbps", "crosses_domain_boundary"],
+        "additionalProperties": False,
+    }
+    k = len(vnf_ids)
+    return {
+        "type": "object",
+        "properties": {
+            "plan_id": {"type": "string"},
+            # per-position tuple validation (draft-07 items-list): exactly K, position i == VNF i
+            "vnf_assignments": {"type": "array", "minItems": k, "maxItems": k, "items": per_position},
+            "flow_requirements": {"type": "array", "items": flow},
+        },
+        "required": ["plan_id", "vnf_assignments", "flow_requirements"],
+        "additionalProperties": False,
+    }
+
+
+def recompute_required_tiers(plan: dict, slice_request: dict, abstract_topology: dict) -> None:
+    """Set each assignment's required_tier to a tier in (permitted ∩ chosen-domain tiers), in place.
+
+    required_tier must be BOTH in the VNF's permitted set and supported by the assigned domain
+    (C8). With domain pinned to a tier-feasible one, that intersection is non-empty; the model's
+    stated required_tier can still mismatch the specific chosen domain, so it is recomputed like
+    crosses_domain_boundary -- a derived field, not a placement decision.
+    """
+    permitted = {v["vnf_id"]: set(v.get("permitted_tiers", []))
+                 for v in slice_request.get("vnfs", [])}
+    dom_tiers = {d["domain_id"]: set(d.get("dominant_tiers", []))
+                 for d in abstract_topology.get("domains", [])}
+    for a in plan.get("vnf_assignments", []) or []:
+        vid, dom = a.get("vnf_id"), a.get("domain")
+        inter = permitted.get(vid, set()) & dom_tiers.get(dom, set())
+        if inter:
+            a["required_tier"] = sorted(inter)[0]
+
+
+def recompute_flow_boundaries(plan: dict) -> None:
+    """Set each flow's crosses_domain_boundary from the plan's OWN assignments, in place.
+
+    crosses_domain_boundary is 100% derived from the VNF->domain assignments, yet the LLM emits
+    it as a free field and gets it inconsistent with its own placement on longer chains
+    (validity probe 2026-07-10: the dominant post-enum failure — grammar-valid, correct
+    partition, rejected only over this computable boolean). Recomputing it does NOT touch the
+    LLM's partition decision; it fixes a field the model should never have owned. Genuine
+    inter-domain feasibility (C5 reachability/bandwidth, C8 tier) is untouched and still checked.
+    """
+    dom = {a.get("vnf_id"): a.get("domain") for a in plan.get("vnf_assignments", [])}
+    for f in plan.get("flow_requirements", []) or []:
+        sd, td = dom.get(f.get("source_vnf")), dom.get(f.get("target_vnf"))
+        if sd is not None and td is not None:
+            f["crosses_domain_boundary"] = (sd != td)
 
 
 class PlanTruncationError(ValueError):
@@ -203,6 +321,7 @@ class AgentB:
         few_shot_examples: list[dict] | None = None,
         violation_feedback: str | None = None,
         reference_knowledge: str | None = None,
+        plan_schema: dict | None = None,
     ) -> dict:
         """Generate one abstract plan via LLM call.
 
@@ -225,7 +344,8 @@ class AgentB:
         )
         raw = self.llm.complete(
             self.system_prompt, user_msg,
-            response_format={"type": "json_object", "schema": AGENT_B_PLAN_JSON_SCHEMA},
+            response_format={"type": "json_object",
+                             "schema": plan_schema or AGENT_B_PLAN_JSON_SCHEMA},
         )
         # Distinguish context-window truncation from a genuine parse failure:
         # a truncated grammar-constrained completion is cut-off JSON, but the
@@ -256,6 +376,7 @@ class AgentB:
         few_shot_examples: list[dict] | None = None,
         max_retries: int = 1,
         reference_knowledge: str | None = None,
+        plan_schema: dict | None = None,
     ) -> tuple[dict, CheckResult]:
         """Generate a plan and validate it, retrying once on structural failure.
 
@@ -282,10 +403,12 @@ class AgentB:
 
         for attempt in range(1 + max_retries):
             try:
-                plan = self.generate_plan(
-                    slice_request, abstract_topology,
-                    few_shot_examples, violation_feedback, reference_knowledge,
-                )
+                with profiled("llm.generate", {"attempt": attempt + 1}):
+                    plan = self.generate_plan(
+                        slice_request, abstract_topology,
+                        few_shot_examples, violation_feedback, reference_knowledge,
+                        plan_schema=plan_schema,
+                    )
             except PlanTruncationError as exc:
                 # Context-window exhaustion, NOT malformed output. Counted
                 # distinctly so an arm-asymmetric truncation regression is
@@ -310,7 +433,12 @@ class AgentB:
                 violation_feedback = "Your previous response was not valid JSON. Respond with only a JSON object."
                 continue
 
-            result = check_plan(plan, slice_request, abstract_topology)
+            # Fix the derived fields (crosses_domain_boundary flag, required_tier) before
+            # validating, so a valid partition is not rejected over values the LLM should not own.
+            recompute_flow_boundaries(plan)
+            recompute_required_tiers(plan, slice_request, abstract_topology)
+            with profiled("struct.check", {"attempt": attempt + 1}):
+                result = check_plan(plan, slice_request, abstract_topology)
 
             if result.is_valid:
                 logger.debug(
@@ -337,6 +465,7 @@ class AgentB:
         kb: SemanticMemory | None = None,
         mb: EpisodicMemory | None = None,
         max_retries: int = 1,
+        plan_schema: dict | None = None,
     ) -> tuple[dict, CheckResult]:
         """Generate a plan using K^B semantic and M^B episodic memory.
 
@@ -377,4 +506,5 @@ class AgentB:
             few_shot_examples=few_shot_examples,
             max_retries=max_retries,
             reference_knowledge=reference_knowledge,
+            plan_schema=plan_schema,
         )

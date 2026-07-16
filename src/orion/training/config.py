@@ -33,8 +33,11 @@ class MAPPOConfig:
     clip_eps: float = 0.2
     value_loss_coef: float = 0.5
     entropy_coef: float = 0.01
-    # Clip the value loss too (CleanRL detail). Reduces value spikes.
-    clip_value_loss: bool = True
+    # §O.2 (ratified 2026-07-13): value clipping REMOVED — max(raw, clip) has a
+    # zero-gradient region in absolute return units that froze the critic
+    # (FAULT_REPORT_2026-07-13). Critic trains with Huber loss on §O.1
+    # value-normalized targets. Flag kept for record; the branch is gone.
+    clip_value_loss: bool = False
 
     # ── GAE ─────────────────────────────────────────────────────────────
     gamma: float = 0.99

@@ -40,7 +40,9 @@ import numpy as np
 
 from orion.baselines.greedy_ffd import compute_cost_greedy
 from orion.mdo.coordinator import MDOCoordinator
+from orion.mdo.observation import build_domain_summaries
 from orion.mdo.types import MDOAction, MDOResult, PlanSummary, RewardComponents
+from orion.profiling import profiled
 from orion.sim.arrival_process import ArrivalProcess, EventType
 from orion.sim.reward import RewardWeights, finalize_reward
 from orion.sim.rollout_buffer import (
@@ -90,6 +92,11 @@ class EpisodeResult:
     stats: EpisodeStats
     rollout: MultiAgentRollout
     mdo_results: list[MDOResult]
+    # Per-arrival behavioral trace (PREREG §N.2) — permanent gate-runner
+    # instrumentation so criterion (b) / the k-analysis are computable from any
+    # run, not a side probe. One dict per MDO-reaching arrival:
+    #   {index, rid, k, partition (domain list), admit, hm (per-domain h^m snapshot)}
+    arrival_trace: list[dict] = field(default_factory=list)
 
 
 # ── Episode runner ───────────────────────────────────────────────────────────
@@ -151,6 +158,7 @@ class EpisodeRunner:
         stats = EpisodeStats()
         rollout = MultiAgentRollout()
         mdo_results: list[MDOResult] = []
+        arrival_trace: list[dict] = []
 
         while self.arrival_process.has_next():
             event = self.arrival_process.next_event()
@@ -161,10 +169,14 @@ class EpisodeRunner:
 
             assert event.slice_request is not None
             self._handle_arrival(
-                event.slice_request, mdo_mode, rollout, mdo_results, stats
+                event.slice_request, mdo_mode, rollout, mdo_results, stats,
+                arrival_trace,
             )
 
-        return EpisodeResult(stats=stats, rollout=rollout, mdo_results=mdo_results)
+        return EpisodeResult(
+            stats=stats, rollout=rollout, mdo_results=mdo_results,
+            arrival_trace=arrival_trace,
+        )
 
     # ── Event handlers ──────────────────────────────────────────────────────
 
@@ -175,13 +187,17 @@ class EpisodeRunner:
         rollout: MultiAgentRollout,
         mdo_results: list[MDOResult],
         stats: EpisodeStats,
+        arrival_trace: list[dict] | None = None,
     ) -> None:
         stats.total_arrivals += 1
+        arrival_index = stats.total_arrivals - 1  # global stream position (§N.2)
         stats.per_slice_type_total[slice_req.slice_type.value] = (
             stats.per_slice_type_total.get(slice_req.slice_type.value, 0) + 1
         )
 
-        plan_summary = self.plan_builder(slice_req, self.substrate)
+        with profiled("plan_build", {"slice_type": slice_req.slice_type.value,
+                                     "k": len(slice_req.vnfs)}):
+            plan_summary = self.plan_builder(slice_req, self.substrate)
 
         # Structurally infeasible slices skip the MDO entirely (Choice D2).
         # They count as system-level rejections in the KPI but contribute no
@@ -192,14 +208,22 @@ class EpisodeRunner:
 
         cost_greedy = compute_cost_greedy(self.substrate, slice_req)
 
-        mdo_result = self.coordinator.resolve_arrival(
-            substrate=self.substrate,
-            slice_req=slice_req,
-            plan=plan_summary,
-            inter_domain_delays=self.inter_domain_delays,
-            mode=mdo_mode,
-            cost_greedy=cost_greedy if cost_greedy != float("inf") else None,
-        )
+        # h^m snapshot (§N.2) — captured pre-decision / pre-allocation, so it is the
+        # same per-domain headroom the policy's observation was built from.
+        hm_snapshot = {
+            ds.domain_id: ds.max_node_headroom
+            for ds in build_domain_summaries(self.substrate)
+        } if arrival_trace is not None else None
+
+        with profiled("mdo.decision", {"mode": mdo_mode, "k": len(slice_req.vnfs)}):
+            mdo_result = self.coordinator.resolve_arrival(
+                substrate=self.substrate,
+                slice_req=slice_req,
+                plan=plan_summary,
+                inter_domain_delays=self.inter_domain_delays,
+                mode=mdo_mode,
+                cost_greedy=cost_greedy if cost_greedy != float("inf") else None,
+            )
         mdo_results.append(mdo_result)
 
         verdict: GroundTruthVerdict | None = None
@@ -207,12 +231,13 @@ class EpisodeRunner:
             placement_plan = self._build_placement_plan(slice_req, mdo_result)
             if placement_plan is not None:
                 self.substrate.allocate(placement_plan, slice_req)
-                verdict = verify_committed_plan(
-                    self.substrate,
-                    placement_plan,
-                    slice_req,
-                    max_inter_domain_hops=self.max_inter_domain_hops,
-                )
+                with profiled("verify"):
+                    verdict = verify_committed_plan(
+                        self.substrate,
+                        placement_plan,
+                        slice_req,
+                        max_inter_domain_hops=self.max_inter_domain_hops,
+                    )
                 if verdict.hard_penalty_fired:
                     stats.hard_penalty_fires += 1
                     self.substrate.deallocate(placement_plan, slice_req)
@@ -231,6 +256,27 @@ class EpisodeRunner:
 
         self._update_stats(slice_req, mdo_result, final_reward, stats)
         self._append_rollout(slice_req, mdo_result, final_reward, rollout, plan_summary)
+
+        # Per-arrival behavioral trace (§N.2), recorded AFTER verify so `admit`
+        # reflects the true-load outcome (hard-penalty deallocation flips it False).
+        # `partition` is the policy's SELECTED partition (final attempt) — recorded
+        # even on reject, so criterion (b) / the k-analysis see WHERE it placed, not
+        # only what committed. `committed` separates selection from admission.
+        if arrival_trace is not None:
+            _attempts = (mdo_result.retry_history.attempts
+                         if mdo_result.retry_history is not None else [])
+            selected = (list(_attempts[-1].partition) if _attempts
+                        else (list(mdo_result.partition)
+                              if mdo_result.partition is not None else None))
+            arrival_trace.append({
+                "index": arrival_index,
+                "rid": slice_req.request_id,
+                "k": len(slice_req.vnfs),
+                "partition": selected,
+                "committed": mdo_result.partition is not None,
+                "admit": bool(mdo_result.admitted),
+                "hm": hm_snapshot,
+            })
 
     def _handle_departure(self, request_id: str, stats: EpisodeStats) -> None:
         plan = self._active_plans.pop(request_id, None)

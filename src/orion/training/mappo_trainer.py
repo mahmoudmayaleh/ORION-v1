@@ -44,6 +44,7 @@ from orion.training.global_state import (
     probe_global_state_dim,
 )
 from orion.training.kl_schedule import beta_linear
+from orion.training.value_norm import ValueNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,10 @@ class MAPPOTrainer:
             hidden_dim=config.critic_hidden_dim,
             num_layers=config.critic_num_layers,
         )
+        # §O.1 — value normalization; single value pipeline with the gate
+        # runner (pinned cadence: update once per rollout round, before the
+        # critic epochs, frozen within the update loop).
+        self.value_norm = ValueNormalizer()
 
         # Optimisers — separate for MDO actor, domain actors, and critic.
         mdo_policy = getattr(runner.coordinator, "policy", None)
@@ -160,7 +165,10 @@ class MAPPOTrainer:
         # tracked in research_notes/phase5_training_loop.md).
         global_state = encode_global_state(self.runner.substrate, stats)
         with torch.no_grad():
-            critic_value = float(self.critic(global_state).item())
+            # §O.1: critic predicts in normalized space; denormalize wherever
+            # values feed GAE.
+            critic_value = float(self.value_norm.denormalize(
+                self.critic(global_state)).item())
 
         for transition in result.rollout.mdo:
             buffer.append_mdo(
@@ -257,25 +265,17 @@ class MAPPOTrainer:
         # reward — this is what makes the advantage state-conditioned.
         critic_loss_total = 0.0
         if buffer.returns is not None and len(buffer.global_states) > 0:
+            # §O.1 — normalizer updated ONCE from this round's return batch,
+            # BEFORE the critic epochs, frozen through them (pinned cadence).
+            self.value_norm.update(buffer.returns.detach())
+            norm_targets = self.value_norm.normalize(buffer.returns.detach())
             for _epoch in range(self.config.update_epochs):
                 global_states = torch.stack(buffer.global_states)
-                returns = buffer.returns.detach()
-                old_values = torch.tensor(buffer.critic_values, dtype=torch.float32)
-
                 new_values = self.critic(global_states).squeeze(-1)
-
-                # Clipped value loss (CleanRL detail)
-                if self.config.clip_value_loss:
-                    v_clipped = old_values + torch.clamp(
-                        new_values - old_values,
-                        -self.config.clip_eps,
-                        self.config.clip_eps,
-                    )
-                    raw_loss = (new_values - returns) ** 2
-                    clip_loss = (v_clipped - returns) ** 2
-                    value_loss = 0.5 * torch.max(raw_loss, clip_loss).mean()
-                else:
-                    value_loss = 0.5 * ((new_values - returns) ** 2).mean()
+                # §O.2 — Huber on normalized targets; max(raw, clip) variant
+                # removed (zero-gradient region, FAULT_REPORT_2026-07-13).
+                value_loss = torch.nn.functional.smooth_l1_loss(
+                    new_values, norm_targets)
 
                 self.critic_optimizer.zero_grad()
                 (self.config.value_loss_coef * value_loss).backward()

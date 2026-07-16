@@ -50,6 +50,10 @@ class DomainSummary:
     ram_capacity: float
     supported_tiers: list[InfrastructureTier] = field(default_factory=list)
     active_slice_count: int = 0
+    # Single-node fragmentation headroom (PREREG 2026-07-11 §M.4-Δ3): the best-fitting node's
+    # min(cpu_res/c_ref, ram_res/r_ref) over nodes in the domain. Aggregate residuals hide
+    # whether ANY single node is large enough; this exposes it. 0.0 = no node has headroom.
+    max_node_headroom: float = 0.0
 
 
 @dataclass
