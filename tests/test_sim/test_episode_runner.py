@@ -59,7 +59,7 @@ def coordinator(substrate) -> MDOCoordinator:
     return MDOCoordinator(
         policy=None,
         domain_actors=actors,
-        config=MDOConfig(n_part=2),
+        config=MDOConfig(),
     )
 
 

@@ -5,12 +5,46 @@ from enum import StrEnum
 
 
 class InfrastructureTier(StrEnum):
-    """Node tier in the 6G substrate hierarchy."""
+    """Node tier in the 6G substrate hierarchy.
 
-    RAN_EDGE = "ran_edge"
-    MEC = "mec"
+    THREE tiers, ordered access-inwards. `MEC` and `RAN_EDGE` were merged into
+    `EDGE` on 2026-07-31 (§Y.1e): a MEC host is edge infrastructure, not a
+    separate layer of the transport hierarchy, and both were "the place VNFs are
+    placed near the user". The merged tier's capacity range is the union of the
+    two it replaces, because it genuinely holds both small access sites and
+    larger MEC hosts.
+
+    Do not reintroduce a fourth tier without amending §Y.1e: the tier set is what
+    the slice templates are restricted against and what the per-tier observation
+    block is sized by.
+    """
+
+    EDGE = "edge"
     REGIONAL_CLOUD = "regional_cloud"
     CENTRAL_CLOUD = "central_cloud"
+
+
+#: Canonical tier ordering, access-inwards. THE single source of truth.
+#:
+#: This used to be redefined in seven modules (the MDO observation, the global
+#: critic state, both domain actors, the domain observation, BC pretraining and
+#: the episode runner), one of which carried a comment saying it "must match
+#: exactly" another. Seven copies of an ordering that must agree is a silent-drift
+#: bug waiting to happen: nothing fails loudly if one of them is edited alone, the
+#: actor and critic just start reading different layouts of the same vector.
+TIER_ORDER: tuple[InfrastructureTier, ...] = (
+    InfrastructureTier.EDGE,
+    InfrastructureTier.REGIONAL_CLOUD,
+    InfrastructureTier.CENTRAL_CLOUD,
+)
+
+#: Tier -> index in `TIER_ORDER`.
+TIER_INDEX: dict[InfrastructureTier, int] = {t: i for i, t in enumerate(TIER_ORDER)}
+
+#: Divisor that maps a tier index onto [0, 1] for the observation vectors. Derived
+#: from the tier count so it cannot go stale if the tier set ever changes again;
+#: it was a hardcoded 3.0 when there were four tiers.
+TIER_INDEX_NORM: float = float(len(TIER_ORDER) - 1)
 
 
 class LinkType(StrEnum):

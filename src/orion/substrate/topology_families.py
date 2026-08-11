@@ -253,14 +253,27 @@ def compute_signature(sub: SubstrateNetwork, family_name: str = "") -> TopologyS
 # ── Family → TopologyConfig mapping ────────────────────────────────────────
 
 
-def family_to_config(family: TopologyFamily, num_domains: int = 5) -> TopologyConfig:
+def family_to_config(
+    family: TopologyFamily,
+    num_domains: int = 5,
+    nodes_per_domain_override: int | None = None,
+) -> TopologyConfig:
     """Map a family to a TopologyConfig.
 
     This is the core design: each axis controls specific parameters.
+
+    nodes_per_domain_override scales the PHYSICAL size axis (nodes per domain)
+    independently of the capacity regime. The capacity axis normally sets node
+    count (6 friendly / 3 hostile), which confounds strictness with size; the
+    override exists so size can be varied on its own for the size-axis sweep.
+    It does NOT change obs_dim (domain features are per-domain aggregates), so a
+    policy trained at the default size evaluates zero-shot at any node count.
     """
 
     # ── Capacity axis ──
-    if family.capacity == CapacityRegime.FRIENDLY:
+    if nodes_per_domain_override is not None:
+        nodes_per_domain = [nodes_per_domain_override] * num_domains
+    elif family.capacity == CapacityRegime.FRIENDLY:
         nodes_per_domain = [6] * num_domains  # 6 nodes → chains of 3-5 fit easily
     else:
         nodes_per_domain = [3] * num_domains  # 3 nodes → chains of 3+ can't fit
@@ -309,6 +322,7 @@ def generate_family_instance(
     seed: int,
     num_domains: int = 5,
     inter_domain_bw_override: float | None = None,
+    nodes_per_domain_override: int | None = None,
 ) -> SubstrateNetwork:
     """Generate one topology instance from a family.
 
@@ -317,7 +331,7 @@ def generate_family_instance(
     not produce clean splits).
     """
     rng = np.random.default_rng(seed)
-    config = family_to_config(family, num_domains)
+    config = family_to_config(family, num_domains, nodes_per_domain_override)
     sub = generate_multi_domain_topology(config, rng)
     g = sub.graph
 

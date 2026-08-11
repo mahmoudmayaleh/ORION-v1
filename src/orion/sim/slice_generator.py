@@ -23,32 +23,59 @@ from orion.types import (
 )
 
 # ── Per-slice-type SFC templates ──────────────────────────────────────────────
+#
+# THREE tiers (§Y.1e, 2026-07-31): `mec` merged into `edge`. These templates were
+# REWRITTEN rather than mechanically remapped, because the merge is substantive:
+# every former {ran_edge, mec} pair collapses to a single tier, so the URLLC chain,
+# the V2X head and the mMTC head are now edge-ONLY rather than choosing between two
+# tiers. That concentrates a large share of the workload's demand on `edge`, which
+# is why the binding tier has to be re-measured rather than carried over from the
+# four-tier substrate (where it was regional_cloud at 0.96).
+#
+# Invariant worth stating because a result depends on it: NO template permits
+# `central_cloud` exclusively, and every chain contains at least one edge-only or
+# regional-only VNF. So a domain holding central cloud alone (D3) can host no
+# COMPLETE chain and can only receive a fragment of a split partition. That is what
+# makes cross-domain placement genuinely forced here, and it is asserted in
+# tests/test_y_topology_and_load.py so it cannot be broken by a template edit.
 
 _VNF_TEMPLATES: dict[SliceType, list[dict]] = {
     SliceType.EMBB: [
-        {"type": "Firewall",   "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.8, "vcr": 1.0, "tiers": ["mec", "regional_cloud", "central_cloud"]},
-        {"type": "CDN",        "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.2, "vcr": 0.7, "tiers": ["mec", "regional_cloud"]},
+        {"type": "Firewall",   "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.8, "vcr": 1.0, "tiers": ["edge", "regional_cloud", "central_cloud"]},
+        {"type": "CDN",        "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.2, "vcr": 0.7, "tiers": ["edge", "regional_cloud"]},
         {"type": "vEPC",       "cpu": (4, 8),  "ram": (4, 16), "intensity": 1.0, "vcr": 1.0, "tiers": ["regional_cloud", "central_cloud"]},
     ],
     SliceType.URLLC: [
-        {"type": "Firewall",   "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.5, "vcr": 1.0, "tiers": ["ran_edge", "mec"]},
-        {"type": "vUPF",       "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.6, "vcr": 1.0, "tiers": ["ran_edge", "mec"]},
+        {"type": "Firewall",   "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.5, "vcr": 1.0, "tiers": ["edge"]},
+        {"type": "vUPF",       "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.6, "vcr": 1.0, "tiers": ["edge"]},
     ],
     SliceType.MMTC: [
-        {"type": "IoTGateway", "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.4, "vcr": 0.3, "tiers": ["ran_edge", "mec"]},
-        {"type": "Aggregator", "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.6, "vcr": 0.5, "tiers": ["mec", "regional_cloud"]},
+        {"type": "IoTGateway", "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.4, "vcr": 0.3, "tiers": ["edge"]},
+        {"type": "Aggregator", "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.6, "vcr": 0.5, "tiers": ["edge", "regional_cloud"]},
         {"type": "Analytics",  "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.5, "vcr": 1.0, "tiers": ["regional_cloud", "central_cloud"]},
     ],
     SliceType.V2X: [
-        {"type": "Firewall",   "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.5, "vcr": 1.0, "tiers": ["ran_edge", "mec"]},
-        {"type": "V2XController", "cpu": (2, 4), "ram": (4, 8), "intensity": 0.7, "vcr": 1.0, "tiers": ["mec"]},
+        {"type": "Firewall",   "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.5, "vcr": 1.0, "tiers": ["edge"]},
+        {"type": "V2XController", "cpu": (2, 4), "ram": (4, 8), "intensity": 0.7, "vcr": 1.0, "tiers": ["edge"]},
         {"type": "vEPC",       "cpu": (2, 4),  "ram": (2, 8),  "intensity": 1.0, "vcr": 1.0, "tiers": ["regional_cloud"]},
     ],
     SliceType.XR: [
-        {"type": "Firewall",   "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.8, "vcr": 1.0, "tiers": ["mec"]},
-        {"type": "MediaProc",  "cpu": (8, 16), "ram": (16, 32), "intensity": 2.0, "vcr": 1.2, "tiers": ["mec", "regional_cloud"]},
+        {"type": "Firewall",   "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.8, "vcr": 1.0, "tiers": ["edge"]},
+        {"type": "MediaProc",  "cpu": (8, 16), "ram": (16, 32), "intensity": 2.0, "vcr": 1.2, "tiers": ["edge", "regional_cloud"]},
         {"type": "CDN",        "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.2, "vcr": 0.7, "tiers": ["regional_cloud", "central_cloud"]},
-        {"type": "vEPC",       "cpu": (2, 4),  "ram": (2, 8),  "intensity": 1.0, "vcr": 1.0, "tiers": ["central_cloud"]},
+        # §Y.1c (2026-07-29): was ["central_cloud"]. For a latency-critical slice
+        # the user-plane function belongs at the EDGE, not in the central cloud:
+        # under CUPS/MEC the user-plane half of the UPF is placed at the network
+        # edge while only the control plane stays central, and sub-millisecond
+        # services make edge UPF placement mandatory rather than optional. Pinning
+        # XR's vEPC to central_cloud forced every 4-VNF XR chain across the
+        # inter-domain link and made 41% of XR infeasible on an EMPTY substrate.
+        # RFC 9699 and 3GPP TR 26.928 are explicit that XR cannot be served from
+        # the cloud at all (20 ms motion-to-photon, ~7-8 ms for render + RTT).
+        # eMBB and mMTC still reach central_cloud, so the tier is not orphaned and
+        # the latency-tolerant/latency-critical split is the thing the partition
+        # policy has to learn.
+        {"type": "vEPC",       "cpu": (2, 4),  "ram": (2, 8),  "intensity": 1.0, "vcr": 1.0, "tiers": ["edge", "regional_cloud"]},
     ],
 }
 

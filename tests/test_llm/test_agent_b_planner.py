@@ -65,7 +65,7 @@ class MockLLMBackend:
         for vnf_id, cpu, ram, tiers_str in vnf_blocks:
             permitted = [t.strip().strip('"') for t in tiers_str.split(",") if t.strip()]
             # Pick first tier that overlaps with domain 0
-            tier = next((t for t in permitted if t in dom0_tiers), permitted[0] if permitted else "mec")
+            tier = next((t for t in permitted if t in dom0_tiers), permitted[0] if permitted else "edge")
             assignments.append({
                 "vnf_id": vnf_id,
                 "domain": "d0",
@@ -126,7 +126,7 @@ class TestPlanSummaryFromAgentB:
         plan = {
             "vnf_assignments": [
                 {"vnf_id": v.vnf_id, "domain": "d0",
-                 "required_tier": "mec", "cpu_demand": v.cpu_demand,
+                 "required_tier": "edge", "cpu_demand": v.cpu_demand,
                  "ram_demand": v.ram_demand}
                 for v in sample_slice.vnfs
             ],

@@ -86,7 +86,7 @@ def build_pinned_plan_schema(slice_request: dict, abstract_topology: dict) -> di
       - domain at position i is an enum of ONLY that VNF's tier-feasible domains D(tau_fk),
       - required_tier is a permissive enum (recomputed deterministically post-generation).
     Grammar-valid output can no longer name a nonexistent VNF, an invalid domain, OR a
-    tier-infeasible domain (a contract violation the RL arms structurally cannot make). Only
+    tier-infeasible domain (a contract violation the RL approaches structurally cannot make). Only
     genuine C4 (resource) / C5 (inter-domain bandwidth/reachability) infeasibility can remain --
     exactly the prior-quality signal the model owns.
 
@@ -242,6 +242,100 @@ OUTPUT FORMAT — respond ONLY with a single JSON object:
 Output only the JSON, no prose."""
 
 
+# ── M^B exemplar rendering ───────────────────────────────────────────────────
+
+# An M^B exemplar states the plan SHAPE and the network condition it held under,
+# not the concrete domain assignment.
+#
+# Why: the concrete form makes the model copy. Paired copy test 2026-08-05, 149
+# matched decisions at identical substrate state -- exemplars rewrote 33% of
+# Agent B's plans and moved feasibility by +0.0 pp (3 better, 3 worse, McNemar
+# p=1.0). Every URLLC K=2 went to [d0,d0] and every eMBB K=3 to [d3,d4,d3]
+# whatever the congestion, so the same retrieved plan was infeasible at arrival
+# 10 and feasible at arrival 18. The exemplar reproduced a plan shape without
+# the conditions that made it work.
+#
+# Two documented failure modes meet here. Case-based reasoning is Retrieve ->
+# Reuse -> Revise -> Retain (arXiv:2504.06943); M^B had no Revise step, so a
+# retrieved case was applied unadapted. And LLMs exhibit copy bias, echoing
+# demonstration answers instead of the pattern, worst when the demonstration
+# context resembles the query context (arXiv:2410.01288) -- which under a fixed
+# §Y substrate it always does. Trajectory-level retrieval returning plausible
+# cases that ignore state-transition dynamics is the same diagnosis TRAD reaches
+# (arXiv:2403.06221).
+#
+# Set False to reproduce the pre-2026-08-05 concrete form.
+MB_ABSTRACT_EXEMPLARS = True
+
+_TIER_ORDER = ("edge", "regional_cloud", "central_cloud")
+
+
+def _condition_line(condition: dict | None) -> str | None:
+    """Congestion in the fields that actually move; see condition_signature."""
+    if not condition:
+        return None
+    tiers = condition.get("tier_cpu_residual") or {}
+    shown = ", ".join(f"{t} {float(tiers[t]):.2f}" for t in _TIER_ORDER if t in tiers)
+    return (f"overall cpu headroom {float(condition.get('cpu_residual_frac', 0.0)):.2f}"
+            f" ({condition.get('bucket', 'unknown')})"
+            + (f"; per-tier headroom {shown}" if shown else ""))
+
+
+def _slice_line(slice_request: dict) -> str:
+    vnfs = slice_request.get("vnfs", [])
+    qos = slice_request.get("qos") or {}
+    tiers = sorted({t for v in vnfs for t in (v.get("permitted_tiers") or [])})
+    return (f"{slice_request.get('slice_type', 'unknown')}, chain of {len(vnfs)}, "
+            f"max delay {qos.get('max_e2e_delay', '?')} ms, "
+            f"permitted tiers {tiers}")
+
+
+def _abstract_exemplar(ex: dict, current_condition: dict | None) -> list[str]:
+    """One exemplar as shape + the condition it held under + the condition now.
+
+    No domain identifier appears anywhere in the block. The model is given what
+    worked and how the network differs today, and has to choose domains itself.
+    """
+    out = [f"Past slice: {_slice_line(ex.get('slice_request') or {})}"]
+
+    shape = ex.get("plan_shape") or {}
+    strategy = shape.get("strategy")
+    tiers = shape.get("tier_assignment") or []
+    n_dom = len(shape.get("domains_used") or [])
+    if not strategy:
+        # Counter-examples and pre-§Y entries carry no plan_shape. Derive width
+        # and tiers from the stored assignment rather than dropping the case:
+        # an exemplar with no placement information is not worth a prompt slot.
+        assigns = (ex.get("placement_plan") or {}).get("vnf_assignments") or []
+        doms = {a.get("domain") for a in assigns if a.get("domain")}
+        if doms:
+            n_dom = len(doms)
+            strategy = "co-locate" if n_dom <= 1 else "split"
+            tiers = [a.get("required_tier") for a in assigns if a.get("required_tier")]
+        elif ex.get("committed_partition") is not None:
+            n_dom = len(set(ex["committed_partition"]))
+            strategy = "co-locate" if n_dom <= 1 else "split"
+
+    if strategy:
+        placed = f"{strategy} across {n_dom} domain(s)" if n_dom else str(strategy)
+        out.append(f"Plan shape that was tried: {placed}"
+                   + (f", tiers {tiers}" if tiers else ""))
+        cuts = shape.get("cut_points") or []
+        if cuts:
+            out.append(f"Chain was cut between: {cuts}")
+
+    when = _condition_line(ex.get("condition"))
+    if when:
+        out.append(f"Network then: {when}")
+    now = _condition_line(current_condition)
+    if now:
+        out.append(f"Network now:  {now}")
+
+    if ex.get("outcome"):
+        out.append(f"Outcome: {ex['outcome']}.")
+    return out
+
+
 # ── Prompt builder ───────────────────────────────────────────────────────────
 
 def build_user_prompt(
@@ -250,6 +344,8 @@ def build_user_prompt(
     few_shot_examples: list[dict] | None = None,
     violation_feedback: str | None = None,
     reference_knowledge: str | None = None,
+    current_condition: dict | None = None,
+    insights: str | None = None,
 ) -> str:
     """Build the user message for Agent B.
 
@@ -262,6 +358,12 @@ def build_user_prompt(
             appended on retry/replan rounds.
         reference_knowledge: Optional formatted text from K^B semantic memory,
             injected as a Reference Knowledge block above the few-shot examples.
+        current_condition: Condition signature at decision time. Rendered beside
+            each exemplar's own condition so the difference is explicit rather
+            than left for the model to infer.
+        insights: Formatted rule block from insight_extraction.format_insights.
+            ExpeL concatenates insights into the task specification alongside
+            the retrieved cases, so this sits above them and below K^B.
     """
     parts: list[str] = []
 
@@ -269,13 +371,36 @@ def build_user_prompt(
     if reference_knowledge:
         parts.append(reference_knowledge)
 
+    # Distilled rules from M^B (ExpeL insight extraction)
+    if insights:
+        parts.append("\n" + insights)
+
     # Few-shot examples from M^B
     if few_shot_examples:
-        parts.append("\n--- Past Plans (Few-Shot Examples) ---")
-        for i, ex in enumerate(few_shot_examples, 1):
-            parts.append(f"\n--- Example {i} ---")
-            parts.append(f"Slice Request:\n{json.dumps(ex['slice_request'], indent=2)}")
-            parts.append(f"Placement Plan:\n{json.dumps(ex['placement_plan'], indent=2)}")
+        if MB_ABSTRACT_EXEMPLARS:
+            parts.append(
+                "\n--- Past Outcomes (shapes, not assignments) ---"
+                "\nThese record what plan SHAPE worked under what network"
+                " condition. The domains are not given: conditions have changed,"
+                " so choose domains for the network as it is now.")
+            for i, ex in enumerate(few_shot_examples, 1):
+                parts.append(f"\n--- Case {i} ---")
+                parts.extend(_abstract_exemplar(ex, current_condition))
+        else:
+            parts.append("\n--- Past Plans (Few-Shot Examples) ---")
+            for i, ex in enumerate(few_shot_examples, 1):
+                parts.append(f"\n--- Example {i} ---")
+                parts.append(f"Slice Request:\n{json.dumps(ex['slice_request'], indent=2)}")
+                parts.append(
+                    f"You suggested this plan:\n{json.dumps(ex['placement_plan'], indent=2)}")
+                # Second outcome loop: what the RL coordinator actually committed + verdict,
+                # so the next plan is steered toward what gets committed and verified.
+                if ex.get("committed_partition") is not None:
+                    dv = " (DIVERGED from your suggestion)" if ex.get("diverged") else ""
+                    parts.append(
+                        f"The RL coordinator committed partition {ex['committed_partition']}{dv}.")
+                if ex.get("outcome"):
+                    parts.append(f"Ground-truth verdict: {ex['outcome']}.")
 
     # Current task
     parts.append("\n--- Current Task ---")
@@ -322,6 +447,8 @@ class AgentB:
         violation_feedback: str | None = None,
         reference_knowledge: str | None = None,
         plan_schema: dict | None = None,
+        current_condition: dict | None = None,
+        insights: str | None = None,
     ) -> dict:
         """Generate one abstract plan via LLM call.
 
@@ -331,6 +458,8 @@ class AgentB:
             few_shot_examples: Few-shot examples from M^B episodic memory.
             violation_feedback: Violation text from a prior failed attempt.
             reference_knowledge: Formatted text from K^B semantic memory.
+            current_condition: Condition signature at decision time, rendered
+                beside each exemplar's own condition.
 
         Returns:
             Parsed plan dict.
@@ -341,6 +470,7 @@ class AgentB:
         user_msg = build_user_prompt(
             slice_request, abstract_topology,
             few_shot_examples, violation_feedback, reference_knowledge,
+            current_condition=current_condition, insights=insights,
         )
         raw = self.llm.complete(
             self.system_prompt, user_msg,
@@ -377,6 +507,8 @@ class AgentB:
         max_retries: int = 1,
         reference_knowledge: str | None = None,
         plan_schema: dict | None = None,
+        current_condition: dict | None = None,
+        insights: str | None = None,
     ) -> tuple[dict, CheckResult]:
         """Generate a plan and validate it, retrying once on structural failure.
 
@@ -408,10 +540,12 @@ class AgentB:
                         slice_request, abstract_topology,
                         few_shot_examples, violation_feedback, reference_knowledge,
                         plan_schema=plan_schema,
+                        current_condition=current_condition,
+                        insights=insights,
                     )
             except PlanTruncationError as exc:
                 # Context-window exhaustion, NOT malformed output. Counted
-                # distinctly so an arm-asymmetric truncation regression is
+                # distinctly so an approach-asymmetric truncation regression is
                 # visible in results rather than hiding as a parse failure.
                 logger.warning(
                     "agent_b_completion_truncated",
@@ -466,6 +600,9 @@ class AgentB:
         mb: EpisodicMemory | None = None,
         max_retries: int = 1,
         plan_schema: dict | None = None,
+        topology_signature: dict | None = None,
+        condition_signature: dict | None = None,
+        insights: str | None = None,
     ) -> tuple[dict, CheckResult]:
         """Generate a plan using K^B semantic and M^B episodic memory.
 
@@ -484,7 +621,8 @@ class AgentB:
         """
         from orion.llm.semantic_memory import build_query_from_slice
 
-        query = build_query_from_slice(slice_request)
+        query = build_query_from_slice(slice_request, topology=topology_signature,
+                                       condition=condition_signature)
 
         reference_knowledge: str | None = None
         if kb is not None:
@@ -495,7 +633,11 @@ class AgentB:
 
         few_shot_examples: list[dict] | None = None
         if mb is not None:
-            mb_entries = mb.retrieve(query, top_k=3)
+            # §Y.6: the state term is network CONDITION when one is supplied.
+            # topology_signature is the pre-§Y key and is a constant (hence a
+            # no-op) on a fixed substrate.
+            mb_entries = mb.retrieve(query, top_k=3, topology=topology_signature,
+                                     condition=condition_signature)
             converted = mb.to_few_shot(mb_entries)
             if converted:
                 few_shot_examples = converted
@@ -507,4 +649,6 @@ class AgentB:
             max_retries=max_retries,
             reference_knowledge=reference_knowledge,
             plan_schema=plan_schema,
+            current_condition=condition_signature,
+            insights=insights,
         )

@@ -61,19 +61,80 @@ def sfc_template(slice_req: SliceRequest) -> tuple[str, ...]:
     return tuple(v.vnf_type for v in slice_req.vnfs)
 
 
-def plan_signature(slice_req: SliceRequest) -> tuple[str, str, tuple[str, ...]]:
-    """Fine intent-level signature: (slice_type, qos_bucket, sfc_template).
+def delay_bucket(qos: QoSRequirements) -> str:
+    """Finer delay quantization than qos_bucket (6 bins vs 3)."""
+    d = qos.max_e2e_delay
+    for hi, name in ((5.0, "d<5"), (10.0, "d5-10"), (20.0, "d10-20"),
+                     (50.0, "d20-50"), (100.0, "d50-100")):
+        if d < hi:
+            return name
+    return "d100+"
 
-    The canonical key for abstract plan caching and the strategy monitor's
-    per-plan drift stream. Exact matching — the ordered VNF-type tuple is the
-    keyword set with order; request-specific scalars (cpu/ram/bw demands,
-    vnf_ids, beta_in) are instantiated fresh per request, never keyed on.
-    """
+
+def throughput_bucket(qos: QoSRequirements) -> str:
+    """Ingress-rate (beta_in) quantization. The OLD key was delay-only, so eMBB
+    slices spanning beta_in 50-500 Mbps all shared ONE plan. Bandwidth drives the
+    cross-domain routing decision, so it MUST be in the key."""
+    t = qos.min_throughput
+    for hi, name in ((10.0, "t<10"), (50.0, "t10-50"), (100.0, "t50-100"),
+                     (250.0, "t100-250"), (500.0, "t250-500")):
+        if t < hi:
+            return name
+    return "t500+"
+
+
+def plan_signature(slice_req: SliceRequest) -> tuple[str, str, str, tuple[str, ...]]:
+    """Fine intent-level signature: (slice_type, delay_bucket, throughput_bucket,
+    sfc_template). Delay AND throughput are both bucketed (was delay-only) so
+    arrivals with materially different bandwidth get materially different plans."""
     return (
         slice_req.slice_type.value,
-        qos_bucket(slice_req.qos),
+        delay_bucket(slice_req.qos),
+        throughput_bucket(slice_req.qos),
         sfc_template(slice_req),
     )
+
+
+def condition_key(
+    condition: dict, cpu_step: float = 0.10, tier_step: float = 0.25
+) -> tuple:
+    """Quantised congestion terms for the cache key.
+
+    `plan_signature` is substrate-INDEPENDENT, so a plan produced on an empty
+    network is served on a saturated one. That collision is what §R measured as
+    the cache hurting acceptance, and it is also incoherent with M^B, whose
+    retrieval is condition-keyed: the cache would serve a stale plan on a hit
+    and never consult the memory that exists to notice.
+
+    Quantisation is measured, not chosen by taste (scripts probe_keyladder):
+    over a 2000-arrival episode the per-tier CPU residual swings 0.61 at the
+    edge and 0.75 at regional cloud, while inter-domain bandwidth never moves at
+    all and central cloud moves 0.011 -- so tier scarcity is keyed and bandwidth
+    is not. Steps of 0.10 on the overall residual and 0.25 per tier give 174
+    distinct plans per 2000-arrival episode (91.3% hit); 0.10 per tier gives 312
+    (84.4%) with no evidence the plan changes that finely.
+    """
+    def _q(x: float, step: float) -> float:
+        return round(round(float(x) / step) * step, 4)
+
+    tiers = condition.get("tier_cpu_residual") or {}
+    return (
+        _q(condition.get("cpu_residual_frac", 0.0), cpu_step),
+        tuple(_q(tiers[k], tier_step) for k in sorted(tiers)),
+    )
+
+
+def plan_profile(slice_req: SliceRequest, condition: dict | None = None) -> tuple:
+    """Cache key: request intent AND the network condition it was planned under.
+
+    `plan_signature` alone is the intent half. With `condition` supplied this is
+    the key the grid runs on; without it the behaviour is the old
+    substrate-independent one, kept only so existing callers do not change
+    meaning silently.
+    """
+    if condition is None:
+        return plan_signature(slice_req)
+    return plan_signature(slice_req) + condition_key(condition)
 
 
 # ── Abstract plan (the cached, request-invariant core) ───────────────────

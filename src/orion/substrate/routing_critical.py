@@ -144,7 +144,7 @@ def rc_slice_factory(
 
     Same call signature as `generate_slice_request`, so it drops straight into
     `ArrivalProcess(slice_factory=...)` and is seen identically by the ceiling
-    enumerator and every arm.
+    enumerator and every approach.
 
     Carried under `SliceType.EMBB` (the slice_type is only a cache-key coarse
     bucket); the RC chains are distinguished by their `sfc_template` — the

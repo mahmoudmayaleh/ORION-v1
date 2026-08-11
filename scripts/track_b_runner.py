@@ -6,9 +6,9 @@ K^A-consistent gold. Sonnet calls run through FrontierBackend's CostMeter; a per
 (data/api_cost_ledger.json) enforces the SHARED $10 cap across Track B + C + R.3.
 
 Usage:
-  python scripts/track_b_runner.py --arms tele                 # local only, $0
-  python scripts/track_b_runner.py --arms sonnet --smoke 2     # 2-call infra+guard smoke
-  python scripts/track_b_runner.py --arms sonnet               # full Sonnet arms under cap
+  python scripts/track_b_runner.py --approaches tele                 # local only, $0
+  python scripts/track_b_runner.py --approaches sonnet --smoke 2     # 2-call infra+guard smoke
+  python scripts/track_b_runner.py --approaches sonnet               # full Sonnet approaches under cap
 Frozen inputs: data/benchmark_S/benchmark_S.json (+ MANIFEST hash), docs/PREREG_S_2026-07-15.md
 """
 import sys, json, argparse, hashlib, time, logging, re
@@ -119,8 +119,8 @@ def score_item(spec, gold, valid):
     return s
 
 
-def run_arm(agent, items, kb, arm_label):
-    """One arm over all 100 items. Returns per-item records. kb=None => K^A off."""
+def run_approach(agent, items, kb, approach_label):
+    """One approach over all 100 items. Returns per-item records. kb=None => K^A off."""
     recs = []
     t0 = time.time()
     for it in items:
@@ -132,10 +132,10 @@ def run_arm(agent, items, kb, arm_label):
         except Exception as e:  # api-fail / cost-cap propagate up; parse errors -> invalid
             from orion.llm.frontier_backend import CostCapExceeded
             if isinstance(e, CostCapExceeded):
-                log.error("COST CAP hit in %s at item %s — stopping arm.", arm_label, it["id"])
+                log.error("COST CAP hit in %s at item %s — stopping approach.", approach_label, it["id"])
                 raise
             spec, valid = {}, False
-            log.warning("%s %s: %s", arm_label, it["id"], str(e)[:100])
+            log.warning("%s %s: %s", approach_label, it["id"], str(e)[:100])
         sc = score_item(spec, gold, valid)
         # two-tier for ambiguous
         if it["stratum"] == "ambiguous":
@@ -143,7 +143,7 @@ def run_arm(agent, items, kb, arm_label):
             sc["tier1_correct"] = sc["slice_type_pred"] == gold["slice_type"]
             sc["tier2_correct"] = sc["slice_type_pred"] in defensible
         recs.append({"id": it["id"], "stratum": it["stratum"], **sc})
-    log.info("%s done: %d items in %.1fs", arm_label, len(recs), time.time() - t0)
+    log.info("%s done: %d items in %.1fs", approach_label, len(recs), time.time() - t0)
     return recs
 
 
@@ -172,7 +172,7 @@ def aggregate(recs):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arms", default="tele", help="comma list: tele,sonnet")
+    ap.add_argument("--approaches", default="tele", help="comma list: tele,sonnet")
     ap.add_argument("--snapshot", default="claude-sonnet-5", help="pinned Sonnet snapshot")
     ap.add_argument("--port", type=int, default=8000, help="local Tele-8B port")
     ap.add_argument("--smoke", type=int, default=0, help="if >0, run only N items (infra check)")
@@ -196,8 +196,8 @@ def main():
     items = json.loads(BENCH.read_text(encoding="utf-8"))
     if args.smoke:
         items = items[:args.smoke]
-    log.info("Track B | benchmark_S_sha256=%s prereg_S_sha256=%s | %d items | arms=%s",
-             bench_hash, prereg_hash, len(items), args.arms)
+    log.info("Track B | benchmark_S_sha256=%s prereg_S_sha256=%s | %d items | approaches=%s",
+             bench_hash, prereg_hash, len(items), args.approaches)
 
     from orion.llm.llm_backend import LLMBackend, LLMConfig
     from orion.llm.agent_a import AgentA
@@ -205,24 +205,24 @@ def main():
     kb_path = ROOT / "data" / "kb_entries.json"
     kb = SemanticMemory.from_json(kb_path) if kb_path.exists() else None
     if kb is None:
-        log.warning("K^A (kb_entries.json) NOT found — K^A-on arm will equal K^A-off!")
+        log.warning("K^A (kb_entries.json) NOT found — K^A-on approach will equal K^A-off!")
 
-    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    approaches = [a.strip() for a in args.approaches.split(",") if a.strip()]
     # Serving-layer provenance (chat_format alongside model_id) — pinned per run.
-    serving = serving_provenance(args.port) if "tele" in arms else None
+    serving = serving_provenance(args.port) if "tele" in approaches else None
     if serving:
         log.info("serving provenance (local): %s", serving)
     results = {"track": "B", "benchmark_S_sha256": _sha(BENCH), "prereg_S_sha256": prereg_hash,
                "snapshot": args.snapshot, "smoke": args.smoke,
-               "serving_provenance_local": serving, "arms": {}}
+               "serving_provenance_local": serving, "approaches": {}}
 
-    for arm in arms:
-        if arm == "tele":
+    for approach in approaches:
+        if approach == "tele":
             backend = LLMBackend(LLMConfig(base_url=f"http://localhost:{args.port}/v1",
                                            api_key="EMPTY", model="default",
                                            temperature=0.0, max_tokens=2048))
             meter = None
-        elif arm == "sonnet":
+        elif approach == "sonnet":
             from orion.llm.frontier_backend import (FrontierBackend, CostMeter,
                                                     make_frontier_config, PILOT_COST_CAP_USD)
             prior = json.loads(LEDGER.read_text())["spent_usd"] if LEDGER.exists() else 0.0
@@ -230,26 +230,26 @@ def main():
             log.info("SHARED cost ledger: prior_spent=$%.4f  cap=$%.2f  remaining=$%.4f",
                      prior, PILOT_COST_CAP_USD, remaining)
             if remaining <= 0:
-                log.error("cap exhausted; refusing Sonnet arm."); continue
+                log.error("cap exhausted; refusing Sonnet approach."); continue
             meter = CostMeter(cap_usd=remaining)
             cfg = make_frontier_config(args.snapshot, temperature=0.0)
             backend = FrontierBackend(cfg, meter)
         else:
-            log.warning("unknown arm %s", arm); continue
+            log.warning("unknown approach %s", approach); continue
 
         agent = AgentA(backend)
         for kb_on in (True, False):
-            label = f"{arm}|K^A={'on' if kb_on else 'off'}"
+            label = f"{approach}|K^A={'on' if kb_on else 'off'}"
             try:
-                recs = run_arm(agent, items, kb if kb_on else None, label)
+                recs = run_approach(agent, items, kb if kb_on else None, label)
             except Exception as e:
                 from orion.llm.frontier_backend import CostCapExceeded
                 if isinstance(e, CostCapExceeded):
                     log.error("stopping: cost cap. Partial results saved.")
                     break
                 raise
-            results["arms"][label] = {"aggregate": aggregate(recs), "items": recs}
-            log.info("%s -> %s", label, results["arms"][label]["aggregate"])
+            results["approaches"][label] = {"aggregate": aggregate(recs), "items": recs}
+            log.info("%s -> %s", label, results["approaches"][label]["aggregate"])
 
         if meter is not None:
             spent = meter.spent_usd
@@ -257,22 +257,22 @@ def main():
             LEDGER.write_text(json.dumps({"spent_usd": round(prior + spent, 6),
                                           "updated": "track_b", "cap": 10.0}, indent=2))
             log.info("Sonnet spent this run=$%.4f  ledger total=$%.4f", spent, prior + spent)
-            results["arms"].setdefault("_cost", {})["sonnet_run_usd"] = round(spent, 4)
+            results["approaches"].setdefault("_cost", {})["sonnet_run_usd"] = round(spent, 4)
 
     tag = "smoke" if args.smoke else "full"
     rep = f"_rep{args.rep}" if args.rep else ""
     results["provenance"] = _prov
     results["rep"] = args.rep
-    outp = ROOT / "data" / f"track_b_results_{'-'.join(arms)}_{tag}{rep}.json"
+    outp = ROOT / "data" / f"track_b_results_{'-'.join(approaches)}_{tag}{rep}.json"
     outp.write_text(json.dumps(results, indent=2))
     log.info("results -> %s", outp)
     # readout
     print("\n" + "=" * 84)
     print(f"TRACK B READOUT ({tag}) — benchmark {bench_hash} | prereg {prereg_hash}")
     print("=" * 84)
-    hdr = ["arm", "schema", "slice", "sfc_all", "vcr", "delay", "tput", "bw", "amb_t1", "amb_t2"]
+    hdr = ["approach", "schema", "slice", "sfc_all", "vcr", "delay", "tput", "bw", "amb_t1", "amb_t2"]
     print("{:<16}{:>7}{:>7}{:>8}{:>7}{:>7}{:>7}{:>7}{:>8}{:>8}".format(*hdr))
-    for label, d in results["arms"].items():
+    for label, d in results["approaches"].items():
         if label.startswith("_"):
             continue
         a = d["aggregate"]

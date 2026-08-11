@@ -7,6 +7,7 @@ JSON extraction, and the structural-check retry loop using mock responses.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -41,11 +42,11 @@ def _valid_plan_json() -> str:
         "plan_id": "xr_telepresence_005_plan",
         "vnf_assignments": [
             {"vnf_id": "xr_telepresence_005_f1", "domain": "d0",
-             "required_tier": "mec", "cpu_demand": 4.0, "ram_demand": 8.0},
+             "required_tier": "edge", "cpu_demand": 4.0, "ram_demand": 8.0},
             {"vnf_id": "xr_telepresence_005_f2", "domain": "d1",
-             "required_tier": "mec", "cpu_demand": 14.0, "ram_demand": 30.0},
+             "required_tier": "edge", "cpu_demand": 14.0, "ram_demand": 30.0},
             {"vnf_id": "xr_telepresence_005_f3", "domain": "d1",
-             "required_tier": "mec", "cpu_demand": 10.0, "ram_demand": 25.0},
+             "required_tier": "edge", "cpu_demand": 10.0, "ram_demand": 25.0},
             {"vnf_id": "xr_telepresence_005_f4", "domain": "d2",
              "required_tier": "regional_cloud", "cpu_demand": 18.0,
              "ram_demand": 45.0},
@@ -71,11 +72,11 @@ def _invalid_plan_json() -> str:
         "plan_id": "xr_telepresence_005_plan",
         "vnf_assignments": [
             {"vnf_id": "xr_telepresence_005_f1", "domain": "d1",
-             "required_tier": "mec", "cpu_demand": 4.0, "ram_demand": 8.0},
+             "required_tier": "edge", "cpu_demand": 4.0, "ram_demand": 8.0},
             {"vnf_id": "xr_telepresence_005_f2", "domain": "d1",
-             "required_tier": "mec", "cpu_demand": 14.0, "ram_demand": 30.0},
+             "required_tier": "edge", "cpu_demand": 14.0, "ram_demand": 30.0},
             {"vnf_id": "xr_telepresence_005_f3", "domain": "d1",
-             "required_tier": "mec", "cpu_demand": 10.0, "ram_demand": 25.0},
+             "required_tier": "edge", "cpu_demand": 10.0, "ram_demand": 25.0},
             {"vnf_id": "xr_telepresence_005_f4", "domain": "d2",
              "required_tier": "regional_cloud", "cpu_demand": 18.0,
              "ram_demand": 45.0},
@@ -119,9 +120,40 @@ class TestPromptBuilding:
 
     def test_prompt_includes_few_shot(self, slice_request, topology, few_shot_examples):
         prompt = build_user_prompt(slice_request, topology, few_shot_examples)
-        assert "Example 1" in prompt
-        assert "Example 2" in prompt
-        assert "urllc_factory_002" in prompt
+        assert "Case 1" in prompt
+        assert "Case 2" in prompt
+        assert "co-locate across 1 domain(s)" in prompt
+        assert "split across 3 domain(s)" in prompt
+
+    def test_exemplars_carry_no_domain_identifier(self, slice_request, topology,
+                                                  few_shot_examples):
+        """The whole point of the abstract form: nothing to copy.
+
+        With concrete assignments in the prompt the model echoed them into a
+        network they no longer fitted (copy test 2026-08-05, +0.0 pp on 149
+        paired decisions). If a domain id ever reaches the exemplar block again
+        the mechanism silently reverts to the form that measured null, and no
+        acceptance number would reveal it.
+        """
+        prompt = build_user_prompt(slice_request, topology, few_shot_examples)
+        block = prompt[:prompt.index("--- Current Task ---")]
+        leaked = [d for ex in few_shot_examples
+                  for a in ex["placement_plan"]["vnf_assignments"]
+                  for d in [a["domain"]] if re.search(rf"\b{re.escape(d)}\b", block)]
+        assert not leaked, f"domain ids leaked into the exemplar block: {sorted(set(leaked))}"
+        assert "vnf_assignments" not in block
+
+    def test_prompt_states_current_condition_beside_past(self, slice_request, topology,
+                                                         few_shot_examples):
+        ex = [dict(few_shot_examples[0],
+                   condition={"cpu_residual_frac": 0.88, "bucket": "free",
+                              "tier_cpu_residual": {"edge": 0.91}})]
+        prompt = build_user_prompt(
+            slice_request, topology, ex,
+            current_condition={"cpu_residual_frac": 0.31, "bucket": "tight",
+                               "tier_cpu_residual": {"edge": 0.19}})
+        assert "Network then:" in prompt and "edge 0.91" in prompt
+        assert "Network now:" in prompt and "edge 0.19" in prompt
 
     def test_prompt_includes_violation_feedback(self, slice_request, topology):
         prompt = build_user_prompt(
@@ -133,7 +165,8 @@ class TestPromptBuilding:
 
     def test_prompt_without_optional_fields(self, slice_request, topology):
         prompt = build_user_prompt(slice_request, topology)
-        assert "Example" not in prompt
+        assert "Case 1" not in prompt
+        assert "Past Outcomes" not in prompt
         assert "PREVIOUS ATTEMPT FAILED" not in prompt
 
 
@@ -225,9 +258,12 @@ class TestAgentBGenerateAndCheck:
         agent.generate_and_check(
             slice_request, topology,
             few_shot_examples=few_shot_examples,
+            current_condition={"cpu_residual_frac": 0.31, "bucket": "tight"},
         )
         user_msg = mock_llm.complete.call_args[0][1]
-        assert "urllc_factory_002" in user_msg
+        assert "Past Outcomes" in user_msg
+        assert "co-locate across 1 domain(s)" in user_msg
+        assert "Network now:" in user_msg
 
 
 # ── Tests: abstract topology integration ─────────────────────────────────────
@@ -280,7 +316,7 @@ class TestAgentBMemoryIntegration:
                 "domain_id": 0,
                 "cpu_residual": 100,
                 "ram_residual": 200,
-                "dominant_tiers": ["mec"],
+                "dominant_tiers": ["edge"],
             }
         ],
         "inter_domain_links": [],
@@ -295,7 +331,7 @@ class TestAgentBMemoryIntegration:
                 "vnf_type": "Firewall",
                 "cpu_demand": 2,
                 "ram_demand": 4,
-                "permitted_tiers": ["mec"],
+                "permitted_tiers": ["edge"],
             }
         ],
         "flow_edges": [],
@@ -402,7 +438,7 @@ class TestAgentBMemoryIntegration:
 
         # Prompt should contain both memory sources
         assert "Reference Knowledge" in user_msg
-        assert "Past Plans" in user_msg or "Example" in user_msg
+        assert "Past Outcomes" in user_msg or "Past Plans" in user_msg
 
     def test_generate_with_memory_kb_only(self):
         """With mb=None the prompt has reference knowledge but no past plans."""

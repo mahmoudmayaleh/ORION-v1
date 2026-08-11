@@ -66,7 +66,7 @@ class ArrivalProcess:
         self.rng = rng
         # Defaults to the standard generator; the routing-critical (§Q) family
         # injects its own cut-sensitive chain factory here. Same signature, so
-        # the ceiling enumerator and every arm draw the identical stream.
+        # the ceiling enumerator and every approach draw the identical stream.
         self.slice_factory: SliceFactory = slice_factory or generate_slice_request
         self.events: list[SimEvent] = []
         self._event_idx: int = 0

@@ -164,7 +164,7 @@ class ConstrainedAgentB:
                 {
                     "vnf_id": a.get("vnf_id", ""),
                     "domain": f"d{a['domain']}" if isinstance(a.get("domain"), int) else str(a.get("domain", "d0")),
-                    "required_tier": a.get("required_tier", "mec"),
+                    "required_tier": a.get("required_tier", "edge"),
                     "cpu_demand": next(
                         (v["cpu_demand"] for v in slice_request["vnfs"]
                          if v["vnf_id"] == a.get("vnf_id")), 0.0

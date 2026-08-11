@@ -14,21 +14,22 @@ from orion.substrate.graph_model import SubstrateNetwork
 from orion.types import InfrastructureTier, LinkType
 
 # Tier-to-capacity lookup tables.
+# §Y.1e: three tiers. `edge` spans the union of the former ran_edge (8-16 CPU) and
+# mec (16-32) ranges rather than either endpoint, because the merged tier really
+# does hold both small access sites and larger MEC hosts; the within-tier spread
+# represents that heterogeneity instead of hiding it.
 _TIER_CPU_RANGE: dict[InfrastructureTier, tuple[float, float]] = {
-    InfrastructureTier.RAN_EDGE:        (8.0,  16.0),
-    InfrastructureTier.MEC:             (16.0, 32.0),
+    InfrastructureTier.EDGE:            (8.0,  32.0),
     InfrastructureTier.REGIONAL_CLOUD:  (32.0, 48.0),
     InfrastructureTier.CENTRAL_CLOUD:   (48.0, 64.0),
 }
 _TIER_RAM_RANGE: dict[InfrastructureTier, tuple[float, float]] = {
-    InfrastructureTier.RAN_EDGE:        (16.0,  32.0),
-    InfrastructureTier.MEC:             (32.0,  128.0),
+    InfrastructureTier.EDGE:            (16.0,  128.0),
     InfrastructureTier.REGIONAL_CLOUD:  (128.0, 192.0),
     InfrastructureTier.CENTRAL_CLOUD:   (192.0, 256.0),
 }
 _TIER_PROC_DELAY_RANGE: dict[InfrastructureTier, tuple[float, float]] = {
-    InfrastructureTier.RAN_EDGE:        (0.5, 1.0),
-    InfrastructureTier.MEC:             (0.8, 1.5),
+    InfrastructureTier.EDGE:            (0.5, 1.5),
     InfrastructureTier.REGIONAL_CLOUD:  (1.0, 2.5),
     InfrastructureTier.CENTRAL_CLOUD:   (1.5, 3.0),
 }

@@ -14,8 +14,8 @@ R.2-prime before it is cited again. A script that runs against any result JSON
 makes the re-derivation checkable and repeatable, instead of a number in prose.
 
 Usage:
-    python scripts/derive_a2.py data/r_local_results_R2PRIME.json [--arm R.2]
-    python scripts/derive_a2.py data/r_local_results_R12.json --arm R.2   # validation
+    python scripts/derive_a2.py data/r_local_results_R2PRIME.json [--approach R.2]
+    python scripts/derive_a2.py data/r_local_results_R12.json --approach R.2   # validation
 """
 from __future__ import annotations
 
@@ -31,16 +31,16 @@ def _mean(xs):
     return sum(xs) / len(xs) if xs else float("nan")
 
 
-def derive(path: Path, arm: str) -> list[dict]:
+def derive(path: Path, approach: str) -> list[dict]:
     d = json.loads(path.read_text())
     rows = []
     for seed in sorted(BW_FOR_SEED):
-        cell = d.get("cells", {}).get(f"{arm}|{seed}")
+        cell = d.get("cells", {}).get(f"{approach}|{seed}")
         if cell is None:
             continue
         trace = cell.get("trace") or []
         if not trace:
-            print(f"  !! {arm}|{seed}: no per-arrival trace in this JSON")
+            print(f"  !! {approach}|{seed}: no per-arrival trace in this JSON")
             continue
         forced = [t for t in trace if t.get("forced")]
         flex = [t for t in trace if not t.get("forced")]
@@ -66,11 +66,11 @@ def derive(path: Path, arm: str) -> list[dict]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("results_json", type=Path)
-    ap.add_argument("--arm", default="R.2")
+    ap.add_argument("--approach", default="R.2")
     args = ap.parse_args()
 
-    rows = derive(args.results_json, args.arm)
-    print(f"\nA.2 spread-and-fail dose-response — {args.results_json.name}, arm {args.arm}")
+    rows = derive(args.results_json, args.approach)
+    print(f"\nA.2 spread-and-fail dose-response — {args.results_json.name}, approach {args.approach}")
     print("=" * 96)
     print(f"  {'seed':>4} {'bw':>4} {'forced admit':>13} {'flex admit':>11} "
           f"{'flex spread-and-failed':>24} {'adm bw_tail':>12} {'rej bw_tail':>12}")

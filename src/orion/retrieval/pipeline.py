@@ -78,6 +78,17 @@ class RetrievalPipeline:
             documents = [e.topic + " " + e.content for e in self._entries]
             self._lexical.build_index(documents)
 
+    def _k(self, query: RetrievalQuery) -> int:
+        """How many entries to return: what the CALLER asked for, else k_final.
+
+        Every stage cap below is widened to at least this, since a stage that
+        truncates to fewer than k makes the requested k unreachable. That was the
+        defect: k_after_rrf=20 and k_final=3 both cut ahead of the caller, so
+        EpisodicMemory's documented pool widening (max(top_k*8, 24)) was dead and
+        its rerank ranked whichever 3 entries BM25 and recency had already picked.
+        """
+        return self.config.k_final if query.top_k is None else query.top_k
+
     def retrieve(
         self, query: RetrievalQuery
     ) -> tuple[list[ScoredEntry], RetrievalTrace | None]:
@@ -88,6 +99,7 @@ class RetrievalPipeline:
         """
         trace = RetrievalTrace() if self.config.return_trace else None
         mode = self.config.mode
+        k = self._k(query)
         t0 = time.perf_counter()
 
         if mode == RetrievalMode.COSINE_ONLY:
@@ -115,7 +127,7 @@ class RetrievalPipeline:
             dense_results = self._dense.query(
                 query_emb,
                 candidate_indices=candidate_indices,
-                top_k=self.config.k_after_dense,
+                top_k=max(self.config.k_after_dense, k),
             )
 
         # Stage 2.5: Recency weighting
@@ -128,7 +140,7 @@ class RetrievalPipeline:
         if mode == RetrievalMode.DENSE_ONLY:
             scored = self._build_scored(dense_results, "dense")
             logger.debug("Pipeline (dense_only) took %.3fs", time.perf_counter() - t0)
-            return scored[: self.config.k_final], trace
+            return scored[:k], trace
 
         # Stage 3: BM25 + RRF
         if self.config.enable_bm25:
@@ -136,21 +148,21 @@ class RetrievalPipeline:
             bm25_results = self._lexical.query(
                 query.text,
                 candidate_indices=bm25_indices,
-                top_k=self.config.k_after_dense,
+                top_k=max(self.config.k_after_dense, k),
             )
             fused = rrf_fuse([dense_results, bm25_results], k=self.config.rrf_k)
         else:
             fused = dense_results
             bm25_results = []
 
-        fused = fused[: self.config.k_after_rrf]
+        fused = fused[: max(self.config.k_after_rrf, k)]
         if trace:
             trace.candidates_after_rrf = len(fused)
 
         if mode == RetrievalMode.NO_RERANK:
             scored = self._build_scored_with_bm25(fused, dense_results, bm25_results)
             logger.debug("Pipeline (no_rerank) took %.3fs", time.perf_counter() - t0)
-            return scored[: self.config.k_final], trace
+            return scored[:k], trace
 
         # Stage 4: Cross-encoder rerank
         if self._reranker is not None:
@@ -168,7 +180,7 @@ class RetrievalPipeline:
 
         scored = self._build_scored_full(reranked, dense_results, bm25_results)
         logger.debug("Pipeline (full) took %.3fs", time.perf_counter() - t0)
-        return scored[: self.config.k_final], trace
+        return scored[:k], trace
 
     def add_entry(self, entry: MemoryEntry) -> None:
         """Add a single entry and rebuild indices."""
@@ -231,7 +243,7 @@ class RetrievalPipeline:
         if query_emb is None:
             return [], trace
 
-        results = self._dense.query(query_emb, top_k=self.config.k_final)
+        results = self._dense.query(query_emb, top_k=self._k(query))
         if trace:
             trace.candidates_after_dense = len(results)
         scored = self._build_scored(results, "dense")
@@ -252,7 +264,7 @@ class RetrievalPipeline:
         results = self._lexical.query(
             query.text,
             candidate_indices=candidate_indices,
-            top_k=self.config.k_final,
+            top_k=self._k(query),
         )
         scored = self._build_scored(results, "bm25")
         return scored, trace

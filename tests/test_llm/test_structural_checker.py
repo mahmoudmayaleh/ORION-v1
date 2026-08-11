@@ -46,11 +46,11 @@ def _valid_plan() -> dict:
         "plan_id": "xr_telepresence_005_plan",
         "vnf_assignments": [
             {"vnf_id": "xr_telepresence_005_f1", "domain": "d0",
-             "required_tier": "mec", "cpu_demand": 2.0, "ram_demand": 2.0},
+             "required_tier": "edge", "cpu_demand": 2.0, "ram_demand": 2.0},
             {"vnf_id": "xr_telepresence_005_f2", "domain": "d1",
-             "required_tier": "mec", "cpu_demand": 14.0, "ram_demand": 30.0},
+             "required_tier": "edge", "cpu_demand": 14.0, "ram_demand": 30.0},
             {"vnf_id": "xr_telepresence_005_f3", "domain": "d1",
-             "required_tier": "mec", "cpu_demand": 4.0, "ram_demand": 8.0},
+             "required_tier": "edge", "cpu_demand": 4.0, "ram_demand": 8.0},
             {"vnf_id": "xr_telepresence_005_f4", "domain": "d2",
              "required_tier": "regional_cloud", "cpu_demand": 6.0,
              "ram_demand": 12.0},
@@ -98,7 +98,7 @@ class TestC4Violations:
         plan = _valid_plan()
         # Move f2 (14 CPU) to d0 — d0 already has f1 (2 CPU), total 16 > 12
         plan["vnf_assignments"][1]["domain"] = "d0"
-        plan["vnf_assignments"][1]["required_tier"] = "mec"
+        plan["vnf_assignments"][1]["required_tier"] = "edge"
 
         result = check_plan(plan, slice_request, topology)
         assert not result.is_valid
@@ -124,7 +124,7 @@ class TestC4Violations:
 class TestC8Violations:
 
     def test_tier_not_in_permitted(self, slice_request, topology):
-        """Place Firewall (permitted: ran_edge, mec) with required_tier=central_cloud."""
+        """Place Firewall (permitted: edge) with required_tier=central_cloud."""
         plan = _valid_plan()
         plan["vnf_assignments"][0]["required_tier"] = "central_cloud"
 
@@ -137,18 +137,18 @@ class TestC8Violations:
         """Place Firewall in d2 (regional_cloud/central_cloud) with required_tier=mec."""
         plan = _valid_plan()
         plan["vnf_assignments"][0]["domain"] = "d2"
-        plan["vnf_assignments"][0]["required_tier"] = "mec"
+        plan["vnf_assignments"][0]["required_tier"] = "edge"
 
         result = check_plan(plan, slice_request, topology)
         assert not result.is_valid
         c8_violations = [v for v in result.violations if v.constraint == "C8"]
         assert any("do not include required_tier" in v.detail for v in c8_violations)
 
-    def test_vEPC_in_ran_edge_domain_fails(self, slice_request, topology):
-        """vEPC (permitted: regional_cloud, central_cloud) placed in d0 (ran_edge, mec)."""
+    def test_vEPC_in_edge_domain_fails(self, slice_request, topology):
+        """vEPC (permitted: regional_cloud, central_cloud) placed in d0 (edge)."""
         plan = _valid_plan()
         plan["vnf_assignments"][3]["domain"] = "d0"
-        plan["vnf_assignments"][3]["required_tier"] = "ran_edge"
+        plan["vnf_assignments"][3]["required_tier"] = "edge"
 
         result = check_plan(plan, slice_request, topology)
         assert not result.is_valid
@@ -240,7 +240,7 @@ class TestViolationFeedback:
         plan = _valid_plan()
         # Move f2 to d0 (CPU overcommit: 2+14=16 > 12)
         plan["vnf_assignments"][1]["domain"] = "d0"
-        plan["vnf_assignments"][1]["required_tier"] = "mec"
+        plan["vnf_assignments"][1]["required_tier"] = "edge"
 
         result = check_plan(plan, slice_request, topology)
         text = result.violation_text_for_prompt()

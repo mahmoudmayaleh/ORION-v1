@@ -11,14 +11,16 @@ def _components(
     admission: float = 0.0,
     efficiency: float = 0.0,
     quality_shaping: float = 0.0,
-    trial_penalty: float = 0.0,
 ) -> RewardComponents:
+    # `trial_penalty` was removed with the single-attempt coordinator: there is
+    # one PartitionDecision per arrival and no retry, so there is no trial to
+    # charge for. These tests carried it until 2026-08-03 and had been failing at
+    # collection since.
     return RewardComponents(
         admission=admission,
         efficiency=efficiency,
         hard_penalty=0.0,  # always 0 from coordinator; reward layer overrides
         quality_shaping=quality_shaping,
-        trial_penalty=trial_penalty,
     )
 
 
@@ -68,23 +70,23 @@ class TestHardPenaltyFire:
 class TestRejectedSlice:
     def test_rejected_with_no_verdict_no_penalty(self) -> None:
         r, comps = finalize_reward(
-            _components(admission=0.0, trial_penalty=-1.5),
+            _components(admission=0.0),
             admitted=False,
             verdict=None,
         )
         assert comps.hard_penalty == 0.0
-        assert r == -1.5
+        assert r == 0.0
 
     def test_verifier_gated_slice_gets_penalty_but_no_admission(self) -> None:
         verdict = GroundTruthVerdict(feasible=False, violated=["C7"])
         r, comps = finalize_reward(
-            _components(admission=100.0, trial_penalty=-1.5),
+            _components(admission=100.0),
             admitted=False,
             verdict=verdict,
         )
         assert comps.admission == 0.0
         assert comps.hard_penalty == -10.0
-        assert r == -11.5
+        assert r == -10.0
 
 
 class TestVerifierGate:

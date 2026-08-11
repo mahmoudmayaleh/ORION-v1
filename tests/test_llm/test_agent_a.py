@@ -32,7 +32,7 @@ VALID_EMBB_SPEC = {
             "vnf_type": "Firewall",
             "cpu_demand": 2.0,
             "ram_demand": 4.0,
-            "permitted_tiers": ["mec", "regional_cloud"],
+            "permitted_tiers": ["edge", "regional_cloud"],
             "computational_intensity": 0.8,
             "vcr": 1.0,
         },
@@ -41,7 +41,7 @@ VALID_EMBB_SPEC = {
             "vnf_type": "CDN",
             "cpu_demand": 6.0,
             "ram_demand": 12.0,
-            "permitted_tiers": ["mec", "regional_cloud"],
+            "permitted_tiers": ["edge", "regional_cloud"],
             "computational_intensity": 1.2,
             "vcr": 0.7,
         },
@@ -67,7 +67,7 @@ VALID_URLLC_SPEC = {
             "vnf_type": "Packet_Filter",
             "cpu_demand": 4.0,
             "ram_demand": 8.0,
-            "permitted_tiers": ["mec"],
+            "permitted_tiers": ["edge"],
             "computational_intensity": 0.5,
             "vcr": 1.0,
         },
@@ -76,7 +76,7 @@ VALID_URLLC_SPEC = {
             "vnf_type": "Encoder",
             "cpu_demand": 8.0,
             "ram_demand": 16.0,
-            "permitted_tiers": ["mec", "regional_cloud"],
+            "permitted_tiers": ["edge", "regional_cloud"],
             "computational_intensity": 1.5,
             "vcr": 0.9,
         },
@@ -102,7 +102,7 @@ VALID_EMBB_3VNF_SPEC = {
             "vnf_type": "Firewall",
             "cpu_demand": 2.0,
             "ram_demand": 4.0,
-            "permitted_tiers": ["mec"],
+            "permitted_tiers": ["edge"],
             "computational_intensity": 0.8,
             "vcr": 1.0,
         },
@@ -111,7 +111,7 @@ VALID_EMBB_3VNF_SPEC = {
             "vnf_type": "CDN",
             "cpu_demand": 6.0,
             "ram_demand": 12.0,
-            "permitted_tiers": ["mec", "regional_cloud"],
+            "permitted_tiers": ["edge", "regional_cloud"],
             "computational_intensity": 1.2,
             "vcr": 0.7,
         },
@@ -389,8 +389,16 @@ class TestAgentARecordTranslation:
         entries = mb.retrieve("eMBB", top_k=5)
         assert len(entries) > 0
 
-    def test_invalid_translation_recorded(self):
-        """is_valid=False records with violations."""
+    def test_invalid_translation_is_stored_but_not_offered_as_an_exemplar(self):
+        """is_valid=False records with violations, and stays out of retrieval.
+
+        This test previously asserted the failure WAS retrievable, which is the
+        opposite of the design: `retrieve` defaults to `successes_only`
+        (RETRIEVE_SUCCESSES_ONLY, following ExpeL, AAAI 2024) precisely so that
+        failures stay in the store as negative evidence without ever being handed
+        to the planner as something to imitate. It had been failing since that
+        behaviour landed.
+        """
         mb = self._make_episodic_memory()
         recorded = record_translation(
             mb=mb,
@@ -399,9 +407,14 @@ class TestAgentARecordTranslation:
             is_valid=False,
         )
         assert recorded is True
+        assert len(mb._entries) == 1, "the failure was not stored at all"
 
-        entries = mb.retrieve("eMBB", top_k=5)
-        assert len(entries) > 0
+        assert mb.retrieve("eMBB", top_k=5) == [], (
+            "a schema-invalid translation was offered to the planner as an "
+            "exemplar to imitate")
+        assert len(mb.retrieve("eMBB", top_k=5, successes_only=False)) > 0, (
+            "the failure is unreachable even with successes_only off, so it is "
+            "not usable as negative evidence either")
 
 
 # -- TestAgentAWithMemory ------------------------------------------------------

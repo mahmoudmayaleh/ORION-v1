@@ -77,6 +77,17 @@ class DirectJointPolicy(nn.Module):
                     break
         return partitions, mask
 
+    def _assert_chain(self, num_vnfs: int) -> None:
+        # RC is asserted K<=max_chain_length. A longer chain would overrun the
+        # enumerated head (num_domains**max_chain_length) — stop-and-report per
+        # §U.1, never a silent truncation.
+        if num_vnfs > self.max_chain_length:
+            raise ValueError(
+                f"DirectJointPolicy: num_vnfs={num_vnfs} exceeds "
+                f"max_chain_length={self.max_chain_length}; joint enumeration "
+                f"head has only num_domains**max_chain_length atoms."
+            )
+
     def forward(
         self,
         obs: torch.Tensor,
@@ -84,6 +95,7 @@ class DirectJointPolicy(nn.Module):
         num_vnfs: int,
         deterministic: bool = False,
     ) -> tuple[list[int], torch.Tensor, torch.Tensor, float]:
+        self._assert_chain(num_vnfs)
         if obs.dim() == 1:
             obs = obs.unsqueeze(0)
         h = self.encoder(obs)
@@ -113,6 +125,7 @@ class DirectJointPolicy(nn.Module):
         actions: torch.Tensor,
         num_vnfs: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._assert_chain(num_vnfs)
         if obs.dim() == 1:
             obs = obs.unsqueeze(0)
         h = self.encoder(obs)
@@ -131,11 +144,148 @@ class DirectJointPolicy(nn.Module):
         entropy = dist.entropy()
         return log_prob.unsqueeze(0), entropy, masked_logits.unsqueeze(0)
 
+    def joint_prior_logits(
+        self,
+        tier_mask: torch.Tensor,
+        num_vnfs: int,
+        suggested_canonical: list[int],
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Single-atom joint soft-prior over enumerated feasible joints (§U.1b).
+
+        Peaks logit 1/temperature on the ONE joint atom equal to the suggested
+        partition m̃ (canonical frame), 0 on the other feasible atoms, infeasible
+        atoms left to be masked by analytical_kl. Atom ordering matches
+        `evaluate_actions` (same `_enumerate_and_mask`).
+
+        Returns (prior_logits[1, n_joint], joint_mask[1, n_joint]) ready for
+        `analytical_kl(new_logits, prior_logits, joint_mask)`, or None if m̃ is
+        not a feasible atom (caller skips the KL term — never fakes it).
+        """
+        self._assert_chain(num_vnfs)
+        partitions, mask = self._enumerate_and_mask(tier_mask, num_vnfs)
+        target = tuple(int(d) for d in suggested_canonical)
+        try:
+            idx = partitions.index(target)
+        except ValueError:
+            return None
+        if not bool(mask[idx]):
+            return None  # suggested partition is tier-infeasible under this mask
+        peak = 1.0 / max(float(temperature), 1e-6)
+        logits = torch.zeros(len(partitions), dtype=torch.float32)
+        logits[idx] = peak
+        return logits.unsqueeze(0), mask.unsqueeze(0)
+
     def get_value(self, obs: torch.Tensor) -> torch.Tensor:
         if obs.dim() == 1:
             obs = obs.unsqueeze(0)
         h = self.encoder(obs)
         return self.aux_value_head(h).squeeze(-1)
+
+
+class AutoregMDOPolicy(nn.Module):
+    """Autoregressive sequential-decode MDO policy (§U.1e).
+
+    Decodes per-VNF domain assignments in SFC order, each step CONDITIONED on
+    where prior VNFs of this slice were placed (a per-domain running count). This
+    captures the joint correlation the factored MDOPolicy could not express
+    (colocation) WITHOUT enumerating the M^K joint space, so it scales to RC's
+    K up to 6+ where DirectJointPolicy (5^6 = 15625 atoms) is infeasible. No
+    chain-length cap.
+
+    Interface matches MDOPolicy exactly (per-VNF [K, M] raw logits + [K] log-probs),
+    so it drops into the factored KL/PPO path — but the log-probs are CONDITIONAL
+    (their product is the joint) and the KL toward m̃ is per-step.
+    """
+
+    def __init__(self, obs_dim, num_domains, max_vnfs=10, hidden_dim=128, num_layers=2):
+        super().__init__()
+        self.num_domains = num_domains
+        self.max_vnfs = max_vnfs
+        self.hidden_dim = hidden_dim
+        layers: list[nn.Module] = []
+        in_dim = obs_dim
+        for _ in range(num_layers):
+            layers.extend([nn.Linear(in_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU()])
+            in_dim = hidden_dim
+        self.encoder = nn.Sequential(*layers)
+        # Decoder input: [h | per-domain running-count frac (M) | position frac (1)].
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_dim + num_domains + 1, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, num_domains))
+        self.aux_value_head = nn.Linear(hidden_dim, 1)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=0.01)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        for m in self.encoder.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=2 ** 0.5)
+
+    def _encode(self, obs):
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+        return self.encoder(obs).squeeze(0)  # [hidden]
+
+    def _step_logits(self, h, counts, k, num_vnfs):
+        cnt = torch.tensor(counts, dtype=h.dtype, device=h.device) / max(num_vnfs, 1)
+        pos = torch.tensor([k / max(num_vnfs, 1)], dtype=h.dtype, device=h.device)
+        return self.decoder(torch.cat([h, cnt, pos]))  # [M] raw (pre-mask)
+
+    def forward(self, obs, tier_mask, num_vnfs, deterministic=False,
+                prior_logits=None, prior_weight=0.0):
+        """prior_logits [K, M] + prior_weight>0 make the LLM plan ADVISE the decode
+        at inference: the suggested-domain bias is added to the DECISION logits so
+        m~ always steers the committed partition. raw_list keeps UNBIASED logits."""
+        h = self._encode(obs)
+        neg_inf = torch.tensor(float("-inf"), dtype=h.dtype, device=h.device)
+        counts = [0.0] * self.num_domains
+        partition, lp_list, raw_list = [], [], []
+        ent_sum = 0.0
+        for k in range(num_vnfs):
+            raw = self._step_logits(h, counts, k, num_vnfs)
+            dec = raw if prior_logits is None else raw + prior_weight * prior_logits[k]
+            masked = torch.where(tier_mask[k], dec, neg_inf)
+            dist = Categorical(logits=masked)
+            a = masked.argmax() if deterministic else dist.sample()
+            ai = int(a.item())
+            partition.append(ai)
+            lp_list.append(dist.log_prob(a))
+            ent_sum += dist.entropy().item()
+            raw_list.append(raw)
+            counts[ai] += 1.0
+        log_probs = torch.stack(lp_list)
+        logits = torch.stack(raw_list)  # [K, M] raw
+        mean_ent = ent_sum / num_vnfs if num_vnfs > 0 else 0.0
+        return partition, log_probs, logits, mean_ent
+
+    def evaluate_actions(self, obs, tier_mask, actions, num_vnfs):
+        h = self._encode(obs)
+        neg_inf = torch.tensor(float("-inf"), dtype=h.dtype, device=h.device)
+        counts = [0.0] * self.num_domains
+        lp_list, raw_list = [], []
+        ent_sum = torch.tensor(0.0)
+        for k in range(num_vnfs):
+            raw = self._step_logits(h, counts, k, num_vnfs)
+            masked = torch.where(tier_mask[k], raw, neg_inf)
+            dist = Categorical(logits=masked)
+            lp_list.append(dist.log_prob(actions[k]))
+            ent_sum = ent_sum + dist.entropy()
+            raw_list.append(raw)
+            counts[int(actions[k].item())] += 1.0
+        log_probs = torch.stack(lp_list)
+        logits = torch.stack(raw_list)  # [K, M] raw
+        ent = ent_sum / num_vnfs if num_vnfs > 0 else ent_sum
+        return log_probs, ent, logits
+
+    def get_value(self, obs):
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+        return self.aux_value_head(self.encoder(obs)).squeeze(-1)
 
 
 class MDOPolicy(nn.Module):

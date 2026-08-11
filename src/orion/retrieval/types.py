@@ -37,7 +37,13 @@ class RetrievalQuery(BaseModel):
 
     text: str
     filters: dict[str, str | list[str]] = Field(default_factory=dict)
-    top_k: int = 5
+    # None = "use config.k_final". An explicit value is AUTHORITATIVE and the
+    # pipeline widens its intermediate stages to honour it. This used to be
+    # `int = 5` and the pipeline ignored it entirely, truncating to k_final at
+    # every exit -- so a caller asking for 24 candidates silently got 3, and
+    # every post-filter and rerank downstream of the pipeline operated on a pool
+    # the pipeline had already decided.
+    top_k: int | None = None
 
 
 class ScoredEntry(NamedTuple):

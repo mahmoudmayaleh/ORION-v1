@@ -2,7 +2,7 @@
 
 Implements the same .act(substrate, fragment) interface as DomainActor but
 uses best-fit placement (tightest CPU fit) and shortest-path routing. No
-learnable parameters. Identical across all experiment arms — removes actor
+learnable parameters. Identical across all experiment approaches — removes actor
 stochasticity from the memory comparison.
 
 Node selection: best-fit minimizes fragmentation by picking the feasible
@@ -22,15 +22,11 @@ from orion.actors.routing import (
 )
 from orion.actors.types import DomainResponse, PlanFragment, VNFAssignment
 from orion.substrate.graph_model import SubstrateNetwork
-from orion.types import InfrastructureTier
+from orion.types import InfrastructureTier, TIER_INDEX, TIER_ORDER
 
 
-_TIER_ORDER = {
-    InfrastructureTier.RAN_EDGE: 0,
-    InfrastructureTier.MEC: 1,
-    InfrastructureTier.REGIONAL_CLOUD: 2,
-    InfrastructureTier.CENTRAL_CLOUD: 3,
-}
+# Canonical ordering lives in orion.types (one definition, see TIER_ORDER).
+_TIER_ORDER = TIER_INDEX
 
 
 class GreedyDomainActor:
@@ -39,7 +35,7 @@ class GreedyDomainActor:
     Sorts VNFs by decreasing CPU then RAM, picks the best-fit feasible node
     (tier match first, then tightest CPU fit), routes intra-domain flows
     on the shortest delay-feasible path. No RL signals produced.
-    Identical across all experiment arms.
+    Identical across all experiment approaches.
     """
 
     def __init__(self, domain_id: int, k_paths: int = 3):

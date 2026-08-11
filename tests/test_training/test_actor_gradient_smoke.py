@@ -70,7 +70,7 @@ class TestActorCTDEPPOSmoke:
 
         actors = {d: DomainActor(d, DomainPolicy("mlp", hidden_dim=32))
                   for d in range(substrate.num_domains)}
-        coordinator = MDOCoordinator(None, actors, MDOConfig(n_part=2))
+        coordinator = MDOCoordinator(None, actors, MDOConfig())
 
         rng = np.random.default_rng(seed + 100)
         ap = ArrivalProcess(substrate, 30, 4.0, 0.02, rng)
@@ -96,7 +96,7 @@ class TestActorCTDEPPOSmoke:
 
         actors = {d: DomainActor(d, DomainPolicy("mlp", hidden_dim=32))
                   for d in range(substrate.num_domains)}
-        coordinator = MDOCoordinator(None, actors, MDOConfig(n_part=2))
+        coordinator = MDOCoordinator(None, actors, MDOConfig())
 
         rng = np.random.default_rng(seed + 100)
         ap = ArrivalProcess(substrate, 50, 4.0, 0.02, rng)
@@ -168,7 +168,7 @@ class TestActorCTDEPPOSmoke:
 
         actors = {d: DomainActor(d, DomainPolicy("mlp", hidden_dim=32))
                   for d in range(substrate.num_domains)}
-        coordinator = MDOCoordinator(None, actors, MDOConfig(n_part=2))
+        coordinator = MDOCoordinator(None, actors, MDOConfig())
 
         rng = np.random.default_rng(seed + 100)
         ap = ArrivalProcess(substrate, 50, 4.0, 0.02, rng)
@@ -265,7 +265,7 @@ class TestActorCTDEPPOSmoke:
 
         actors = {d: DomainActor(d, DomainPolicy("mlp", hidden_dim=32))
                   for d in range(substrate.num_domains)}
-        coordinator = MDOCoordinator(None, actors, MDOConfig(n_part=2))
+        coordinator = MDOCoordinator(None, actors, MDOConfig())
 
         rng = np.random.default_rng(seed + 100)
         ap = ArrivalProcess(substrate, 50, 4.0, 0.02, rng)
@@ -346,7 +346,7 @@ class TestActorCTDEPPOSmoke:
 
         actors = {d: DomainActor(d, DomainPolicy("mlp", hidden_dim=32))
                   for d in range(substrate.num_domains)}
-        coordinator = MDOCoordinator(None, actors, MDOConfig(n_part=2))
+        coordinator = MDOCoordinator(None, actors, MDOConfig())
 
         rng = np.random.default_rng(seed + 100)
         ap = ArrivalProcess(substrate, 50, 4.0, 0.02, rng)
@@ -442,7 +442,7 @@ class TestActorCTDEPPOSmoke:
 
         actors = {d: DomainActor(d, DomainPolicy("mlp", hidden_dim=32))
                   for d in range(substrate.num_domains)}
-        coordinator = MDOCoordinator(None, actors, MDOConfig(n_part=2))
+        coordinator = MDOCoordinator(None, actors, MDOConfig())
 
         rng = np.random.default_rng(seed + 100)
         ap = ArrivalProcess(substrate, 50, 4.0, 0.02, rng)

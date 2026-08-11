@@ -45,6 +45,7 @@ from orion.types import (
     QoSRequirements,
     SliceRequest,
     SliceType,
+    TIER_ORDER,
     VNF,
 )
 
@@ -118,12 +119,8 @@ def _node_id_to_domain(node_id: str) -> int:
         return -1
 
 
-_TIER_ORDER = [
-    InfrastructureTier.RAN_EDGE,
-    InfrastructureTier.MEC,
-    InfrastructureTier.REGIONAL_CLOUD,
-    InfrastructureTier.CENTRAL_CLOUD,
-]
+# Canonical ordering lives in orion.types (one definition, see TIER_ORDER).
+_TIER_ORDER = list(TIER_ORDER)
 _TIER_TO_IDX = {t: i for i, t in enumerate(_TIER_ORDER)}
 
 

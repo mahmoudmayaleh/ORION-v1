@@ -1,9 +1,8 @@
 """Data types for the MDO RL coordinator.
 
 MDOObservation: aggregated cross-domain state for the MDO policy.
-PartitionAttempt: record of one partition trial within an arrival.
-RetryHistory: accumulates attempts per arrival.
-MDOAction: COMMIT / RETRY / REJECT enum.
+PartitionDecision: record of the partition decision for an arrival.
+MDOAction: COMMIT / REJECT enum.
 MDOResult: final outcome per slice arrival.
 RewardComponents: decomposed reward for logging and debugging.
 StrategyMonitorState: types for the population-level Page-Hinkley monitor.
@@ -25,15 +24,12 @@ from orion.types import InfrastructureTier, SliceType
 class MDOAction(IntEnum):
     """Control action emitted by the MDO after collecting domain responses."""
     COMMIT = 0
-    RETRY = auto()
     REJECT = auto()
 
 
 class RejectReason(IntEnum):
-    """Which rejection trigger fired."""
-    BUDGET_EXHAUSTED = 0
-    VIOLATION_STABLE = auto()
-    LOW_VALUE = auto()
+    """Why the arrival was rejected."""
+    INFEASIBLE = 0
 
 
 @dataclass
@@ -54,6 +50,14 @@ class DomainSummary:
     # min(cpu_res/c_ref, ram_res/r_ref) over nodes in the domain. Aggregate residuals hide
     # whether ANY single node is large enough; this exposes it. 0.0 = no node has headroom.
     max_node_headroom: float = 0.0
+    # Residual CPU/RAM PER TIER (§Y.1e). Aggregate residuals cannot express "this
+    # domain's edge tier is full but its regional tier is not", which is the common
+    # case once domains hold different tier sets. Every tier is always a key,
+    # including tiers this domain does not hold, which read 0.0: an absent tier and
+    # an exhausted tier are deliberately indistinguishable, since composition is
+    # fixed and an absent tier reads 0.0 in every instance.
+    tier_cpu_residual: dict[InfrastructureTier, float] = field(default_factory=dict)
+    tier_ram_residual: dict[InfrastructureTier, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -90,12 +94,11 @@ class PlanSummary:
 class MDOObservation:
     """Aggregated cross-domain observation for the MDO policy (v6.2 Eq. 2).
 
-    o^MDO_t = ({ĉ^m_res, r̂^m_res, τ^m}, {b^res_ℓ, D_ℓ}, π̃_t, h_t)
+    o^MDO_t = ({ĉ^m_res, r̂^m_res, τ^m}, {b^res_ℓ, D_ℓ}, π̃_t)
     """
     domain_summaries: list[DomainSummary]
     inter_domain_links: list[InterDomainLink]
     plan: PlanSummary
-    retry_history: RetryHistory | None = None
 
     @property
     def num_domains(self) -> int:
@@ -104,7 +107,7 @@ class MDOObservation:
 
 @dataclass
 class ViolationInfo:
-    """Structured violation information from a failed partition trial."""
+    """Structured violation information from a failed partition decision."""
     c5b_violated: bool = False
     c7_violated: bool = False
     c9_violated: bool = False
@@ -131,9 +134,8 @@ class ViolationInfo:
 
 
 @dataclass
-class PartitionAttempt:
-    """Record of one partition trial within an arrival."""
-    trial_index: int
+class PartitionDecision:
+    """Record of the partition decision for an arrival."""
     partition: list[int]  # per-VNF domain assignment
     domain_responses: dict[int, DomainResponse] = field(default_factory=dict)
     violation: ViolationInfo | None = None
@@ -145,31 +147,15 @@ class PartitionAttempt:
 
 
 @dataclass
-class RetryHistory:
-    """Accumulates partition attempts for one slice arrival."""
-    attempts: list[PartitionAttempt] = field(default_factory=list)
-
-    @property
-    def num_attempts(self) -> int:
-        return len(self.attempts)
-
-    def last_violation_vectors(self, k: int = 2) -> list[tuple[bool, bool, bool, bool]]:
-        """Return the violation vectors from the last k attempts."""
-        recent = self.attempts[-k:]
-        return [a.violation.violation_vector for a in recent if a.violation is not None]
-
-
-@dataclass
 class RewardComponents:
     """Decomposed reward (v6.2 Eq. 9) for logging and debugging.
 
-    R_t = μ·z_s - α·Cost(π*) - λ_viol·1[violated] + η·LocalScore(π*) - ξ·(T_t-1)
+    R_t = μ·z_s - α·Cost(π*) - λ_viol·1[violated] + η·LocalScore(π*)
     """
     admission: float = 0.0        # μ·z_s
     efficiency: float = 0.0       # -α·Cost(π*)
     hard_penalty: float = 0.0     # -λ_viol·1[C2,C3,C5b,C7 violated]
     quality_shaping: float = 0.0  # +η·LocalScore(π*)
-    trial_penalty: float = 0.0    # -ξ·(T_t - 1)
 
     @property
     def total(self) -> float:
@@ -178,7 +164,6 @@ class RewardComponents:
             + self.efficiency
             + self.hard_penalty
             + self.quality_shaping
-            + self.trial_penalty
         )
 
 
@@ -195,8 +180,23 @@ class MDOResult:
     e2e_delay: float = 0.0
     total_cost: float = 0.0
     reward: RewardComponents = field(default_factory=RewardComponents)
-    retry_history: RetryHistory = field(default_factory=RetryHistory)
+    decision: PartitionDecision | None = None
     reject_reason: RejectReason | None = None
+    # §Y.13 — why an already-COMMITTED admission was revoked.
+    #
+    # `resolve_arrival` returns admitted=True and the episode runner then
+    # allocates, verifies against post-allocation load, and may revoke. Before
+    # this field existed that flip recorded nothing the rejection taxonomy could
+    # read: `_classify` inspects `decision.violation`, which is None on this
+    # path, so 100% of post-commit revocations landed in `unattributed` (24 to 89
+    # percent of all rejections). Holds the post-commit verifier's violated
+    # constraint codes, e.g. ["C7"], or ["PLAN_BUILD"] when no concrete
+    # placement could be synthesised from the committed partition.
+    #
+    # Codes rather than the GroundTruthVerdict itself: the verdict lives in
+    # `orion.sim.verifier` and this module is `orion.mdo`, so holding the object
+    # would point a model type at the simulator that consumes it.
+    revoked_by: list[str] | None = None
     log_probs: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     entropy: float = 0.0
     value_estimate: float = 0.0

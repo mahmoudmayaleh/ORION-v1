@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Item 6: Analysis script for the three-arm learning-curve experiment.
+"""Item 6: Analysis script for the three-approach learning-curve experiment.
 
 Reads data/three_arm_results.json and produces:
   1. Per-family FoC bar charts (extrapolation + interpolation)
   2. Paired differences (Full-M^B minus best static) with spread
-  3. Reject-reason breakdown per arm per family
+  3. Reject-reason breakdown per approach per family
   4. Automatic pass/fail against pre-registered success criteria
   5. Summary table for the paper
 
@@ -30,9 +30,9 @@ import numpy as np
 
 B_MINUS_PRIMARY = ["C-_T+_B-", "C+_T-_B-"]
 CONTROL_FAMILY = "C-_T+_B+"
-ARM_ORDER = ["RA-ColocFB", "Memory-off", "Full-M^B"]
-STATIC_ARMS = ["RA-ColocFB"]
-LLM_ARMS = ["Memory-off", "Full-M^B"]
+APPROACH_ORDER = ["RA-ColocFB", "Memory-off", "Full-M^B"]
+STATIC_APPROACHES = ["RA-ColocFB"]
+LLM_APPROACHES = ["Memory-off", "Full-M^B"]
 
 
 def load_results(path: str) -> list[dict]:
@@ -68,7 +68,7 @@ def analyze(results: list[dict]):
     """Full analysis pipeline."""
 
     print("=" * 90)
-    print("THREE-ARM EXPERIMENT ANALYSIS")
+    print("THREE-APPROACH EXPERIMENT ANALYSIS")
     print("=" * 90)
 
     seeds = sorted(set(r.get("seed", 0) for r in results))
@@ -90,19 +90,19 @@ def analyze(results: list[dict]):
 
         # Header
         header = f"  {'Family':<14}"
-        for arm in ARM_ORDER:
-            header += f"  {arm:>14}"
+        for approach in APPROACH_ORDER:
+            header += f"  {approach:>14}"
         print(header)
-        print("  " + "─" * (14 + 16 * len(ARM_ORDER)))
+        print("  " + "─" * (14 + 16 * len(APPROACH_ORDER)))
 
         for family in families:
             row = f"  {family:<14}"
-            for arm in ARM_ORDER:
-                arm_records = [r for r in phase_records
-                              if r["family"] == family and r["arm"] == arm]
-                if arm_records:
-                    m = 100 * mean_foc(arm_records)
-                    s = 100 * std_foc(arm_records)
+            for approach in APPROACH_ORDER:
+                approach_records = [r for r in phase_records
+                              if r["family"] == family and r["approach"] == approach]
+                if approach_records:
+                    m = 100 * mean_foc(approach_records)
+                    s = 100 * std_foc(approach_records)
                     if s > 0.1:
                         row += f"  {m:>10.1f}±{s:<3.1f}"
                     else:
@@ -127,13 +127,13 @@ def analyze(results: list[dict]):
 
         for family in families:
             full_focs = [r["foc"] for r in phase_records
-                        if r["family"] == family and r["arm"] == "Full-M^B"]
+                        if r["family"] == family and r["approach"] == "Full-M^B"]
             best_static_focs = []
-            for arm in STATIC_ARMS:
-                arm_focs = [r["foc"] for r in phase_records
-                           if r["family"] == family and r["arm"] == arm]
-                if arm_focs:
-                    best_static_focs.append(np.mean(arm_focs))
+            for approach in STATIC_APPROACHES:
+                approach_focs = [r["foc"] for r in phase_records
+                           if r["family"] == family and r["approach"] == approach]
+                if approach_focs:
+                    best_static_focs.append(np.mean(approach_focs))
 
             if full_focs and best_static_focs:
                 full_mean = 100 * np.mean(full_focs)
@@ -155,20 +155,20 @@ def analyze(results: list[dict]):
 
     for family in families:
         print(f"\n  {family}:")
-        for arm in ARM_ORDER:
-            arm_records = [r for r in extrap
-                          if r["family"] == family and r["arm"] == arm]
-            if not arm_records:
+        for approach in APPROACH_ORDER:
+            approach_records = [r for r in extrap
+                          if r["family"] == family and r["approach"] == approach]
+            if not approach_records:
                 continue
             # Aggregate reject reasons
             agg_reasons = defaultdict(int)
-            for r in arm_records:
+            for r in approach_records:
                 for reason, count in r.get("reject_reasons", {}).items():
                     agg_reasons[reason] += count
             if agg_reasons:
                 reason_str = ", ".join(f"{k}:{v}" for k, v in
                                        sorted(agg_reasons.items(), key=lambda x: -x[1]))
-                print(f"    {arm:<14}: {reason_str}")
+                print(f"    {approach:<14}: {reason_str}")
 
     # ── 4. Pre-registered success criteria ──────────────────────────────────
 
@@ -183,13 +183,13 @@ def analyze(results: list[dict]):
     primary_pass = True
     for family in B_MINUS_PRIMARY:
         full_focs = [r["foc"] for r in extrap
-                    if r["family"] == family and r["arm"] == "Full-M^B"]
+                    if r["family"] == family and r["approach"] == "Full-M^B"]
         best_static = 0
-        for arm in STATIC_ARMS:
-            arm_focs = [r["foc"] for r in extrap
-                       if r["family"] == family and r["arm"] == arm]
-            if arm_focs:
-                best_static = max(best_static, np.mean(arm_focs))
+        for approach in STATIC_APPROACHES:
+            approach_focs = [r["foc"] for r in extrap
+                       if r["family"] == family and r["approach"] == approach]
+            if approach_focs:
+                best_static = max(best_static, np.mean(approach_focs))
 
         if full_focs:
             full_mean = np.mean(full_focs)
@@ -209,13 +209,13 @@ def analyze(results: list[dict]):
     print(f"\n  NO-REGRESSION: {CONTROL_FAMILY}")
     control = [r for r in extrap if r["family"] == CONTROL_FAMILY]
     if control:
-        for arm in ARM_ORDER:
-            arm_focs = [r["foc"] for r in control if r["arm"] == arm]
-            if arm_focs:
-                m = 100 * np.mean(arm_focs)
-                print(f"    {arm:<14}: {m:.1f}%", end="")
-                if arm in LLM_ARMS:
-                    static_focs = [r["foc"] for r in control if r["arm"] == "RA-ColocFB"]
+        for approach in APPROACH_ORDER:
+            approach_focs = [r["foc"] for r in control if r["approach"] == approach]
+            if approach_focs:
+                m = 100 * np.mean(approach_focs)
+                print(f"    {approach:<14}: {m:.1f}%", end="")
+                if approach in LLM_APPROACHES:
+                    static_focs = [r["foc"] for r in control if r["approach"] == "RA-ColocFB"]
                     if static_focs:
                         static_m = 100 * np.mean(static_focs)
                         gap = m - static_m
@@ -230,8 +230,8 @@ def analyze(results: list[dict]):
         if not phase_r:
             continue
         for a, b in [("Full-M^B", "Memory-off")]:
-            a_focs = [r["foc"] for r in phase_r if r["arm"] == a]
-            b_focs = [r["foc"] for r in phase_r if r["arm"] == b]
+            a_focs = [r["foc"] for r in phase_r if r["approach"] == a]
+            b_focs = [r["foc"] for r in phase_r if r["approach"] == b]
             if a_focs and b_focs:
                 delta = 100 * (np.mean(a_focs) - np.mean(b_focs))
                 status = "PASS" if delta > 0.5 else "FAIL" if delta < -0.5 else "TIE"
@@ -250,10 +250,10 @@ def analyze(results: list[dict]):
 
     for phase_label, flag_name in [("extrap", "extrap_gain"), ("interp", "interp_gain")]:
         phase_r = [r for r in results if r["phase"] == phase_label]
-        full_focs = [r["foc"] for r in phase_r if r["arm"] == "Full-M^B"]
+        full_focs = [r["foc"] for r in phase_r if r["approach"] == "Full-M^B"]
         static_focs = []
-        for arm in STATIC_ARMS:
-            static_focs.extend([r["foc"] for r in phase_r if r["arm"] == arm])
+        for approach in STATIC_APPROACHES:
+            static_focs.extend([r["foc"] for r in phase_r if r["approach"] == approach])
         if full_focs and static_focs:
             if np.mean(full_focs) > np.mean(static_focs):
                 if flag_name == "extrap_gain":
@@ -263,8 +263,8 @@ def analyze(results: list[dict]):
 
     memoff_matches = True
     all_phase_r = [r for r in results if r["phase"] in ("extrap", "interp")]
-    full_all = [r["foc"] for r in all_phase_r if r["arm"] == "Full-M^B"]
-    memoff_all = [r["foc"] for r in all_phase_r if r["arm"] == "Memory-off"]
+    full_all = [r["foc"] for r in all_phase_r if r["approach"] == "Full-M^B"]
+    memoff_all = [r["foc"] for r in all_phase_r if r["approach"] == "Memory-off"]
     if full_all and memoff_all:
         memoff_matches = abs(np.mean(full_all) - np.mean(memoff_all)) < 0.01
 
@@ -293,8 +293,8 @@ def analyze(results: list[dict]):
     if extrap:
         families = sorted(set(r["family"] for r in extrap))
         header = f"  {'Family':<14}  {'Role':<12}"
-        for arm in ARM_ORDER:
-            short = arm.replace("ColocFB", "CFB").replace("Memory-off", "Mem-off")
+        for approach in APPROACH_ORDER:
+            short = approach.replace("ColocFB", "CFB").replace("Memory-off", "Mem-off")
             header += f"  {short:>10}"
         print(header)
         print("  " + "─" * 80)
@@ -307,11 +307,11 @@ def analyze(results: list[dict]):
             else:
                 role = "—"
             row = f"  {family:<14}  {role:<12}"
-            for arm in ARM_ORDER:
-                arm_records = [r for r in extrap
-                              if r["family"] == family and r["arm"] == arm]
-                if arm_records:
-                    m = 100 * mean_foc(arm_records)
+            for approach in APPROACH_ORDER:
+                approach_records = [r for r in extrap
+                              if r["family"] == family and r["approach"] == approach]
+                if approach_records:
+                    m = 100 * mean_foc(approach_records)
                     row += f"  {m:>9.1f}%"
                 else:
                     row += f"  {'—':>10}"

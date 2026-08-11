@@ -7,6 +7,7 @@ aggregates and inter-domain link summaries, matching v6 Section 5.2.
 from __future__ import annotations
 
 from orion.substrate.graph_model import SubstrateNetwork
+from orion.types import TIER_ORDER
 
 
 def build_abstract_topology(substrate: SubstrateNetwork) -> dict:
@@ -26,13 +27,28 @@ def build_abstract_topology(substrate: SubstrateNetwork) -> dict:
         cpu_res = sum(substrate.graph.nodes[n]["cpu_residual"] for n in nodes)
         ram_res = sum(substrate.graph.nodes[n]["ram_residual"] for n in nodes)
 
-        # Collect unique tiers in this domain
-        tiers = sorted({substrate.graph.nodes[n]["tier"] for n in nodes})
+        # Collect unique tiers in this domain, in canonical order rather than
+        # alphabetical, so "the first tier" means the same thing here as everywhere
+        # else. Alphabetical put central_cloud before edge, which read as a
+        # hierarchy inversion in the prompt.
+        present = {substrate.graph.nodes[n]["tier"] for n in nodes}
+        tiers = [t.value for t in TIER_ORDER if t.value in present]
 
-        # Build a human-readable label from the dominant tiers
+        # Per-tier residuals (§Y.1e). The planner is choosing a domain per VNF and
+        # every VNF is tier-restricted, so a domain's aggregate residual is the
+        # wrong quantity: it cannot say "this domain's edge tier is full but its
+        # regional tier is not", which is the common case once domains hold
+        # different tier sets. Reported for EVERY tier including absent ones, which
+        # read 0.0, so the planner sees one consistent shape per domain.
+        tier_cpu = {t.value: 0.0 for t in TIER_ORDER}
+        tier_ram = {t.value: 0.0 for t in TIER_ORDER}
+        for n in nodes:
+            t = substrate.graph.nodes[n]["tier"]
+            tier_cpu[t] += substrate.graph.nodes[n]["cpu_residual"]
+            tier_ram[t] += substrate.graph.nodes[n]["ram_residual"]
+
         tier_labels = {
-            "ran_edge": "RAN/Edge",
-            "mec": "MEC",
+            "edge": "Edge",
             "regional_cloud": "Regional Cloud",
             "central_cloud": "Central Cloud",
         }
@@ -44,6 +60,8 @@ def build_abstract_topology(substrate: SubstrateNetwork) -> dict:
             "dominant_tiers": tiers,
             "cpu_residual": round(cpu_res, 1),
             "ram_residual": round(ram_res, 1),
+            "cpu_residual_by_tier": {k: round(v, 1) for k, v in tier_cpu.items()},
+            "ram_residual_by_tier": {k: round(v, 1) for k, v in tier_ram.items()},
         })
 
     # Inter-domain links: aggregate by (src_domain, dst_domain)

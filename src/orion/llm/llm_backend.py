@@ -254,7 +254,7 @@ class LLMBackend:
         # A memory-augmented prompt can approach n_ctx and truncate the
         # completion. With grammar-constrained decoding that truncation yields
         # cut-off (invalid) JSON, which downstream looked like a plain parse
-        # failure — and it was arm-asymmetric (only the K^B+M^B arms hit it).
+        # failure — and it was approach-asymmetric (only the K^B+M^B approaches hit it).
         # Record finish_reason + usage so truncation is a *distinct, counted*
         # signal, and check headroom against the configured window.
         self.last_finish_reason = choice.finish_reason

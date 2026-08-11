@@ -116,7 +116,7 @@ add("eMBB","eMBB",3,160.0,62.0,"Shopping-mall digital-signage slice, 160 Mbps, 6
 
 # ---- URLLC x25 (delay 1-10, beta 10-50, chain Firewall->vUPF) ----
 add("URLLC","URLLC",2,20.0,2.0,"Factory-floor robotic control slice: 20 Mbps, ultra-low 2 ms latency, firewall and a local user-plane function at the edge.")
-add("URLLC","URLLC",2,15.0,1.0,"Motion-control loop for a robotic arm, 15 Mbps, 1 ms hard budget, firewall + vUPF pinned to the edge.")
+add("URLLC","URLLC",2,15.0,1.0,"Motion-control loop for a robotic approach, 15 Mbps, 1 ms hard budget, firewall + vUPF pinned to the edge.")
 add("URLLC","URLLC",2,30.0,5.0,"Remote-surgery haptics link, 30 Mbps, 5 ms, secured with edge user-plane.")
 add("URLLC","URLLC",2,25.0,3.0,"AGV fleet coordination in a warehouse, 25 Mbps, 3 ms, firewall then vUPF.")
 add("URLLC","URLLC",2,10.0,4.0,"Protective-relay teleprotection for a substation, 10 Mbps, 4 ms, edge core.")

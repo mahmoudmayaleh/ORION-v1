@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from orion.llm.semantic_memory import SemanticMemory
 
 from orion.llm.llm_backend import LLMBackend, extract_json
+from orion.types import TIER_ORDER
 
 logger = logging.getLogger("orion.llm.agent_a")
 
@@ -33,7 +34,7 @@ logger = logging.getLogger("orion.llm.agent_a")
 
 VALID_SLICE_TYPES = {"eMBB", "URLLC", "mMTC", "V2X", "XR"}
 
-VALID_TIERS = {"ran_edge", "mec", "regional_cloud", "central_cloud"}
+VALID_TIERS = {t.value for t in TIER_ORDER}
 
 # ── System prompt ────────────────────────────────────────────────────────────
 

@@ -1,16 +1,14 @@
-
-
-"""MDO Coordinator: partition retry loop, dispatch to domain actors, reward.
+"""MDO Coordinator: partition decision, dispatch to domain actors, reward.
 
 Implements the per-arrival control flow:
-  1. Build MDO observation from substrate + plan + retry history
-  2. Partition retry loop (j = 1..N_part):
+  1. Build MDO observation from substrate + plan
+  2. Partition decision:
      a. Sample partition from MDO policy (or deterministic mode)
      b. Split plan into PlanFragments per domain
      c. Dispatch to domain actors
      d. Collect DomainResponses, run pre-commit checks
-     e. COMMIT or check rejection triggers
-  3. Compute reward components (SMDP: terminal reward shared across trials)
+     e. COMMIT or REJECT
+  3. Compute reward components (terminal reward for the arrival)
 
 The coordinator does NOT own training — PPO updates, the centralised critic,
 and the training loop are Phase 5.  Phase 4 delivers this coordinator running
@@ -41,15 +39,13 @@ from orion.mdo.observation import (
     observation_to_tensor,
 )
 from orion.mdo.policy import MDOPolicy
-from orion.mdo.rejection import check_rejection_triggers
 from orion.profiling import profiled
 from orion.mdo.types import (
     MDOAction,
     MDOResult,
-    PartitionAttempt,
+    PartitionDecision,
     PlanSummary,
     RejectReason,
-    RetryHistory,
     RewardComponents,
     ViolationInfo,
 )
@@ -58,13 +54,14 @@ from orion.types import FlowEdge, QoSRequirements, SliceRequest
 
 logger = logging.getLogger(__name__)
 
+# Strength of the LLM's inference-time advice in mode="advised".
+ADVISE_WEIGHT = 2.0
+
 
 @dataclass
 class MDOConfig:
     """Configuration for the MDO coordinator."""
 
-    n_part: int = 3
-    n_retry: int = 1
     max_inter_domain_hops: int = 3
     gamma_inter: float = 1.0
     # Reward weights (v6.2 Eq. 9)
@@ -72,14 +69,10 @@ class MDOConfig:
     alpha: float = 1.0
     lambda_viol: float = 10.0
     eta: float = 1.0
-    xi: float = 0.5
-    # Rejection trigger (iii) threshold — disabled by default until trained
-    tau_v: float = -float("inf")
-    stability_k: int = 2
 
 
 class MDOCoordinator:
-    """Orchestrates the partition retry loop for one slice arrival.
+    """Orchestrates the partition decision for one slice arrival.
 
     Args:
         policy: The MDO policy network (or None for random/deterministic modes).
@@ -106,7 +99,7 @@ class MDOCoordinator:
         mode: str = "sample",
         cost_greedy: float | None = None,
     ) -> MDOResult:
-        """Run the full partition retry loop for one slice arrival.
+        """Resolve one slice arrival: one partition decision, commit or reject.
 
         Args:
             substrate: Current substrate state.
@@ -120,11 +113,16 @@ class MDOCoordinator:
                          If None, quality shaping is skipped.
 
         Returns:
-            MDOResult with final outcome, reward, and retry history.
+            MDOResult with final outcome, reward, and the recorded decision.
         """
-        history = RetryHistory()
         obs_struct = build_mdo_observation(substrate, plan)
-        tier_mask = build_tier_masks(plan, obs_struct.domain_summaries)
+        # §U.1d — node-based feasibility (permitted_nodes ∩ domain nodes) when enabled;
+        # slice_req carries the authoritative D_f per VNF.
+        tier_mask = build_tier_masks(
+            plan, obs_struct.domain_summaries,
+            permitted_nodes=[list(v.permitted_nodes) for v in slice_req.vnfs],
+            substrate=substrate,
+        )
         obs_tensor = observation_to_tensor(obs_struct)
         bw_demands = plan.bw_demands
         cfg = self.config
@@ -148,104 +146,113 @@ class MDOCoordinator:
         all_entropy = 0.0
         last_value = 0.0
 
-        for j in range(cfg.n_part):
-            # --- Sample partition (canonical indices) ---
-            with profiled("mdo.forward", {"trial": j}):
-                partition_canonical, log_probs, _logits, entropy, value = self._sample_partition(
-                    obs_tensor, tier_mask, plan, mode,
-                    canonical_to_domain=canonical_to_domain,
-                )
-            all_log_probs.append(log_probs)
-            all_entropy += entropy
-            last_value = value
-
-            # Map canonical indices to actual domain IDs
-            partition = [canonical_to_domain[c] for c in partition_canonical]
-
-            # --- Snapshot substrate CPU/RAM before actor dispatch ---
-            node_snapshot = self._snapshot_node_residuals(substrate, partition)
-
-            # --- Split into PlanFragments and dispatch ---
-            fragments, cross_domain_flows = self._build_fragments(
-                plan, partition, slice_req,
+        # --- Sample partition (canonical indices) ---
+        with profiled("mdo.forward"):
+            partition_canonical, log_probs, _logits, entropy, value = self._sample_partition(
+                obs_tensor, tier_mask, plan, mode,
+                canonical_to_domain=canonical_to_domain,
             )
-            with profiled("actor.place", {"trial": j, "n_domains": len(fragments)}):
-                responses = self._dispatch_to_actors(substrate, fragments)
+        all_log_probs.append(log_probs)
+        all_entropy += entropy
+        last_value = value
 
-            # --- Route cross-domain flows on full graph ---
-            actor_infeasible = any(
-                not r.feasible for r in responses.values()
+        # Map canonical indices to actual domain IDs
+        partition = [canonical_to_domain[c] for c in partition_canonical]
+
+        # --- Snapshot substrate CPU/RAM before actor dispatch ---
+        node_snapshot = self._snapshot_node_residuals(substrate, partition)
+
+        # --- Split into PlanFragments and dispatch ---
+        fragments, cross_domain_flows = self._build_fragments(
+            plan, partition, slice_req,
+        )
+        with profiled("actor.place", {"n_domains": len(fragments)}):
+            responses = self._dispatch_to_actors(substrate, fragments)
+
+        # --- Route cross-domain flows on full graph ---
+        actor_infeasible = any(
+            not r.feasible for r in responses.values()
+        )
+        cross_feasible = True
+        cross_routes: dict[tuple[str, str], list[str]] = {}
+        cross_bw: dict[tuple[str, str], float] = {}
+        cross_delay = 0.0
+        cross_hops = 0
+
+        if not actor_infeasible and cross_domain_flows:
+            intra_delay = sum(
+                r.intra_delay for r in responses.values()
             )
-            cross_feasible = True
-            cross_routes: dict[tuple[str, str], list[str]] = {}
-            cross_bw: dict[tuple[str, str], float] = {}
-            cross_delay = 0.0
-            cross_hops = 0
-
-            if not actor_infeasible and cross_domain_flows:
-                intra_delay = sum(
-                    r.intra_delay for r in responses.values()
-                )
-                remaining_delay = slice_req.qos.max_e2e_delay - intra_delay
-                (
-                    cross_feasible, cross_routes, cross_bw,
-                    cross_delay, cross_hops,
-                ) = self._route_cross_domain_flows(
-                    substrate, cross_domain_flows, responses,
-                    delay_budget=remaining_delay,
-                )
-
-            # --- Build violation info from actual routing ---
-            intra_delay = sum(r.intra_delay for r in responses.values())
-            e2e = intra_delay + cross_delay
-            inter_bw = sum(cross_bw.values())
-            # Intra-domain routes use subgraph(domain_set) — no inter-domain
-            # edges. All inter-domain hops come from cross-domain routing.
-            total_inter_hops = cross_hops
-
-            violation = ViolationInfo(
-                c7_violated=e2e > slice_req.qos.max_e2e_delay,
-                c9_violated=total_inter_hops > cfg.max_inter_domain_hops,
-                actor_infeasible=actor_infeasible,
-                cross_domain_infeasible=not cross_feasible,
-                e2e_delay=e2e,
-                e2e_budget=slice_req.qos.max_e2e_delay,
-                total_bw=inter_bw,
-                min_bw=slice_req.qos.min_throughput,
-                inter_domain_hops=total_inter_hops,
-                max_inter_domain_hops=cfg.max_inter_domain_hops,
+            remaining_delay = slice_req.qos.max_e2e_delay - intra_delay
+            (
+                cross_feasible, cross_routes, cross_bw,
+                cross_delay, cross_hops,
+            ) = self._route_cross_domain_flows(
+                substrate, cross_domain_flows, responses,
+                delay_budget=remaining_delay,
             )
 
-            passes = not violation.has_violation
+        # --- Build violation info from actual routing ---
+        intra_delay = sum(r.intra_delay for r in responses.values())
+        e2e = intra_delay + cross_delay
+        inter_bw = sum(cross_bw.values())
+        # Intra-domain routes use subgraph(domain_set) — no inter-domain
+        # edges. All inter-domain hops come from cross-domain routing.
+        total_inter_hops = cross_hops
 
-            # Compute cost
-            intra_cost = sum(r.resource_cost for r in responses.values())
-            cost = intra_cost + cfg.gamma_inter * inter_bw
+        violation = ViolationInfo(
+            c7_violated=e2e > slice_req.qos.max_e2e_delay,
+            c9_violated=total_inter_hops > cfg.max_inter_domain_hops,
+            actor_infeasible=actor_infeasible,
+            cross_domain_infeasible=not cross_feasible,
+            e2e_delay=e2e,
+            e2e_budget=slice_req.qos.max_e2e_delay,
+            total_bw=inter_bw,
+            min_bw=slice_req.qos.min_throughput,
+            inter_domain_hops=total_inter_hops,
+            max_inter_domain_hops=cfg.max_inter_domain_hops,
+        )
 
-            # --- Record attempt ---
-            # Store canonical partition for PPO re-evaluation (policy space).
-            attempt = PartitionAttempt(
-                trial_index=j,
-                partition=partition_canonical,
-                domain_responses=responses,
-                violation=violation if not passes else None,
-                e2e_delay=e2e,
-                total_cost=cost,
-                value_estimate=value,
-                log_probs=log_probs.detach(),
-                entropy=entropy,
+        passes = not violation.has_violation
+
+        # Compute cost
+        intra_cost = sum(r.resource_cost for r in responses.values())
+        cost = intra_cost + cfg.gamma_inter * inter_bw
+
+        # --- Record the decision ---
+        # Store canonical partition for PPO re-evaluation (policy space).
+        decision = PartitionDecision(
+            partition=partition_canonical,
+            domain_responses=responses,
+            violation=violation if not passes else None,
+            e2e_delay=e2e,
+            total_cost=cost,
+            value_estimate=value,
+            log_probs=log_probs.detach(),
+            entropy=entropy,
+        )
+
+        if passes:
+            # Frame-consistency asserts: certify canonical↔domain-ID
+            # round-trip and tier feasibility at the dispatch site.
+            domain_to_canonical = {d: i for i, d in enumerate(canonical_to_domain)}
+            roundtrip = [domain_to_canonical[d] for d in partition]
+            assert roundtrip == partition_canonical, (
+                f"Canonical round-trip failed: {partition_canonical} -> "
+                f"{partition} -> {roundtrip}"
             )
-            history.attempts.append(attempt)
-
-            if passes:
-                # Frame-consistency asserts: certify canonical↔domain-ID
-                # round-trip and tier feasibility at the dispatch site.
-                domain_to_canonical = {d: i for i, d in enumerate(canonical_to_domain)}
-                roundtrip = [domain_to_canonical[d] for d in partition]
-                assert roundtrip == partition_canonical, (
-                    f"Canonical round-trip failed: {partition_canonical} -> "
-                    f"{partition} -> {roundtrip}"
-                )
+            import orion.mdo.observation as _obs
+            if _obs.USE_NODE_BASED_TIER_MASK:
+                # §U.1d — frame check on the authoritative D_f: the committed
+                # domain must hold a permitted node for the VNF.
+                for k, domain_id in enumerate(partition):
+                    pk = set(slice_req.vnfs[k].permitted_nodes)
+                    dn = set(substrate.nodes_in_domain(domain_id))
+                    assert pk & dn, (
+                        f"VNF {k} has no permitted node in domain {domain_id} "
+                        f"(node-based frame check)"
+                    )
+            else:
                 domain_tiers = {
                     s.domain_id: s.supported_tiers
                     for s in obs_struct.domain_summaries
@@ -257,47 +264,33 @@ class MDOCoordinator:
                         f"supports {domain_tiers.get(domain_id, [])}"
                     )
 
-                # COMMIT — restore substrate to pre-dispatch state.
-                # The episode runner's allocate() applies the definitive
-                # allocation from the PlacementPlan (which now includes
-                # cross-domain routes). Undo all provisional mutations.
-                self._restore_node_residuals(substrate, node_snapshot)
-                for resp in responses.values():
-                    if resp.feasible:
-                        self._rollback_domain(substrate, resp)
-                self._rollback_cross_domain(substrate, cross_routes, cross_bw)
-
-                final_action = MDOAction.COMMIT
-                committed_partition = partition
-                committed_responses = responses
-                committed_cross_routes = cross_routes
-                committed_cross_bw = cross_bw
-                committed_e2e = e2e
-                committed_cost = cost
-                break
-
-            # --- Rollback substrate state ---
+            # COMMIT — restore substrate to pre-dispatch state.
+            # The episode runner's allocate() applies the definitive
+            # allocation from the PlacementPlan (which now includes
+            # cross-domain routes). Undo all provisional mutations.
             self._restore_node_residuals(substrate, node_snapshot)
             for resp in responses.values():
                 if resp.feasible:
                     self._rollback_domain(substrate, resp)
             self._rollback_cross_domain(substrate, cross_routes, cross_bw)
 
-            # --- Check rejection triggers ---
-            reject_reason = check_rejection_triggers(
-                history=history,
-                n_part=cfg.n_part,
-                tau_v=cfg.tau_v,
-                stability_k=cfg.stability_k,
-            )
-            if reject_reason is not None:
-                final_action = MDOAction.REJECT
-                break
+            final_action = MDOAction.COMMIT
+            committed_partition = partition
+            committed_responses = responses
+            committed_cross_routes = cross_routes
+            committed_cross_bw = cross_bw
+            committed_e2e = e2e
+            committed_cost = cost
+        else:
+            # --- Rollback substrate state and reject ---
+            self._restore_node_residuals(substrate, node_snapshot)
+            for resp in responses.values():
+                if resp.feasible:
+                    self._rollback_domain(substrate, resp)
+            self._rollback_cross_domain(substrate, cross_routes, cross_bw)
 
-        # If loop ended without COMMIT or explicit REJECT
-        if final_action not in (MDOAction.COMMIT, MDOAction.REJECT):
             final_action = MDOAction.REJECT
-            reject_reason = RejectReason.BUDGET_EXHAUSTED
+            reject_reason = RejectReason.INFEASIBLE
 
         # --- Compute reward (SMDP: terminal reward for the whole arrival) ---
         admitted = final_action == MDOAction.COMMIT
@@ -306,11 +299,10 @@ class MDOCoordinator:
             cost=committed_cost if admitted else 0.0,
             e2e=committed_e2e if admitted else 0.0,
             qos=slice_req.qos,
-            num_trials=history.num_attempts,
             cost_greedy=cost_greedy,
         )
 
-        # Stack log probs from all trials
+        # Stack log probs
         if all_log_probs:
             stacked = torch.cat(all_log_probs)
         else:
@@ -327,10 +319,10 @@ class MDOCoordinator:
             e2e_delay=committed_e2e,
             total_cost=committed_cost,
             reward=reward,
-            retry_history=history,
+            decision=decision,
             reject_reason=reject_reason,
             log_probs=stacked,
-            entropy=all_entropy / max(history.num_attempts, 1),
+            entropy=all_entropy,
             value_estimate=last_value,
             obs_tensor=obs_tensor.detach(),
             tier_mask=tier_mask.detach(),
@@ -365,6 +357,26 @@ class MDOCoordinator:
             log_probs = torch.zeros(K)
             logits = torch.zeros(K, M)
             return partition, log_probs, logits, 0.0, 0.0
+
+        if mode == "advised":
+            # LLM ALWAYS advises the MDO: bias the trained policy's autoregressive
+            # decode toward m~'s suggested partition at inference (never anneals to 0).
+            if self.policy is None:
+                raise ValueError("Policy required for 'advised' mode but is None")
+            domain_to_canonical = (
+                {d: i for i, d in enumerate(canonical_to_domain)}
+                if canonical_to_domain else {})
+            prior_logits = torch.zeros(K, M)
+            for k, d in enumerate(plan.suggested_domains[:K]):
+                c = domain_to_canonical.get(d, d)
+                if 0 <= c < M:
+                    prior_logits[k, c] = 1.0
+            with torch.no_grad():
+                partition, log_probs, logits, entropy = self.policy(
+                    obs_tensor, tier_mask, K, deterministic=True,
+                    prior_logits=prior_logits, prior_weight=ADVISE_WEIGHT)
+                value = self.policy.get_value(obs_tensor).item()
+            return partition, log_probs, logits, entropy, value
 
         if mode == "random":
             partition = []
@@ -686,13 +698,11 @@ class MDOCoordinator:
         cost: float,
         e2e: float,  # noqa: ARG002 — used by hard penalty in Phase 5
         qos: QoSRequirements,  # noqa: ARG002 — used by hard penalty in Phase 5
-        num_trials: int,
         cost_greedy: float | None = None,
     ) -> RewardComponents:
         """Compute decomposed reward (v6.2 Eq. 9).
 
-        SMDP credit assignment: this terminal reward is shared across all
-        partition trials within this arrival. No bootstrapping between retries.
+        Terminal reward for the arrival's partition decision.
 
         Efficiency uses normalized cost ratio (cost/cost_greedy) so the
         penalty stays bounded relative to the admission bonus mu.
@@ -712,12 +722,9 @@ class MDOCoordinator:
             local_score = max(0.0, (cost_greedy - cost) / cost_greedy)
             quality_shaping = cfg.eta * local_score
 
-        trial_penalty = -cfg.xi * max(0, num_trials - 1)
-
         return RewardComponents(
             admission=admission,
             efficiency=efficiency,
             hard_penalty=hard_penalty,
             quality_shaping=quality_shaping,
-            trial_penalty=trial_penalty,
         )

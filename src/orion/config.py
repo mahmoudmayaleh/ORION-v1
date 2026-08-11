@@ -34,8 +34,7 @@ class TopologyConfig(BaseSettings):
     inter_domain_links: int = 4
     tier_distribution: dict[str, float] = Field(
         default={
-            "ran_edge": 0.3,
-            "mec": 0.3,
+            "edge": 0.6,
             "regional_cloud": 0.2,
             "central_cloud": 0.2,
         }

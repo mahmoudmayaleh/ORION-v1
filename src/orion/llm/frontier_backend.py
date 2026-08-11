@@ -97,7 +97,7 @@ def make_frontier_config(model_snapshot: str, temperature: float = 0.0,
     if not key:
         raise RuntimeError(
             f"{FRONTIER_KEY_ENV} is not set. Source ~/ORION/.env.frontier before "
-            f"launching the frontier arm (see SCOPING_Q_API_INTEGRATION §7)."
+            f"launching the frontier approach (see SCOPING_Q_API_INTEGRATION §7)."
         )
     return LLMConfig(
         base_url=ANTHROPIC_OPENAI_BASE_URL,

@@ -36,14 +36,10 @@ from orion.actors.routing import (
 )
 from orion.actors.types import ActorStepRecord, DomainResponse, PlanFragment, VNFAssignment
 from orion.substrate.graph_model import SubstrateNetwork
-from orion.types import InfrastructureTier
+from orion.types import InfrastructureTier, TIER_INDEX, TIER_ORDER
 
-_TIER_ORDER = [
-    InfrastructureTier.RAN_EDGE,
-    InfrastructureTier.MEC,
-    InfrastructureTier.REGIONAL_CLOUD,
-    InfrastructureTier.CENTRAL_CLOUD,
-]
+# Canonical ordering lives in orion.types (one definition, see TIER_ORDER).
+_TIER_ORDER = list(TIER_ORDER)
 _TIER_TO_IDX = {t: i for i, t in enumerate(_TIER_ORDER)}
 
 

@@ -1,8 +1,8 @@
 """Final reward assembly: take MDO components + ground-truth verdict → R_t.
 
 The MDO coordinator (Phase 4) returns `RewardComponents` with admission,
-efficiency, quality_shaping, and trial_penalty already correctly computed,
-but stubs `hard_penalty = 0.0` because firing it requires the simulator-side
+efficiency, and quality_shaping already correctly computed, but stubs
+`hard_penalty = 0.0` because firing it requires the simulator-side
 ground-truth check — that's what we add here (Choice E1).
 
 This module is intentionally thin. It does NOT recompute admission, cost,
@@ -32,7 +32,6 @@ class RewardWeights:
     alpha: float = 1.0
     lambda_viol: float = 10.0
     eta: float = 1.0
-    xi: float = 0.5
 
 
 def finalize_reward(
@@ -76,6 +75,5 @@ def finalize_reward(
         efficiency=efficiency,
         hard_penalty=hard_penalty,
         quality_shaping=quality_shaping,
-        trial_penalty=mdo_components.trial_penalty,
     )
     return finalised.total, finalised

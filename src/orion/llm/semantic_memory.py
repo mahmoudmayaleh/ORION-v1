@@ -225,11 +225,36 @@ def _tokenize(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9_]+", text.lower()))
 
 
-def build_query_from_slice(slice_request: dict) -> str:
-    """Build a retrieval query string from a slice request dict.
+def _topology_query_terms(topology: dict | None) -> list[str]:
+    """Topology descriptor tokens for the retrieval query so M^B episodes are
+    matched by TOPOLOGY SIGNATURE, not slice features alone. The family code (and
+    its per-axis tokens C±/T±/B±) overlaps the stored `Topology:` record content,
+    so BM25 prefers episodes from the same/similar topology signature."""
+    if not topology:
+        return []
+    terms: list[str] = []
+    # The family code is deliberately NOT emitted. telecom_tokenize strips '+'
+    # and '-', so 'C+_T+_B-' and 'C-_T-_B+' both tokenize to ['c','t','b'] --
+    # it carries no topology signal and only dilutes the query. Substrate
+    # matching happens numerically in EpisodicMemory._topology_similarity; the
+    # descriptor terms below survive because K^B entries are written in these
+    # words and they do tokenize meaningfully.
+    tc = topology.get("tier_coverage")
+    if isinstance(tc, list) and tc:
+        terms.append("tier-scarce" if (sum(tc) / len(tc)) < 0.6 else "tier-rich")
+    bw = topology.get("inter_bw_mean")
+    if isinstance(bw, (int, float)):
+        terms.append("bandwidth-scarce" if bw < 100.0 else "bandwidth-generous")
+    return terms
 
-    Combines slice type, VNF types, tier requirements, and QoS values
-    into a text query for keyword/embedding matching.
+
+def build_query_from_slice(slice_request: dict, topology: dict | None = None,
+                           condition: dict | None = None) -> str:
+    """Build a retrieval query string from a slice request dict (and, when given,
+    the topology signature).
+
+    Combines slice type, VNF types, tier requirements, QoS values, AND topology
+    signature descriptors into a text query for keyword/embedding matching.
     """
     parts = [slice_request.get("slice_type", "")]
 
@@ -237,6 +262,15 @@ def build_query_from_slice(slice_request: dict) -> str:
         parts.append(vnf.get("vnf_type", ""))
         for tier in vnf.get("permitted_tiers", []):
             parts.append(tier)
+
+    parts.extend(_topology_query_terms(topology))
+    # §Y.6: operating point / congestion terms. Under a fixed substrate the
+    # topology terms above are constant across every entry and carry no signal;
+    # these are what let the lexical stage separate a free-network episode from
+    # a saturated one.
+    if condition is not None:
+        from orion.llm.condition_signature import condition_query_terms
+        parts.extend(condition_query_terms(condition))
 
     qos = slice_request.get("qos", {})
     if "max_e2e_delay" in qos:

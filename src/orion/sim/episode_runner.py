@@ -74,6 +74,10 @@ class EpisodeStats:
     rejected_structural: int = 0
     departures: int = 0
     hard_penalty_fires: int = 0
+    #: Committed partitions with no realisable placement (§Y.13). Counted so the
+    #: path cannot be silent again: it was previously a no-op that left the
+    #: arrival marked admitted.
+    plan_build_failures: int = 0
     cumulative_reward: float = 0.0
     per_slice_type_admitted: dict[str, int] = field(default_factory=dict)
     per_slice_type_total: dict[str, int] = field(default_factory=dict)
@@ -229,7 +233,17 @@ class EpisodeRunner:
         verdict: GroundTruthVerdict | None = None
         if mdo_result.admitted and mdo_result.partition is not None:
             placement_plan = self._build_placement_plan(slice_req, mdo_result)
-            if placement_plan is not None:
+            if placement_plan is None:
+                # §Y.13 — the coordinator committed a partition but no concrete
+                # placement could be synthesised from the domain responses.
+                # Nothing is allocated and nothing is tracked, so leaving
+                # `admitted` True counted a slice that does not exist on the
+                # substrate: it inflated acceptance and its departure was a
+                # no-op. A commit that cannot be realised is a rejection.
+                stats.plan_build_failures += 1
+                mdo_result.admitted = False
+                mdo_result.revoked_by = ["PLAN_BUILD"]
+            else:
                 self.substrate.allocate(placement_plan, slice_req)
                 with profiled("verify"):
                     verdict = verify_committed_plan(
@@ -242,6 +256,11 @@ class EpisodeRunner:
                     stats.hard_penalty_fires += 1
                     self.substrate.deallocate(placement_plan, slice_req)
                     mdo_result.admitted = False
+                    # §Y.13 — carry the binding constraint so the rejection
+                    # taxonomy can bin this instead of dropping it into
+                    # `unattributed`. Set before `_update_stats` so the flip and
+                    # its reason are recorded together.
+                    mdo_result.revoked_by = list(verdict.violated)
                 else:
                     self._active_plans[slice_req.request_id] = placement_plan
                     self._active_requests[slice_req.request_id] = slice_req
@@ -263,9 +282,8 @@ class EpisodeRunner:
         # even on reject, so criterion (b) / the k-analysis see WHERE it placed, not
         # only what committed. `committed` separates selection from admission.
         if arrival_trace is not None:
-            _attempts = (mdo_result.retry_history.attempts
-                         if mdo_result.retry_history is not None else [])
-            selected = (list(_attempts[-1].partition) if _attempts
+            _dec = mdo_result.decision
+            selected = (list(_dec.partition) if _dec is not None
                         else (list(mdo_result.partition)
                               if mdo_result.partition is not None else None))
             arrival_trace.append({
@@ -293,60 +311,8 @@ class EpisodeRunner:
         slice_req: SliceRequest,
         mdo_result: MDOResult,
     ) -> PlacementPlan | None:
-        """Synthesise a substrate-level PlacementPlan from domain responses.
-
-        Combines intra-domain routes (from domain actors) with cross-domain
-        routes (from the coordinator's full-graph routing). Both land in
-        flow_routes and bw_allocations so substrate.allocate() charges all
-        edges and the verifier covers all flows.
-        """
-        vnf_placements: dict[str, str] = {}
-        cpu_allocations: dict[str, float] = {}
-        ram_allocations: dict[str, float] = {}
-        flow_routes: dict[tuple[str, str], list[str]] = {}
-        bw_allocations: dict[tuple[str, str], dict[str, float]] = {}
-
-        vnf_by_id = {v.vnf_id: v for v in slice_req.vnfs}
-
-        for _domain_id, response in mdo_result.domain_responses.items():
-            for vnf_id, node_id in response.placements.items():
-                vnf_placements[vnf_id] = node_id
-                vnf = vnf_by_id[vnf_id]
-                cpu_allocations[vnf_id] = vnf.cpu_demand
-                ram_allocations[vnf_id] = vnf.ram_demand
-
-            for flow_key, route_link_ids in response.routes.items():
-                flow_routes[flow_key] = route_link_ids
-                per_link_bw_value = response.bw_allocated.get(flow_key, 0.0)
-                bw_allocations[flow_key] = {
-                    link_id: per_link_bw_value for link_id in route_link_ids
-                }
-
-        # Add cross-domain routes from coordinator's full-graph routing
-        for flow_key, route_link_ids in mdo_result.cross_domain_routes.items():
-            flow_routes[flow_key] = route_link_ids
-            bw = mdo_result.cross_domain_bw.get(flow_key, 0.0)
-            bw_allocations[flow_key] = {
-                link_id: bw for link_id in route_link_ids
-            }
-
-        if any(v.vnf_id not in vnf_placements for v in slice_req.vnfs):
-            logger.warning(
-                "Incomplete VNF placements for committed slice %s",
-                slice_req.request_id,
-            )
-            return None
-
-        return PlacementPlan(
-            plan_id=f"{slice_req.request_id}_mdo",
-            vnf_placements=vnf_placements,
-            cpu_allocations=cpu_allocations,
-            ram_allocations=ram_allocations,
-            flow_routes=flow_routes,
-            bw_allocations=bw_allocations,
-            is_structurally_valid=True,
-            source="mdo",
-        )
+        """Instance-level delegate; see module-level build_placement_plan."""
+        return build_placement_plan(slice_req, mdo_result)
 
     def _update_stats(
         self,
@@ -372,36 +338,36 @@ class EpisodeRunner:
         rollout: MultiAgentRollout,
         plan_summary: PlanSummary | None = None,
     ) -> None:
-        """One MDO transition per trial; one domain-actor transition per
-        domain per trial. Terminal reward broadcast to all (SMDP)."""
-        history = mdo_result.retry_history
+        """One MDO transition per arrival; one domain-actor transition per
+        domain. Terminal reward broadcast to all (SMDP)."""
+        decision = mdo_result.decision
         suggested = plan_summary.suggested_domains if plan_summary is not None else []
-        for attempt in history.attempts:
+        if decision is not None:
             rollout.append_mdo(
                 MDOTransition(
                     request_id=slice_req.request_id,
-                    trial_index=attempt.trial_index,
+                    trial_index=0,
                     obs=mdo_result.obs_tensor,
-                    action=attempt.partition,
-                    log_probs=attempt.log_probs,
-                    entropy=attempt.entropy,
-                    value_estimate=attempt.value_estimate,
+                    action=decision.partition,
+                    log_probs=decision.log_probs,
+                    entropy=decision.entropy,
+                    value_estimate=decision.value_estimate,
                     terminal_reward=final_reward,
-                    committed=attempt.trial_index == history.num_attempts - 1,
+                    committed=True,
                     tier_mask=mdo_result.tier_mask,
                     num_vnfs=mdo_result.num_vnfs,
                     info={
-                        "e2e_delay": attempt.e2e_delay,
-                        "cost": attempt.total_cost,
+                        "e2e_delay": decision.e2e_delay,
+                        "cost": decision.total_cost,
                         "suggested_domains": suggested,
                     },
                 )
             )
-            for domain_id, response in attempt.domain_responses.items():
+            for domain_id, response in decision.domain_responses.items():
                 rollout.append_domain_actor(
                     DomainActorTransition(
                         request_id=slice_req.request_id,
-                        trial_index=attempt.trial_index,
+                        trial_index=0,
                         domain_id=domain_id,
                         log_probs=response.log_probs,
                         entropy=getattr(response, "entropy", 0.0),
@@ -469,7 +435,7 @@ def _default_plan_builder(
 
 def _infer_required_tier(vnf, substrate):
     """Return the InfrastructureTier required by a VNF (modal tier of permitted_nodes)."""
-    from orion.types import InfrastructureTier
+    from orion.types import InfrastructureTier, TIER_INDEX, TIER_ORDER
 
     if not vnf.permitted_nodes:
         return None
@@ -481,13 +447,73 @@ def _infer_required_tier(vnf, substrate):
     if not tiers:
         return None
     # If unambiguous, use it; otherwise pick the most "edge-ward" tier.
-    tier_order = [
-        InfrastructureTier.RAN_EDGE,
-        InfrastructureTier.MEC,
-        InfrastructureTier.REGIONAL_CLOUD,
-        InfrastructureTier.CENTRAL_CLOUD,
-    ]
+    tier_order = list(TIER_ORDER)
     for t in tier_order:
         if t.value in tiers:
             return t
     return None
+
+
+# ── Commit mechanics, shared with the M^B warm-up path (§Y.6) ────────────────
+
+
+def build_placement_plan(
+    slice_req: SliceRequest,
+    mdo_result: MDOResult,
+) -> PlacementPlan | None:
+    """Synthesise a substrate-level PlacementPlan from domain responses.
+
+    Combines intra-domain routes (from domain actors) with cross-domain routes
+    (from the coordinator's full-graph routing). Both land in flow_routes and
+    bw_allocations so substrate.allocate() charges all edges and the verifier
+    covers all flows.
+
+    Module-level because the M^B warm-up stream must commit through the
+    IDENTICAL mechanics as the eval episode; a second copy of this logic is how
+    the two paths would silently drift apart.
+    """
+    vnf_placements: dict[str, str] = {}
+    cpu_allocations: dict[str, float] = {}
+    ram_allocations: dict[str, float] = {}
+    flow_routes: dict[tuple[str, str], list[str]] = {}
+    bw_allocations: dict[tuple[str, str], dict[str, float]] = {}
+
+    vnf_by_id = {v.vnf_id: v for v in slice_req.vnfs}
+
+    for _domain_id, response in mdo_result.domain_responses.items():
+        for vnf_id, node_id in response.placements.items():
+            vnf_placements[vnf_id] = node_id
+            vnf = vnf_by_id[vnf_id]
+            cpu_allocations[vnf_id] = vnf.cpu_demand
+            ram_allocations[vnf_id] = vnf.ram_demand
+
+        for flow_key, route_link_ids in response.routes.items():
+            flow_routes[flow_key] = route_link_ids
+            per_link_bw_value = response.bw_allocated.get(flow_key, 0.0)
+            bw_allocations[flow_key] = {
+                link_id: per_link_bw_value for link_id in route_link_ids
+            }
+
+    # Cross-domain routes from the coordinator's full-graph routing.
+    for flow_key, route_link_ids in mdo_result.cross_domain_routes.items():
+        flow_routes[flow_key] = route_link_ids
+        bw = mdo_result.cross_domain_bw.get(flow_key, 0.0)
+        bw_allocations[flow_key] = {link_id: bw for link_id in route_link_ids}
+
+    if any(v.vnf_id not in vnf_placements for v in slice_req.vnfs):
+        logger.warning(
+            "Incomplete VNF placements for committed slice %s",
+            slice_req.request_id,
+        )
+        return None
+
+    return PlacementPlan(
+        plan_id=f"{slice_req.request_id}_mdo",
+        vnf_placements=vnf_placements,
+        cpu_allocations=cpu_allocations,
+        ram_allocations=ram_allocations,
+        flow_routes=flow_routes,
+        bw_allocations=bw_allocations,
+        is_structurally_valid=True,
+        source="mdo",
+    )

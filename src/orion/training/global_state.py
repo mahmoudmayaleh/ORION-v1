@@ -37,16 +37,12 @@ import torch
 
 from orion.mdo.observation import build_domain_summaries, build_inter_domain_links
 from orion.substrate.graph_model import SubstrateNetwork
-from orion.types import InfrastructureTier
+from orion.types import InfrastructureTier, TIER_INDEX, TIER_ORDER
 
 # Same tier order as the MDO observation builder — must match exactly so
 # the actor and critic see the same canonical layout (Choice A1).
-_TIER_ORDER = {
-    InfrastructureTier.RAN_EDGE: 0,
-    InfrastructureTier.MEC: 1,
-    InfrastructureTier.REGIONAL_CLOUD: 2,
-    InfrastructureTier.CENTRAL_CLOUD: 3,
-}
+# Canonical ordering lives in orion.types (one definition, see TIER_ORDER).
+_TIER_ORDER = TIER_INDEX
 _TIER_NORM = 3.0  # 4 tiers indexed 0..3 → normalize to [0, 1]
 
 

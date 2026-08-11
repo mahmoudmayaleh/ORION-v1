@@ -4,7 +4,7 @@ R.1  ORION-local deployable : Agent B (LLaMA-3-8B) plans, plan-cache ON, follow_
 R.2  Local, diverse sampling : same, plan-cache OFF (every arrival re-plans).
 
 Three seeds 42/43/44 (bw sweep 70/90/110), byte-identical 100-arrival RC streams,
-per-(seed, arm) cold start (cache + M^B wiped, state hash asserted empty). Reuses
+per-(seed, approach) cold start (cache + M^B wiped, state hash asserted empty). Reuses
 q_pilot_runner.run_q_cell (now emitting a per-arrival trace) so R.1/R.2 are the
 SAME deployable stack the pilot measured, just cache ON vs OFF.
 
@@ -13,7 +13,7 @@ Settles (PREREG_AMENDMENT_2026-07-15_R.md):
   R-Sampling : |R.2 - R.1| = the cache-thinness measurement (characterization).
 
 Needs the local llama.cpp server on :8000. --mock swaps Agent B for FFD (wiring smoke,
-no server). Box-only, minutes-to-hours. Records everything per arm/seed for the paper.
+no server). Box-only, minutes-to-hours. Records everything per approach/seed for the paper.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ from orion.substrate.routing_critical import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("r_local")
 
-# ── FROZEN RC-v2 validity draw ────────────────────────────────────────────────
+# ── FROZEN RC-v2 validity draw (results/rc_family_validity_RESULT.md) ──────────
 # §R rule: Plain-ColocFB and the ceiling are NEVER re-run; cite these verbatim.
 # R.1/R.2 build the SAME (substrate, arrival stream) as the validity draw
 # (generate_rc_instance(RC_GEN_SEED+(seed-42), bw) + arrival_seed=seed +
@@ -110,11 +110,11 @@ def _mb_composition(mb):
     return {"mb_entries": len(entries), "mb_pos": pos, "mb_neg": len(entries) - pos}
 
 
-def _cell(arm, agent_b, kb, substrate, seed, cache_on, mock):
+def _cell(approach, agent_b, kb, substrate, seed, cache_on, mock):
     mb = _fresh_mb()
     plan_cache = PlanCache(capacity=64) if cache_on else None
     t0 = time.time()
-    m = run_q_cell(arm, agent_b, kb, mb, plan_cache, substrate, seed, mock)
+    m = run_q_cell(approach, agent_b, kb, mb, plan_cache, substrate, seed, mock)
     m["wall_s"] = round(time.time() - t0, 1)
     m.update(_mb_composition(mb))
     return m
@@ -123,7 +123,7 @@ def _cell(arm, agent_b, kb, substrate, seed, cache_on, mock):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
-    ap.add_argument("--arms", nargs="+", default=["R.1", "R.2"], choices=["R.1", "R.2"])
+    ap.add_argument("--approaches", nargs="+", default=["R.1", "R.2"], choices=["R.1", "R.2"])
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--mock", action="store_true", help="FFD stand-in for Agent B (no server)")
     ap.add_argument("--tag", default="R12")
@@ -142,11 +142,11 @@ def main():
     kb = _load_kb()
     agent_b = None if args.mock else _build_local_agent(args.port)
 
-    # cache_on per arm: R.1 = cache ON, R.2 = cache OFF (diverse sampling).
-    arm_cache = {"R.1": True, "R.2": False}
+    # cache_on per approach: R.1 = cache ON, R.2 = cache OFF (diverse sampling).
+    approach_cache = {"R.1": True, "R.2": False}
 
     out = {"provenance": _prov, "tag": args.tag, "family": RC_FAMILY_SHORT, "gen_seed": RC_GEN_SEED,
-           "prereg_sha256": prereg_sha256(), "seeds": args.seeds, "arms": args.arms,
+           "prereg_sha256": prereg_sha256(), "seeds": args.seeds, "approaches": args.approaches,
            "mock": args.mock, "plain_foc_ref": PLAIN_FOC_RC_MEAN, "refs": {}, "cells": {}}
 
     # Per-seed reference: FROZEN ceiling + Plain (validity draw, never re-run).
@@ -160,16 +160,16 @@ def main():
         logger.info("seed %d (bw=%g): FROZEN ceiling=%d Plain=%d (Plain FoC=%.1f%%)",
                     seed, fr["bw"], fr["ceiling"], fr["plain_admits"], fr["plain_foc"])
 
-        for arm in args.arms:
-            logger.info("### %s seed=%d cache=%s", arm, seed, arm_cache[arm])
-            m = _cell(arm, agent_b, kb, sub, seed, arm_cache[arm], args.mock)
+        for approach in args.approaches:
+            logger.info("### %s seed=%d cache=%s", approach, seed, approach_cache[approach])
+            m = _cell(approach, agent_b, kb, sub, seed, approach_cache[approach], args.mock)
             ceiling_s = out["refs"][str(seed)]["ceiling"]
             m["foc"] = 100.0 * m["admitted"] / ceiling_s if ceiling_s else float("nan")
             m["struct_reject_rate"] = 100.0 * m["structural"] / m["total"] if m["total"] else 0.0
             m["schema_fail_rate"] = 100.0 * m["schema_fail"] / m["total"] if m["total"] else 0.0
-            out["cells"][f"{arm}|{seed}"] = m
+            out["cells"][f"{approach}|{seed}"] = m
             logger.info("  -> %s seed=%d FoC=%.1f%% admit=%d/%d cache_hit=%d wall=%.0fs",
-                        arm, seed, m["foc"], m["admitted"], m["total"], m["cache_hit"], m["wall_s"])
+                        approach, seed, m["foc"], m["admitted"], m["total"], m["cache_hit"], m["wall_s"])
 
     out_path = Path(f"data/r_local_results_{args.tag}.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,21 +201,21 @@ def _readout(out):
         print(row + f"{m['structural']:>9d}")
 
     print("\n[3] FoC (admitted / ceiling) vs per-seed Plain")
-    for arm in out["arms"] if "arms" in out else ["R.1", "R.2"]:
+    for approach in out["approaches"] if "approaches" in out else ["R.1", "R.2"]:
         vals, signs = [], []
         for s in seeds:
-            m = cells.get(f"{arm}|{s}")
+            m = cells.get(f"{approach}|{s}")
             if not m:
                 continue
             pf = refs[str(s)]["plain_foc"]
             d = m["foc"] - pf
             vals.append(m["foc"]); signs.append(d)
-            print(f"  {arm} seed {s}: FoC={m['foc']:.1f}%  Plain={pf:.1f}%  ({d:+.1f}pp)  "
+            print(f"  {approach} seed {s}: FoC={m['foc']:.1f}%  Plain={pf:.1f}%  ({d:+.1f}pp)  "
                   f"admit={m['admitted']}/{m['total']}")
         if vals:
             mean = float(np.mean(vals))
             all_pos = all(x > 0 for x in signs)
-            print(f"  {arm} MEAN FoC={mean:.1f}%  (Plain-mean {out['plain_foc_ref']}%)  "
+            print(f"  {approach} MEAN FoC={mean:.1f}%  (Plain-mean {out['plain_foc_ref']}%)  "
                   f"all-seeds-positive={all_pos}")
 
     # R-Primary verdict (R.1), R-Sampling (|R.2-R.1|)
