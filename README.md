@@ -9,23 +9,6 @@ a PPO-trained Multi-Domain Orchestrator, KL-regularised toward that plan, decide
 admission and partitions the plan across domains; behaviour-cloned per-domain actors
 place within each domain.
 
-## Layout
-
-| Path | Contents |
-| --- | --- |
-| `src/orion/` | The system: substrate model, simulator, LLM agents, memory/retrieval, MDO, per-domain actors, training. |
-| `tests/` | Test suite. |
-| `scripts/` | Experiment entry points and analysis tools. |
-| `data/` | Fixtures used by the test suite. |
-
-## Install
-
-```
-pip install -e ".[dev]"
-```
-
-Optional extras: `retrieval` (BM25/FAISS/sentence-transformers), `actors` (torch-geometric).
-
 ## Citation
 
 See `CITATION.cff`.
