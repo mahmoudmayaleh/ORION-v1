@@ -1,6 +1,6 @@
 # ORION-v1
 
-![ORION_System_design](V6-ORION.png)
+![ORION_System_design](Orion-arch.jpg)
 
 ORION is an LLM-guided reinforcement-learning system for admission and placement of
 network slices across federated administrative domains. A language model turns an
