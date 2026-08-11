@@ -97,12 +97,38 @@ _QOS_PROFILES: dict[SliceType, dict] = {
     SliceType.XR:    {"delay": (5.0, 30.0),    "beta_in": (100.0, 500.0)},
 }
 
+#: §Y.10 complexity level S1, the standard workload mix. This IS the reference
+#: configuration R (§Y.4); every
+#: load-axis number is measured under it. Mean chain length 2.85 VNFs.
 _SLICE_TYPE_WEIGHTS = {
     SliceType.EMBB:  0.30,
     SliceType.URLLC: 0.25,
     SliceType.MMTC:  0.20,
     SliceType.V2X:   0.15,
     SliceType.XR:    0.10,
+}
+
+#: §Y.10 complexity level S2: an XR-dominant workload. Mean chain length 3.25 VNFs
+#: and 1.38x the CPU per slice of the standard mix.
+#:
+#: XR is the stressing class for structural reasons, not by assertion: it has the
+#: longest chain in the catalogue (4 VNFs), the heaviest single VNF (MediaProc,
+#: 8-16 CPU / 16-32 RAM), and the tightest delay budget of the multi-tier types
+#: (5-30 ms). Raising its share therefore lengthens chains and raises per-slice
+#: demand together, the way a real traffic shift would.
+#:
+#: The WEIGHTS are a design choice and must be described as one. They are not an
+#: empirical traffic forecast and no source is cited for them, because none of the
+#: references this project uses gives a service-class split for 6G. What the
+#: references support is that XR is a first-class 6G service class with the
+#: latency budget used here (3GPP TR 26.928, RFC 9699); the decision to make it
+#: dominant is ours and is the definition of the level.
+COMPLEX_SLICE_TYPE_WEIGHTS = {
+    SliceType.EMBB:  0.30,
+    SliceType.URLLC: 0.10,
+    SliceType.MMTC:  0.10,
+    SliceType.V2X:   0.15,
+    SliceType.XR:    0.35,
 }
 
 
@@ -124,6 +150,7 @@ def generate_slice_request(
     slice_type: SliceType | None = None,
     arrival_time: float = 0.0,
     lifetime: float = 0.0,
+    type_weights: dict[SliceType, float] | None = None,
 ) -> SliceRequest:
     """Generate a single random slice request.
 
@@ -132,6 +159,8 @@ def generate_slice_request(
         substrate: Substrate network for resolving permitted nodes (C8).
         rng: Seeded random generator.
         slice_type: If None, sample from weighted distribution.
+        type_weights: Slice-type mix; defaults to the standard mix.
+            §Y.10 varies this and nothing else.
         arrival_time: Simulation arrival time.
         lifetime: Duration; 0.0 for static batch mode.
 
@@ -139,8 +168,9 @@ def generate_slice_request(
         A fully populated SliceRequest.
     """
     if slice_type is None:
-        types = list(_SLICE_TYPE_WEIGHTS.keys())
-        weights = [_SLICE_TYPE_WEIGHTS[t] for t in types]
+        wmap = type_weights or _SLICE_TYPE_WEIGHTS
+        types = list(wmap.keys())
+        weights = [wmap[t] for t in types]
         # rng.choice returns a numpy element (numpy.str_ for StrEnum); coerce
         # back to a real SliceType so downstream `.value` access works.
         slice_type = SliceType(rng.choice(types, p=weights))
@@ -148,10 +178,19 @@ def generate_slice_request(
     templates = _VNF_TEMPLATES[slice_type]
     qos_profile = _QOS_PROFILES[slice_type]
 
-    # Optionally shorten the chain (minimum 2 VNFs)
-    max_vnfs = len(templates)
-    n_vnfs = rng.integers(2, max_vnfs + 1) if max_vnfs > 2 else max_vnfs
-    selected_templates = templates[:n_vnfs]
+    # NO TRUNCATION (§Y.10, 2026-08-01). This used to draw n_vnfs in
+    # [2, len(templates)] and keep templates[:n_vnfs], which removed the TAIL of
+    # the service chain: an eMBB request became Firewall + CDN with no vEPC, an
+    # mMTC request lost its Analytics stage. That is not a shorter valid slice of
+    # that type, it is one missing its core function, and no admission decision
+    # made about it means anything. It also skewed the workload hard toward
+    # trivially co-locatable requests: 61% of arrivals were two-VNF chains and
+    # mean K was 2.43 against 2.85 for the templates as written, so most arrivals
+    # never posed the partitioning question the orchestrator exists to answer.
+    #
+    # Chain length now varies ACROSS slice types (URLLC 2, eMBB/mMTC/V2X 3, XR 4),
+    # which is where it varies in reality, and the workload mix is the knob.
+    selected_templates = templates
 
     vnfs: list[VNF] = []
     for k, tmpl in enumerate(selected_templates):

@@ -75,6 +75,15 @@ def tier_feasible_domains(vnf: dict, abstract_topology: dict) -> list[str]:
     return out
 
 
+#: Completion ceiling for a plan call. The server reserves this on TOP of the
+#: prompt, so leaving it at the 2048 default cost both overnight jobs: a 4121-token
+#: prompt plus a 2048-token reservation is 6169 against a 4096 window, and the
+#: request is refused with a 400 rather than truncated. Measured plans are 50 to 90
+#: tokens since the schema asks for the partition only, so this is ~4x headroom and
+#: still leaves a plan-carrying request inside a 4608-token window.
+PLAN_MAX_TOKENS = 384
+
+
 def build_pinned_plan_schema(slice_request: dict, abstract_topology: dict) -> dict | None:
     """Per-request JSON schema that PINS the interface contract, not just shape.
 
@@ -101,16 +110,19 @@ def build_pinned_plan_schema(slice_request: dict, abstract_topology: dict) -> di
         if not feas:
             return None  # signals genuine tier-infeasibility for this VNF
         tiers = sorted(v.get("permitted_tiers", []))
+        # required_tier, cpu_demand and ram_demand are NOT asked for. The first is
+        # overwritten by recompute_required_tiers and the other two are echoes of the
+        # request, so generating them cost ~200 of the ~257 output tokens per call and
+        # bought nothing. Measured 2026-08-07: 9.3 s per call at ~28 tok/s effective,
+        # which put the LLM grid at ~350 h. `tiers` stays in scope for the caller.
+        _ = tiers
         return {
             "type": "object",
             "properties": {
                 "vnf_id": {"enum": [v["vnf_id"]]},          # pin position -> VNF
                 "domain": {"enum": feas},                    # D(tau_fk) only
-                "required_tier": ({"enum": tiers} if tiers else {"type": "string"}),
-                "cpu_demand": {"type": "number"},
-                "ram_demand": {"type": "number"},
             },
-            "required": ["vnf_id", "domain", "required_tier", "cpu_demand", "ram_demand"],
+            "required": ["vnf_id", "domain"],
             "additionalProperties": False,
         }
 
@@ -121,27 +133,17 @@ def build_pinned_plan_schema(slice_request: dict, abstract_topology: dict) -> di
             return None  # genuinely infeasible slice
         per_position.append(a)
 
-    flow = {
-        "type": "object",
-        "properties": {
-            "source_vnf": {"enum": vnf_ids},
-            "target_vnf": {"enum": vnf_ids},
-            "min_bandwidth_mbps": {"type": "number"},
-            "crosses_domain_boundary": {"type": "boolean"},
-        },
-        "required": ["source_vnf", "target_vnf", "min_bandwidth_mbps", "crosses_domain_boundary"],
-        "additionalProperties": False,
-    }
+    # flow_requirements is filled from the request (see fill_derived_fields), so the
+    # structural check now screens on the TRUE per-edge bandwidth instead of a number the
+    # model invented. plan_id is read by nothing.
     k = len(vnf_ids)
     return {
         "type": "object",
         "properties": {
-            "plan_id": {"type": "string"},
             # per-position tuple validation (draft-07 items-list): exactly K, position i == VNF i
             "vnf_assignments": {"type": "array", "minItems": k, "maxItems": k, "items": per_position},
-            "flow_requirements": {"type": "array", "items": flow},
         },
-        "required": ["plan_id", "vnf_assignments", "flow_requirements"],
+        "required": ["vnf_assignments"],
         "additionalProperties": False,
     }
 
@@ -163,6 +165,39 @@ def recompute_required_tiers(plan: dict, slice_request: dict, abstract_topology:
         inter = permitted.get(vid, set()) & dom_tiers.get(dom, set())
         if inter:
             a["required_tier"] = sorted(inter)[0]
+
+
+def fill_derived_fields(plan: dict, slice_request: dict) -> None:
+    """Fill every field the model no longer emits, in place, from the REQUEST.
+
+    The model emits the partition only. The rest is either a copy of the request
+    (cpu_demand, ram_demand, min_bandwidth_mbps) or derived from the assignments
+    (crosses_domain_boundary, set by recompute_flow_boundaries; required_tier, by
+    recompute_required_tiers), so generating it cost decode tokens and bought
+    nothing. Taking min_bandwidth_mbps from the request also means the structural
+    check screens on the real per-edge demand and not on an invented number.
+
+    This runs immediately after parsing so the plan the defensive validator sees
+    has the shape it has always had. Fill only; never overwrite.
+    """
+    demands = {v.get("vnf_id"): v for v in slice_request.get("vnfs", []) or []}
+    plan.setdefault("plan_id", str(slice_request.get("request_id", "req")) + "_plan")
+    for a in plan.get("vnf_assignments", []) or []:
+        v = demands.get(a.get("vnf_id"), {})
+        a.setdefault("cpu_demand", v.get("cpu_demand", 0.0))
+        a.setdefault("ram_demand", v.get("ram_demand", 0.0))
+        a.setdefault("required_tier", "")
+    if plan.get("flow_requirements"):
+        return
+    plan["flow_requirements"] = [
+        {
+            "source_vnf": f.get("source_vnf"),
+            "target_vnf": f.get("target_vnf"),
+            "min_bandwidth_mbps": f.get("bandwidth_demand", 0.0),
+            "crosses_domain_boundary": False,
+        }
+        for f in slice_request.get("flow_edges", []) or []
+    ]
 
 
 def recompute_flow_boundaries(plan: dict) -> None:
@@ -219,23 +254,8 @@ VNFs in the same domain when both tier and resource constraints allow.
 
 OUTPUT FORMAT — respond ONLY with a single JSON object:
 {
-  "plan_id": "<request_id>_plan",
   "vnf_assignments": [
-    {
-      "vnf_id": "<vnf_id>",
-      "domain": "<domain_id>",
-      "required_tier": "<tier from permitted_tiers matching this domain>",
-      "cpu_demand": <float>,
-      "ram_demand": <float>
-    }
-  ],
-  "flow_requirements": [
-    {
-      "source_vnf": "<vnf_id>",
-      "target_vnf": "<vnf_id>",
-      "min_bandwidth_mbps": <float>,
-      "crosses_domain_boundary": <true|false>
-    }
+    {"vnf_id": "<vnf_id>", "domain": "<domain_id>"}
   ]
 }
 
@@ -474,6 +494,7 @@ class AgentB:
         )
         raw = self.llm.complete(
             self.system_prompt, user_msg,
+            max_tokens=PLAN_MAX_TOKENS,
             response_format={"type": "json_object",
                              "schema": plan_schema or AGENT_B_PLAN_JSON_SCHEMA},
         )
@@ -487,6 +508,7 @@ class AgentB:
                 f"n_ctx={getattr(self.llm.config, 'n_ctx', None)})"
             )
         plan = extract_json(raw)
+        fill_derived_fields(plan, slice_request)
         # Defensive secondary check (v6.5): with grammar-constrained decoding this
         # must already hold. If it ever fires, the constrained path has regressed —
         # log loudly rather than silently repair the model's output.

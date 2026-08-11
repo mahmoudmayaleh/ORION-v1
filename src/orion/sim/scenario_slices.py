@@ -8,12 +8,14 @@ along the SFC chain:
     β_{k,k+1} = β_in — the setting most prior slicing work assumes.
   * Stress (ρ > 1): bandwidth GROWS along the chain, β_{k,k+1} = β_in · ρ^k,
     tightening the coupling between placement and inter-domain routing. ρ matches
-    the validated RC family (_RC_VCR = 1.15, src/orion/substrate/routing_critical.py).
+    the validated pre-§Y routing-critical family (rho = 1.15). That generator was
+    removed in §Y.1e; the VALUE is retained because the scenario class is defined by
+    it, not by the generator it was measured on.
 
 Both wrap the shipped ``generate_slice_request`` (same slice-type mix, chain
 templates, QoS ranges, and permitted-node resolution) and override ONLY the VCR,
 recomputing the bandwidth ramp from β_in exactly as v4 Eq. 3 prescribes. This keeps
-the workload identical across families (topology_families.py: "slice-mix FROZEN
+the workload identical across topologies (slice-mix FROZEN
 across families") while making the scenario class the single varying factor.
 
 Both factories satisfy the SliceFactory contract
@@ -27,7 +29,10 @@ from dataclasses import replace
 import numpy as np
 
 from orion.substrate.graph_model import SubstrateNetwork
-from orion.sim.slice_generator import generate_slice_request
+from orion.sim.slice_generator import (
+    COMPLEX_SLICE_TYPE_WEIGHTS,
+    generate_slice_request,
+)
 from orion.types import FlowEdge, SliceRequest
 
 # Stress ρ, matched to the validated RC family (_RC_VCR).
@@ -56,18 +61,28 @@ def make_scenario_slice_factory(scenario: str, rho: float | None = None):
 
     scenario == "conventional" -> ρ = 1.0 (constant bandwidth).
     scenario == "stress"       -> ρ = STRESS_RHO (ramp), or an explicit ``rho``.
+    scenario == "complex"      -> ρ = 1.0, XR-dominant mix (§Y.10 level S2).
     """
+    weights = None
     if scenario == "conventional":
         r = 1.0
     elif scenario == "stress":
         r = STRESS_RHO if rho is None else rho
+    elif scenario == "complex":
+        # §Y.10 level S2. Same VCR as conventional, so this differs from the
+        # reference in the workload MIX and in nothing else -- the one-axis-at-a-
+        # time requirement of §Y.4. Chains get longer and heavier together
+        # because XR chains ARE longer and heavier, not via a demand multiplier.
+        r = 1.0
+        weights = COMPLEX_SLICE_TYPE_WEIGHTS
     else:
         raise ValueError(f"unknown scenario class: {scenario!r}")
 
     def factory(request_id: str, substrate: SubstrateNetwork, rng: np.random.Generator,
                 arrival_time: float = 0.0, lifetime: float = 0.0) -> SliceRequest:
         sr = generate_slice_request(request_id, substrate, rng,
-                                    arrival_time=arrival_time, lifetime=lifetime)
+                                    arrival_time=arrival_time, lifetime=lifetime,
+                                    type_weights=weights)
         return _reramp(sr, r)
 
     factory.scenario = scenario  # type: ignore[attr-defined]

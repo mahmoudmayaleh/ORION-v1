@@ -54,6 +54,17 @@ SERVICE_RATE = 0.05
 #: out", not a queue. At N=2000 every sweep point is valid and acceptance falls
 #: monotonically 0.87 -> 0.45.
 #:
+#: 2000 (user directive 2026-07-31). Briefly 3000 to let the ladder reach
+#: rho = 2.00; at 2000 the top rung fails A/N <= 0.25 and is not a steady-state
+#: measurement, so L4 is taken from the highest rho that IS one and the
+#: acceptance range is correspondingly narrower. The targets below are set
+#: against the range this N can actually produce.
+#: Superseded note: 2000 -> 3000 was forced by the L4 offered load. The ladder now
+#: reaches rho = 2.00, i.e. A = 528 concurrent slices, and an N-arrival episode can
+#: never hold more than N of them: at N=2000 the top rung failed A/N <= 0.25 and was
+#: not a steady-state measurement, so L4 had to be taken from rho = 1.52 instead and
+#: the bottom of the achievable range was unreachable.
+#:
 #: The frozen levels below assume this value. `A/N <= 0.25` is asserted in the
 #: tests so the two cannot drift apart again.
 NUM_ARRIVALS = 2000
@@ -92,7 +103,27 @@ RHO_SWEEP = (0.10, 2.00)
 #:
 #: The four targets now span the achievable range (0.87 .. 0.45) rather than an
 #: assumed one. Levels remain pinned on the OUTCOME, not on rho.
-ACCEPTANCE_TARGETS = {"L1": 0.85, "L2": 0.75, "L3": 0.60, "L4": 0.45}
+#: RE-TARGETED 2026-07-31 for the §Y.1e substrate. The previous targets
+#: (0.85/0.75/0.60/0.45) are NOT REACHABLE here: measured on the calibrated
+#: substrate the reference policy tops out at 0.740 even at rho = 0.10 with 20
+#: concurrent slices and 12% utilisation of the binding tier, so L1 and L2 both
+#: selected the same lambda (1.32) and the ladder degenerated to three distinct
+#: levels wearing four names.
+#:
+#: The residual is the QoS gate and it is legitimate rather than a defect to tune
+#: away: colocation FFD packs by best CPU fit, which is delay-blind, so it loses
+#: slices to the delay constraint that a delay-aware placer would keep. That gap is
+#: precisely the headroom the learned approaches exist to exploit. What is NOT
+#: legitimate is defining a level at an acceptance the policy that defines it never
+#: reaches.
+#:
+#: The achievable range on this substrate is 0.74 down to 0.50, narrower than the
+#: 0.87-0.45 of the superseded four-tier substrate, because merging MEC into edge
+#: concentrates the workload on one tier and the XR chain now bounces between edge
+#: and regional (37% of XR is delay-infeasible on an EMPTY substrate; see
+#: scripts/diag_delay_budget.py). The acceptance axis is therefore compressed, but
+#: the LOAD axis is not: rho spans 0.10 to 2.00 and mean concurrency 20 to 220.
+ACCEPTANCE_TARGETS = {"L1": 0.72, "L2": 0.66, "L3": 0.60, "L4": 0.55}
 
 #: The load level every learned stack trains at (§Y.4).
 TRAINING_LEVEL = "L2"
@@ -155,23 +186,36 @@ class LoadLevel:
 #:      L4 lambda=23.72 rho=2.000  acceptance=0.420
 #: lambda rose at every level: the added links and capacity make the substrate
 #: easier at equal lambda, so more offered load is needed to hit the same target.
-#: INVALIDATED 2026-07-31 by §Y.1e and EMPTIED rather than left in place. The
-#: substrate is now 80 nodes rather than 100, holds three tiers rather than four,
-#: and has a different tier balance and inter-domain adjacency, so the same lambda
-#: offers a different load and the ladder cannot carry over.
+#: FROZEN on the §Y.1e substrate (80 nodes, three tiers, heterogeneous domain
+#: composition, partial mesh) by scripts/calibrate_load_levels.py:
+#:   3000 arrivals, seeds [42, 43, 44, 45, 46], instances [0, 1, 2],
+#:   12 rho points, 257.8 s wall.
 #:
-#: Emptying is deliberate. `get_level` refuses when this is empty, which is the
-#: whole point: a stale lambda would produce a complete run in which every cell
-#: carries a plausible number measured at a load nobody chose. That is exactly the
-#: failure mode that hid the `eval_plain` bug for a full grid.
+#: Acceptance monotone in rho: PASS (the script refuses to freeze otherwise, and
+#: this table is written by it rather than by hand).
 #:
-#: Superseded 2026-07-30 freeze, for comparison only, do NOT reuse (100-node
-#: four-tier substrate, star plus lateral peer adjacencies):
-#:      L1 lambda=2.0654  rho=0.1724  acceptance=0.8528
-#:      L2 lambda=8.0608  rho=0.6729  acceptance=0.7602
-#:      L3 lambda=13.8973 rho=1.1601  acceptance=0.6267
-#:      L4 lambda=23.9597 rho=2.0000  acceptance=0.4708
-CALIBRATED_LEVELS: dict[str, LoadLevel] = {}
+#: Superseded ladders, for comparison only, do NOT reuse:
+#:   2026-07-30, 100-node four-tier substrate:
+#:     L1 2.0654 / L2 8.0608 / L3 13.8973 / L4 23.9597
+#: FROZEN on the §Y.1e substrate (80 nodes, three tiers, heterogeneous domain
+#: composition, partial mesh) by scripts/calibrate_load_levels.py at N=2000:
+#:   12 rho points, seeds [42, 43, 44, 45, 46], instances [0, 1, 2], 167 s wall.
+#: Monotone in rho, and every level has a distinct lambda -- the script refuses
+#: to freeze otherwise, and writes this table itself rather than by hand.
+#:
+#: Superseded ladders, comparison only, do NOT reuse:
+#:   2026-07-30, 100-node four-tier: L1 2.0654 L2 8.0608 L3 13.8973 L4 23.9597
+#: FROZEN by scripts/freeze_load_levels.py from a §Y.3 calibration sweep:
+#:   N=2000, 12 rho points, seeds [42, 43, 44, 45, 46], instances [0, 1, 2], 202 s wall.
+#: Monotone in rho and every level has a distinct lambda; the script refuses
+#: to write this table otherwise, and writes it itself rather than by hand.
+#: Recalibrated after the Y.10 chain-truncation fix; the superseded ladder measured a workload in which 61% of arrivals were 2-VNF chains.
+CALIBRATED_LEVELS: dict[str, LoadLevel] = {
+    "L1": LoadLevel("L1", arrival_rate=1.0593, rho_offered=0.1000, plain_acceptance=0.7211),
+    "L2": LoadLevel("L2", arrival_rate=7.1279, rho_offered=0.6729, plain_acceptance=0.6687),
+    "L3": LoadLevel("L3", arrival_rate=12.2889, rho_offered=1.1601, plain_acceptance=0.6091),
+    "L4": LoadLevel("L4", arrival_rate=16.1358, rho_offered=1.5232, plain_acceptance=0.5485),
+}
 
 
 def get_level(name: str) -> LoadLevel:

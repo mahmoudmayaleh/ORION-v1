@@ -213,7 +213,7 @@ class EpisodicMemory:
         self._max_entries = max_entries
         # Full-M^B: selective write + importance eviction (defaults).
         # FIFO-M^B ablation: write_policy="write_all", evict_policy="fifo".
-        assert write_policy in ("selective", "write_all", "reward")
+        assert write_policy in ("selective", "write_all")
         assert evict_policy in ("importance", "fifo")
         self._write_policy = write_policy
         self._evict_policy = evict_policy
@@ -231,11 +231,28 @@ class EpisodicMemory:
             return {"calls": 0}
         ab = sum(1 for r in lg if r["abstained"])
         fired = [r["max"] for r in lg if not r["abstained"] and r["max"] is not None]
+        # What the floor turned away, so the operating point can be read off a
+        # real stream instead of the synthetic probe it was calibrated on. An
+        # abstain rate on its own says the floor fired; the near-miss quantiles
+        # say by how much, which is the part a re-calibration needs.
+        missed = sorted(r["best_available"] for r in lg
+                        if r["abstained"] and r.get("best_available") is not None)
+
+        def q(p):
+            if not missed:
+                return None
+            return round(missed[min(len(missed) - 1, int(p * len(missed)))], 4)
+
         return {
             "calls": len(lg),
             "abstain_rate": round(ab / len(lg), 3),
             "mean_returned": round(sum(r["n"] for r in lg) / len(lg), 2),
             "mean_score_when_fired": round(sum(fired) / len(fired), 4) if fired else None,
+            "floor": lg[-1].get("floor"),
+            "near_miss_n": len(missed),
+            "near_miss_p50": q(0.50),
+            "near_miss_p90": q(0.90),
+            "near_miss_max": missed[-1] if missed else None,
         }
 
     def reset_retrieval_log(self) -> None:
@@ -291,14 +308,8 @@ class EpisodicMemory:
             reward, constraints_violated
         ):
             return False
-        if self._write_policy == "reward" and not self._should_record_reward(reward):
-            return False
-
-        if self._write_policy == "reward":
-            label = "success" if reward > 0 else "failure"
-        else:
-            success = len(constraints_violated) == 0 and reward > 0
-            label = "success" if success else "failure"
+        success = len(constraints_violated) == 0 and reward > 0
+        label = "success" if success else "failure"
 
         content_parts = []
 
@@ -440,6 +451,11 @@ class EpisodicMemory:
             reranked.append((combined, se))
 
         reranked.sort(key=lambda x: x[0], reverse=True)
+        # Read the top score BEFORE the floor filters it away. This used to be
+        # computed after, so it was 0.0 on exactly the calls it exists to
+        # describe, and the abstained calls carry the only evidence for where the
+        # floor should sit.
+        best_available = reranked[0][0] if reranked else None
         if isinstance(min_score, _AutoFloor):
             # Match the floor to the scale `combined` was actually computed on.
             min_score = (RETRIEVAL_FLOOR if condition is not None
@@ -454,8 +470,10 @@ class EpisodicMemory:
         # events, and only the log distinguishes them.
         self._retrieval_log.append({
             "n": len(kept),
-            "max": round(reranked[0][0], 4) if reranked else None,
-            "best_available": round(max((s for s, _ in reranked), default=0.0), 4),
+            "max": round(kept[0][0], 4) if kept else None,
+            "best_available": (round(best_available, 4)
+                               if best_available is not None else None),
+            "floor": round(min_score, 4) if min_score is not None else None,
             "abstained": not kept,
         })
         # Return the score the FLOOR was applied to, not the raw pipeline score.
@@ -631,23 +649,6 @@ class EpisodicMemory:
         if reward <= -0.5:
             return True
         return False
-
-    def _should_record_reward(self, reward: float) -> bool:
-        """Reward-labelled write gate (approach A): keyed on scalar admission reward only.
-
-        BINARY on the sign, not a magnitude band. The previous form
-        (reward >= 0.8 or reward <= -0.5) had no basis -- those cutoffs were
-        invented, and the dead band silently discarded every episode in
-        (-0.5, 0.8), which is most of the reward range.
-
-        Binary outcome-gating is the published form: AWM (arXiv 2409.07429)
-        admits only trajectories its evaluator labels L_eval = 1; Memp retains
-        only successfully-completed trajectories. Xiong et al. (arXiv 2505.16067)
-        supply the empirical case -- ungated add-all cost RegAgent 12.05 points
-        versus writing nothing, while outcome-gated addition beat the no-memory
-        baseline (70.95% vs 67.53%).
-        """
-        return reward > 0.0
 
     def _evict(self) -> None:
         """Evict entries. Importance policy (Full-M^B) removes lowest

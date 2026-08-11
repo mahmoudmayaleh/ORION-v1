@@ -107,6 +107,12 @@ class EpisodeResult:
 
 
 class EpisodeRunner:
+    #: Optional per-arrival callback (slice_req, mdo_result, verdict, plan) fired
+    #: once the outcome is final. None = no call, so the default path is
+    #: unchanged. Set by a caller that needs to observe committed outcomes, e.g.
+    #: an episodic store accumulating during evaluation.
+    on_decision = None
+
     """Drives one episode end-to-end.
 
     Args:
@@ -264,6 +270,14 @@ class EpisodeRunner:
                 else:
                     self._active_plans[slice_req.request_id] = placement_plan
                     self._active_requests[slice_req.request_id] = slice_req
+
+        # Fired AFTER the outcome is final -- after the PLAN_BUILD flip and after
+        # the post-commit verify -- so a caller writing an episodic record sees
+        # the same admit/reject the KPI counts. Writing at resolve_arrival time
+        # instead would label every post-commit revocation a success, and at L2
+        # that is ~21% of arrivals.
+        if self.on_decision is not None:
+            self.on_decision(slice_req, mdo_result, verdict, plan_summary)
 
         final_reward, final_components = finalize_reward(
             mdo_components=mdo_result.reward,

@@ -73,6 +73,26 @@ def _gpu_mem_used_bytes() -> int | None:
         return None
 
 
+def _gpu_proc_util(since_us: int) -> dict[int, int] | None:
+    """{pid: sm_util%} for processes with samples since `since_us` (epoch us).
+
+    The A6000 is shared: another user runs a vLLM server on the same card, so
+    whole-card power is not this experiment's power. NVML reports SM utilisation
+    per PID, which is what makes a foreign-load window detectable instead of
+    silently added to the energy figure. Returns None if the query is
+    unavailable; an empty dict means nothing used the GPU in the window.
+    """
+    if not (_NVML_OK and _GPU_HANDLE is not None):
+        return None
+    try:
+        return {s.pid: int(s.smUtil)
+                for s in pynvml.nvmlDeviceGetProcessUtilization(_GPU_HANDLE, since_us)}
+    except Exception:  # noqa: BLE001
+        # NVML raises NOT_FOUND when no samples fall in the window, which is not
+        # the same as "no foreign load" -- report unknown rather than clean.
+        return None
+
+
 # ---- RAPL (AMD CPU package energy via intel-rapl driver) ----------------------------------
 def _discover_rapl() -> list[tuple[str, str, int]]:
     """Return [(name, energy_uj_path, max_range_uj)] for readable RAPL package zones."""
@@ -114,7 +134,7 @@ def _rapl_read(zones) -> float | None:
 class PowerSampler(threading.Thread):
     """Background power/energy trace. Samples (t_epoch, gpu_w, rapl_uj) at `hz`."""
 
-    def __init__(self, hz: float = 20.0):
+    def __init__(self, hz: float = 20.0, own_pids: set[int] | None = None):
         super().__init__(daemon=True)
         self.dt = 1.0 / hz
         self._stop_evt = threading.Event()
@@ -123,6 +143,11 @@ class PowerSampler(threading.Thread):
         self.ts: list[float] = []
         self.gpu_w: list[float] = []
         self.rapl_uj: list[float] = []
+        # PIDs whose GPU work IS this experiment: this process plus the llama.cpp
+        # server it talks to. Anything else on the card is foreign load.
+        self.own_pids = set(own_pids or ())
+        self.foreign: list[bool | None] = []   # per tick: True/False, None = unknown
+        self.foreign_pids_seen: dict[int, int] = {}   # pid -> max sm_util observed
 
     @property
     def rapl_available(self) -> bool:
@@ -134,9 +159,19 @@ class PowerSampler(threading.Thread):
 
     def run(self):
         while not self._stop_evt.is_set():
-            self.ts.append(time.time())
+            now = time.time()
+            self.ts.append(now)
             self.gpu_w.append(_gpu_power_w() or 0.0)
             self.rapl_uj.append(_rapl_read(self.rapl_zones) or 0.0)
+            util = _gpu_proc_util(int((now - self.dt * 2) * 1e6))
+            if util is None:
+                self.foreign.append(None)
+            else:
+                hot = {p: u for p, u in util.items()
+                       if u > 0 and p not in self.own_pids}
+                for p, u in hot.items():
+                    self.foreign_pids_seen[p] = max(self.foreign_pids_seen.get(p, 0), u)
+                self.foreign.append(bool(hot))
             time.sleep(self.dt)
 
     def stop(self):
@@ -161,6 +196,30 @@ class PowerSampler(threading.Thread):
             pb = self.gpu_w[i - 1] + (self.gpu_w[i] - self.gpu_w[i - 1]) * ((hi - a) / span)
             e += 0.5 * (pa + pb) * (hi - lo)
         return e
+
+    def gpu_clean_fraction(self, t0: float, t1: float) -> float | None:
+        """Share of [t0,t1] during which no foreign PID used the GPU.
+
+        1.0 means the card was ours for the whole window and its energy is
+        attributable. Anything less means another user's process was running and
+        the whole-card integral is not this experiment's cost. None when NVML
+        could not tell us, which must not be read as clean.
+        """
+        if len(self.ts) < 2:
+            return None
+        span = max(t1 - t0, 1e-9)
+        clean = 0.0
+        for i in range(1, len(self.ts)):
+            a, b = self.ts[i - 1], self.ts[i]
+            lo, hi = max(a, t0), min(b, t1)
+            if hi <= lo:
+                continue
+            f = self.foreign[i] if i < len(self.foreign) else None
+            if f is None:
+                return None
+            if not f:
+                clean += hi - lo
+        return clean / span
 
     def cpu_energy_j(self, t0: float, t1: float) -> float | None:
         """ΔRAPL over [t0,t1] (uJ->J), wrap-corrected, interpolated at edges."""
@@ -258,18 +317,28 @@ class ProfileCollector:
         for e in self.events:
             by.setdefault(e["name"], []).append(e)
         out = {}
+        def dist(vals):
+            a = np.asarray(vals, dtype=float)
+            return {"mean": float(a.mean()), "sum": float(a.sum()),
+                    "p50": float(np.percentile(a, 50)), "p90": float(np.percentile(a, 90)),
+                    "p99": float(np.percentile(a, 99)), "max": float(a.max()),
+                    "n": int(a.size)}
+
         for name, evs in by.items():
             row = {"count": len(evs)}
-            for k in ("wall_s", "cpu_s", "gpu_energy_j", "cpu_energy_j", "cpu_energy_j_est"):
+            for k in ("wall_s", "cpu_s", "gpu_energy_j", "cpu_energy_j",
+                      "cpu_energy_j_est", "gpu_clean_frac"):
                 vals = [e[k] for e in evs if e.get(k) is not None]
-                if not vals:
-                    continue
-                a = np.asarray(vals, dtype=float)
-                row[k] = {
-                    "mean": float(a.mean()), "sum": float(a.sum()),
-                    "p50": float(np.percentile(a, 50)), "p90": float(np.percentile(a, 90)),
-                    "p99": float(np.percentile(a, 99)), "max": float(a.max()), "n": int(a.size),
-                }
+                if vals:
+                    row[k] = dist(vals)
+            # Energy over the windows the card was ours for the WHOLE event. This
+            # is the attributable number; `gpu_energy_j` above is whole-card and
+            # includes any foreign load. n_clean vs count says how much survived.
+            clean = [e["gpu_energy_j"] for e in evs
+                     if e.get("gpu_clean_frac") == 1.0 and e.get("gpu_energy_j") is not None]
+            row["n_clean"] = len(clean)
+            if clean:
+                row["gpu_energy_j_clean"] = dist(clean)
             out[name] = row
         return out
 
@@ -285,6 +354,11 @@ class ProfileCollector:
             if s is not None and "t0" in e and "t1" in e:
                 if e.get("gpu_energy_j") is None:
                     e["gpu_energy_j"] = s.gpu_energy_j(e["t0"], e["t1"])
+                # Whole-card energy is only this experiment's energy when nothing
+                # else was on the card. Carry the share so a contaminated window
+                # can be dropped downstream instead of averaged in.
+                if e.get("gpu_clean_frac") is None:
+                    e["gpu_clean_frac"] = s.gpu_clean_fraction(e["t0"], e["t1"])
                 if rapl_ok and e.get("cpu_energy_j") is None:
                     e["cpu_energy_j"] = s.cpu_energy_j(e["t0"], e["t1"])
             if not rapl_ok and e.get("cpu_s") is not None:  # measured energy unavailable
@@ -296,6 +370,11 @@ class ProfileCollector:
                    "cpu_watt_per_core": None if rapl_ok else MDO_CPU_WATT_PER_CORE,
                    "rapl_available": rapl_ok,
                    "gpu_available": bool(s and s.gpu_available),
+                   # Who else was on the card, and how hard. A non-empty map means
+                   # some windows' whole-card energy is not attributable here.
+                   "gpu_own_pids": sorted(s.own_pids) if s else [],
+                   "gpu_foreign_pids": (dict(sorted(s.foreign_pids_seen.items()))
+                                        if s else {}),
                    "cell_totals": self.cell_totals(),  # §O.9
                    "events": self.events, "summary": self.summary()},
                   open(raw_path, "w"))

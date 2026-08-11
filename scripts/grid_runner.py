@@ -30,7 +30,6 @@ Approaches (monotone ablation ladder; all trained approaches share ONE curriculu
   Prior-only  LLM shaped TRAINING (KL prior); eval = trained selector, greedy m~.
   Memory-off  LLM plan as eval prior, M^B disabled.
   Full        LLM plan + M^B (outcome-driven: selective write, violation-tagged).
-  Reward      LLM plan + M^B (reward-labelled: write/label gated by scalar reward).  [§exp approach A]
 
 Memory approaches warm M^B on the TRAIN-family streams, then keep writing on the held-out
 stream (adaptation "written during operation"). Non-memory approaches go through wp7's
@@ -96,6 +95,7 @@ from orion.llm.condition_signature import compute_condition_signature  # noqa: E
 from orion.llm.episodic_memory import EpisodicMemory  # noqa: E402
 from orion.sim.episode_runner import build_placement_plan  # noqa: E402
 from orion.sim.verifier import verify_committed_plan  # noqa: E402
+from orion.profiling import profiled  # noqa: E402
 from orion.retrieval import RetrievalConfig, RetrievalMode  # noqa: E402
 from orion.provenance import git_provenance, serving_provenance  # noqa: E402
 from partial_obs_prior import partial_obs_builder  # noqa: E402
@@ -119,18 +119,82 @@ CELLS = Path(os.environ.get("ORION_CELL_DIR", "data/grid_cells"))
 # must set ORION_CKPT_DIR to a scratch path; the default stays the real one so
 # no production invocation changes behaviour.
 CKPTS = Path(os.environ.get("ORION_CKPT_DIR", "results/wp7/ckpt_grid"))
-APPROACHES = ["Plain", "MDO-fullobs", "MDO-partial", "MDO-ffd", "RL-alone", "RL-poprior", "Prior-only", "Memory-off", "Full", "Reward"]
-MEMORY_APPROACHES = {"Full": "selective", "Reward": "reward"}  # approach -> M^B write_policy
-TRAINED_APPROACHES = {"RL-alone", "RL-poprior", "Prior-only", "Memory-off", "Full", "Reward"}
+APPROACHES = ["Plain", "MDO-fullobs", "MDO-partial", "MDO-ffd", "RL-alone", "RL-poprior", "Prior-only", "Memory-off", "Full"]
+# M^B capacity. Defined HERE, not inherited from r_local_runner, because this is
+# the runner that decides how much the store is asked to hold.
+#
+# Was R.MEMORY_CAPACITY_K = 50, set on 2026-07-02 (d21dcd8) to force 4-8x
+# oversubscription so a FIFO-vs-importance eviction ablation had something to
+# measure. That ablation is no longer in APPROACHES, so the 50 was a leftover
+# that every §Y.15 cell ran under: warm-up offers 4 x --warm-arrivals candidate
+# writes, and all 34 banked memory cells came back at exactly mb_entries=50,
+# i.e. saturated, with most of the warm-up evicted before eval began.
+#
+# 500 was tried on 2026-08-11 and STILL bound: the warm-up offers 4 x
+# --warm-arrivals candidate writes, so at --warm-arrivals 200 that is 800 into
+# 500, and Probe A's Full cell tripped the saturation guard at 500/500.
+#
+# A capacity constant is the wrong shape for this. M^B is an accumulating record
+# of past episodes, and the claim it exists to support is that experience helps,
+# so a cap that bites limits the mechanism rather than describing it. None =
+# unbounded, which is the default; an int is still honoured so a capacity
+# ablation stays possible, and `_mb_capacity` says when one would bind.
+MEMORY_CAPACITY_K = None
+# "frozen" is the §P transfer protocol: warm the store, freeze it, evaluate. That
+# measures a memory with accumulation off. "accumulate" lets it grow during the
+# evaluation, which is what the mechanism claims to do. Recorded per cell as
+# mb_mode, so a frozen cell is never confused with an accumulating one.
+MB_MODE = "frozen"
+
+
+def _mb_capacity(warm_arrivals: int) -> int:
+    """Entries the store may hold. Never below the warm-up's write volume.
+
+    The warm-up offers 4 x warm_arrivals candidate writes (four training
+    instances) and the store is frozen for eval, so 4 x warm_arrivals is the
+    exact ceiling on what can ever be written. Unbounded is that number with
+    headroom rather than an arbitrary large constant, so the saturation guard
+    still has something real to compare against.
+    """
+    need = 4 * int(warm_arrivals)
+    if MEMORY_CAPACITY_K is None:
+        return max(4 * need, 2000)
+    if MEMORY_CAPACITY_K < need:
+        log.warning("MEMORY_CAPACITY_K=%d is below the warm-up write volume "
+                    "(4 x %d = %d): the store will evict, and retrieval will "
+                    "then be measuring eviction rather than the floor",
+                    MEMORY_CAPACITY_K, warm_arrivals, need)
+    return MEMORY_CAPACITY_K
+# Plan cache. True for every run of record; --no-plan-cache sets it False and is
+# refused unless the cells go to a scratch ORION_CELL_DIR. Module level rather
+# than an argument because `_wire` runs per cell and would otherwise put the
+# cache back on between cells.
+USE_PLAN_CACHE = True
+# Inline profiling, off unless --profile. Set to a live PowerSampler by main().
+PROFILE_SAMPLER = None
+PROFILE_DIR = Path(os.environ.get("ORION_PROFILE_DIR", "results/profile_cells"))
+MEMORY_APPROACHES = {"Full": "selective"}  # approach -> M^B write_policy
+TRAINED_APPROACHES = {"RL-alone", "RL-poprior", "Prior-only", "Memory-off", "Full"}
 # Which curriculum stack each trained approach evaluates. Same mapping run_cell
 # dispatches on, named once so --eval-only can report the checkpoint per cell.
 STACK_FOR_APPROACH = {"RL-alone": "rl_alone", "RL-poprior": "po_prior",
                       "Prior-only": "llm_prior", "Memory-off": "llm_prior",
-                      "Full": "llm_prior", "Reward": "llm_prior"}
+                      "Full": "llm_prior"}
 # LLM advises the MDO at inference for these approaches (mode="advised"); RL-alone and
 # Prior-only stay LLM-free at inference (deterministic) to preserve the ladder.
-ADVISED_APPROACHES = {"Memory-off", "Full", "Reward"}
-BETA_FLOOR = 0.2  # KL prior beta NEVER anneals to 0 — the LLM always advises.
+ADVISED_APPROACHES = {"Memory-off", "Full"}
+# §Z.1 (2026-08-06): anneals to 0. The prior term is Kickstarting-style auxiliary
+# shaping (arXiv:1803.03835: cross-entropy to the teacher on the STUDENT's own
+# trajectories, weight decayed to zero), not a standing objective. Two reasons the
+# old 0.2 floor was wrong. Shah et al. (arXiv:2512.21852) show a KL added to the
+# loss alone over on-policy contexts keeps the pathwise term and drops the
+# score-function one, so a permanent floor holds a structurally biased gradient
+# alive forever; a floor of 0 lets it expire. And Kickstarting reports linear
+# schedules reaching 0 outperform ones that do not. The old comment justified the
+# floor with "the LLM always advises", which conflates two channels: inference-time
+# advising is ADVISED_APPROACHES + prior_weight in AutoregMDOPolicy.forward, and it
+# is untouched by beta. Beta is training-only.
+BETA_FLOOR = 0.0
 
 # ── §Y: which scenario classes this grid may run ─────────────────────────────
 # `stress` (the pre-§Y rho-ramp class) is NOT a §Y axis and is excluded here
@@ -146,9 +210,28 @@ Y_SCENARIOS = ["conventional", "complex"]
 # would be selection on test.
 EVAL_INSTANCE = HELDOUT_INSTANCES[0]
 VALIDATION_INSTANCES = tuple(HELDOUT_INSTANCES[1:])
-# Stacks whose evaluation is LLM-free and deterministic, so a validation pass
-# costs CPU only. `llm_prior` is deliberately absent; see `select_checkpoint`.
-SELECTABLE_STACKS = {"rl_alone": "RL-alone", "po_prior": "RL-poprior"}
+# Stack -> the approach whose eval path scores its segments on the validation
+# instances. For the LLM-free stacks this is the arm itself, so a validation
+# pass costs CPU only.
+#
+# §Y.14b: `llm_prior` is ONE checkpoint sequence shared by Prior-only,
+# Memory-off and Full (TRAINED_CONFIG maps all three onto it), so
+# there is one segment to choose and three arms that would disagree about
+# which. Selecting on any single arm's advised eval privileges that arm in
+# a comparison whose entire subject is the plan source, and selecting on all
+# four is 4 x len(segments) x len(VALIDATION_INSTANCES) episodes with the
+# model in the inference loop. It is selected instead on the same LLM-free
+# probe rl_alone and po_prior use: the selection rule is then a constant
+# across the paper's table rather than a per-arm choice, it privileges none
+# of the four, and it costs no model calls. The assumption it rests on, that
+# the segment ranking under heuristic plans tracks the ranking under Agent B
+# plans, is measured once on one seed rather than asserted; see the §Y.14b
+# verification in docs/PREREG_AMENDMENT_2026-08-03_Y14.md.
+SELECTABLE_STACKS = {"rl_alone": "RL-alone", "po_prior": "RL-poprior",
+                     "llm_prior": "RL-alone"}
+# Stacks selected on a probe that is not their own eval path. Kept explicit
+# so a reader of a banked cell can see it without re-deriving the mapping.
+PROXY_SELECTED_STACKS = {"llm_prior"}
 
 
 # ── per-cell wall-clock timeout (§Y, required before the scalability axis) ────
@@ -271,8 +354,28 @@ def _wire(scenario, level_name, instance_seed):
     # bandit: A_a = r_a - V_a                    fully myopic; this is the
     #                                            per-arrival-episode convention
     W.ADV_MODE = "td0"
-    # Cache ON, always. Not an ablation: see wp7_runner.RC_USE_PLAN_CACHE.
-    W.RC_USE_PLAN_CACHE = True
+    # Prior coupling: the SAME omission as ADV_MODE, found 2026-08-07, and this one
+    # already cost a banked block.
+    #
+    # wp7's module default is PRIOR_LOSS="sampled_kl", whose own comment reads "a
+    # contradictory objective ... measured: cannot align at any beta". For a
+    # colocation m~, once step 0 samples a domain other than m~[0] the term pulls
+    # step 1 toward m~[1] conditioned on the wrong prefix, against the decoder's
+    # running-count conditioning. The grid pinned ADV_MODE and never pinned this,
+    # so RL-poprior trained under it and lost to RL-alone in 20/20 paired cells,
+    # -7.5 pp at L2 and -11.2 pp at L4.
+    #
+    # §Z.1 repaired distill's reduction (mean -> sum, so beta means the same thing
+    # under both) and dropped BETA_FLOOR to 0, but neither changed WHICH term the
+    # grid runs. This line does. distill is teacher-forced, so its known weakness
+    # is exposure bias, measured at ~28 pp and only after ~100 rounds (KLS7), which
+    # is a bias in the state distribution rather than an objective that contradicts
+    # itself.
+    W.PRIOR_LOSS = "distill"
+    # Cache ON for every run of record: see wp7_runner.RC_USE_PLAN_CACHE. The
+    # only way this reads False is --no-plan-cache, which is refused unless the
+    # cells go to a scratch directory.
+    W.RC_USE_PLAN_CACHE = USE_PLAN_CACHE
     W.RC_FIXED_TRAIN_STREAM = True   # content-memo => ~arrivals LLM calls / segment
     W.TIER_FILTER_LLM_PLANS = True
     W.CUSTOM_PLAN_BUILDER = None
@@ -394,26 +497,23 @@ def select_checkpoint(scenario, seed, config, args):
     """
     approach = SELECTABLE_STACKS.get(config)
     if approach is None:
-        # Not a refusal to be worked around. §Y.14 registers the selection PROBE
-        # only for stacks whose evaluation is LLM-free, and an LLM stack's
-        # validation pass would be len(segments) x len(VALIDATION_INSTANCES)
-        # episodes with the model in the inference loop. Which probe an LLM stack
-        # is selected on is a real methodological choice (its own advised eval? a
-        # shared LLM-free probe? one segment per approach off one stack?) and it
-        # changes what the arm means. Register it, then implement it here.
+        # Not a refusal to be worked around. Which probe a stack is selected on
+        # changes what its arms mean, so it is registered before it is run.
         raise SystemExit(
             f"§Y.14 does not specify the checkpoint-selection probe for the "
-            f"'{config}' stack, whose evaluation runs the LLM in the loop. "
-            "Selecting it on an unregistered probe would make the arm's meaning "
-            "depend on an undocumented choice; running it on the final segment "
-            "would use the superseded §Y.13 readout that missed its criterion. "
-            "Amend docs/PREREG_AMENDMENT_2026-08-03_Y14.md first, or pass "
+            f"'{config}' stack. Selecting it on an unregistered probe would "
+            "make the arm's meaning depend on an undocumented choice; running "
+            "it on the final segment would use the superseded §Y.13 readout "
+            "that missed its criterion. Amend "
+            "docs/PREREG_AMENDMENT_2026-08-03_Y14.md first, or pass "
             "--final-segment to deliberately accept the old readout.")
 
     segments = _curriculum_segments(seed, args.passes, args.train_instances)
     log.info("### §Y.14 selecting %s checkpoint (%s seed=%d): %d segments x %d "
-             "validation instances", config, scenario, seed, len(segments),
-             len(VALIDATION_INSTANCES))
+             "validation instances, probe=%s%s", config, scenario, seed,
+             len(segments), len(VALIDATION_INSTANCES), approach,
+             " (§Y.14b PROXY: LLM-free probe, not this stack's eval path)"
+             if config in PROXY_SELECTED_STACKS else "")
     t0 = time.time()
     curve = []
     for g in range(len(segments)):
@@ -430,6 +530,8 @@ def select_checkpoint(scenario, seed, config, args):
              "delta %+.1f pp) in %.1f min", best, len(segments) - 1, curve[best],
              curve[-1], 100 * (curve[best] - curve[-1]), (time.time() - t0) / 60)
     info = {"rule": "Y14_validation_selected", "prereg": "4bf325d",
+            "stack": config, "selection_probe": approach,
+            "proxy_probe": config in PROXY_SELECTED_STACKS,
             "selected_segment": best, "n_segments": len(segments),
             "validation_instances": list(VALIDATION_INSTANCES),
             "validation_score": round(curve[best], 4),
@@ -452,10 +554,11 @@ def curriculum_train(scenario, seed, config, rounds, arrivals, lr, agent_b, kb, 
                              eval builder), curriculum entered from `init_from`
                              (the §V.4 BC ckpt). LLM-free. The warm-start IS the
                              guidance channel here.
-    config == "llm_prior" -> beta anneals 1->BETA_FLOOR (never 0) over the WHOLE
-                             curriculum, LLM prior. The floor is the point: the
-                             LLM must keep advising the MDO at inference, so the
-                             prior stays a live channel instead of annealing out.
+    config == "llm_prior" -> beta anneals 1->BETA_FLOOR over the WHOLE curriculum,
+                             LLM prior. §Z.1: BETA_FLOOR is 0, so the training-time
+                             coupling expires. Inference-time advising is a separate
+                             channel (ADVISED_APPROACHES + prior_weight) and is
+                             unaffected.
     `init_from`: optional ckpt path to warm-start SEGMENT 0 from (later segments
     chain as always). Returns (final_coord, final_ckpt_path).
     """
@@ -513,8 +616,7 @@ def curriculum_train(scenario, seed, config, rounds, arrivals, lr, agent_b, kb, 
             be = 1.0 - ((i + 1) * rps / total) * (1.0 - BETA_FLOOR)
             approach, mock, ab, k, ewt = "RL-alone", True, None, None, True
         else:
-            # Global linear anneal from 1.0 -> BETA_FLOOR (never 0): the LLM prior
-            # stays coupled through the whole curriculum.
+            # Global linear anneal from 1.0 -> BETA_FLOOR over the whole curriculum.
             bs = 1.0 - (i * rps / total) * (1.0 - BETA_FLOOR)
             be = 1.0 - ((i + 1) * rps / total) * (1.0 - BETA_FLOOR)
             approach, mock, ab, k, ewt = "LLM+RL-memoff", False, agent_b, kb, False
@@ -578,7 +680,12 @@ def eval_plain(scenario, seed, level, instance, arrivals):
             continue
         total += 1
         sr = ev.slice_request
-        res = colocation_ffd(sub, sr, GreedyConfig())
+        # Plain runs its own loop rather than the EpisodeRunner, so it inherits
+        # none of the `profiled()` wraps and had no cost row at all. It is the
+        # reference approach, so without one there is nothing to state the
+        # learned and LLM approaches' per-decision cost against.
+        with profiled("plain.decision", {"k": len(sr.vnfs)}):
+            res = colocation_ffd(sub, sr, GreedyConfig())
         # §X.2 — same QoS gate the coordinator's commits face (verifier model):
         # a placement that would violate C7/C9 is a reject, not an admission.
         if not res.feasible or res.plan is None:
@@ -713,6 +820,8 @@ def _with_plan_cache(pb):
     does mean M^B is consulted on the ~174 misses per 2000 arrivals, not 2000
     times, and the reported retrieval counts must be read against that.
     """
+    if not USE_PLAN_CACHE:
+        return pb, {"disabled": True}
     from orion.llm.plan_cache import PlanCache
     stats: dict = {}
     return W._cached_plan_builder(
@@ -720,6 +829,8 @@ def _with_plan_cache(pb):
 
 
 def _cache_report(stats):
+    if stats.get("disabled"):
+        return {"disabled": True}
     lk = stats.get("lookups", 0)
     return {"lookups": lk, "hits": stats.get("hits", 0),
             "misses": stats.get("misses", 0),
@@ -847,14 +958,81 @@ def grid_memory_instance(coord, sub, arrival_seed, agent_b, kb, mb, topo_sig,
     return admitted, total
 
 
-def _new_mb(write_policy):
+def _new_mb(write_policy, warm_arrivals):
     return EpisodicMemory(
         config=RetrievalConfig(mode=RetrievalMode.NO_RERANK, apply_recency=True, k_final=3),
-        max_entries=R.MEMORY_CAPACITY_K, write_policy=write_policy, evict_policy="importance")
+        max_entries=_mb_capacity(warm_arrivals), write_policy=write_policy,
+        evict_policy="importance")
+
+
+def _plan_shape_from_partition(sr, partition):
+    """Abstract plan shape from the COMMITTED partition.
+
+    Abstract on purpose: shape and cut points, never concrete domain ids as an
+    exemplar to copy. `_extract_plan_shape` needs node-level placements, which
+    the eval path does not hand back, so this derives the same abstract fields
+    from the partition the coordinator committed.
+    """
+    if not partition:
+        return None
+    dom = {v.vnf_id: d for v, d in zip(sr.vnfs, partition)}
+    used = sorted(set(partition))
+    cuts = [(fe.source_vnf, fe.target_vnf) for fe in sr.flow_edges
+            if dom.get(fe.source_vnf) is not None
+            and dom.get(fe.target_vnf) is not None
+            and dom[fe.source_vnf] != dom[fe.target_vnf]]
+    return {"strategy": "co-locate" if len(used) <= 1 else "split",
+            "tier_assignment": [], "cut_points": cuts,
+            "inter_domain_links": [], "domains_used": used}
+
+
+def _accumulating(pb, mb, level):
+    """(wrapped builder, on_decision) so M^B grows DURING the evaluation.
+
+    The §P protocol froze the store for the held-out eval. That measures a memory
+    with accumulation switched off, which is the one thing the mechanism claims
+    to do, so `--mb-mode accumulate` drops the freeze.
+
+    Two halves because the two facts arrive at different times. The condition has
+    to be read PRE-decision or every entry records a post-commit state no later
+    query can match, and the outcome is only final after the post-commit verify.
+    They are paired by request id, so an arrival whose plan build fails (no MDO
+    decision, no callback) cannot leak its condition onto the next arrival.
+    """
+    pending = {}
+
+    def builder(slice_req, substrate):
+        cond = compute_condition_signature(substrate, level)
+        summary = pb(slice_req, substrate)
+        if summary is None:
+            pending.pop(slice_req.request_id, None)
+            return None
+        pending[slice_req.request_id] = (cond, summary)
+        return summary
+
+    def on_decision(slice_req, mdo_result, verdict, plan_summary):
+        got = pending.pop(slice_req.request_id, None)
+        if got is None:
+            return
+        cond, summary = got
+        plan_dict = {"vnf_assignments": [
+            {"vnf_id": v, "domain": d}
+            for v, d in zip(summary.vnf_ids, summary.suggested_domains)]}
+        committed = list(mdo_result.partition) if mdo_result.partition else None
+        F.write_to_mb(
+            mb, "Full-M^B", slice_req, bool(mdo_result.admitted), plan_dict,
+            list(getattr(verdict, "violated", []) or []), None,
+            _plan_shape_from_partition(slice_req, committed),
+            committed_partition=committed,
+            diverged=(committed is not None
+                      and committed != list(summary.suggested_domains)),
+            condition_sig=cond)
+
+    return builder, on_decision
 
 
 def eval_memory(coord, write_policy, scenario, seed, level, instance, arrivals, agent_b, kb,
-                warm_arrivals):
+                warm_arrivals, mb_mode):
     _wire(scenario, level, instance)
     sf = make_scenario_slice_factory(scenario)
     # Warm M^B ONCE per (scenario, write_policy, seed), capped at warm_arrivals per
@@ -879,8 +1057,8 @@ def eval_memory(coord, write_policy, scenario, seed, level, instance, arrivals, 
     #    -- with the default --levels L1 L2 L3 L4 that is an L1-warmed store
     #    (`free` for all 2000 arrivals) served to L2/L3/L4, which are `tight` for
     #    1200-1870 of 2000. Measured separation says such a store abstains on
-    #    most arrivals at every level including L2, so Full and Reward would have
-    #    come back equal to Memory-off with no visible cause.
+    #    most arrivals at every level including L2, so Full would have come back
+    #    equal to Memory-off with no visible cause.
     #  * load_level was never passed, so every warmed entry recorded
     #    load_level="" while every eval query carries the real level. The
     #    exact-match term in condition_similarity guards on `if la and lb`, so an
@@ -894,9 +1072,20 @@ def eval_memory(coord, write_policy, scenario, seed, level, instance, arrivals, 
     # training level the store is cross-condition, retrieval abstains on most
     # arrivals, and Full approaches Memory-off. That is the design refusing to
     # reuse a plan from a regime it was not taken in.
-    snap = CKPTS / f"mb_{scenario}_{write_policy}_{seed}_{TRAINING_LEVEL}.json"
-    if not snap.exists():
-        mbw = _new_mb(write_policy)
+    # The warm-up budget and the capacity are IN THE NAME. Both decide what the
+    # store contains, and the snapshot is reused whenever it exists, so leaving
+    # them out means changing either one silently re-loads the store built under
+    # the old one and the change reads as having no effect. The §Y.15 snapshots
+    # are w35/k50; they stay on disk and stay loadable under their own name.
+    cap = _mb_capacity(warm_arrivals)
+    snap = (CKPTS / f"mb_{scenario}_{write_policy}_{seed}_{TRAINING_LEVEL}"
+                    f"_w{warm_arrivals}k{cap}.json")
+    # --warm-arrivals 0 starts the store EMPTY. Under accumulate that is the
+    # honest form of the claim: the memory holds only what this run has lived
+    # through, so nothing is carried in from a warm-up whose entries the eval
+    # stream never produced.
+    if warm_arrivals > 0 and not snap.exists():
+        mbw = _new_mb(write_policy, warm_arrivals)
         _wire(scenario, TRAINING_LEVEL, instance)   # warm-up stream at the TRAINING load
         for wi, inst in enumerate(TRAIN_INSTANCES[:4]):
             wsub = _substrate_fn(inst)(seed)
@@ -917,8 +1106,18 @@ def eval_memory(coord, write_policy, scenario, seed, level, instance, arrivals, 
     # protocol). Eval through the SAME stateful eval_foc + make_llm_plan_builder path
     # as Memory-off, so Full vs Memory-off differs ONLY in the memory (mb vs None) --
     # no stateless/stateful or plan-builder confound.
-    mb = _new_mb(write_policy)
-    mb.load(snap)
+    mb = _new_mb(write_policy, warm_arrivals)
+    if warm_arrivals > 0:
+        mb.load(snap)
+    # Saturation is the failure this guards. Every §Y.15 cell reported exactly
+    # mb_entries=50 against a 50-entry cap, which is what eviction-bound looks
+    # like from the outside, and nothing in the run said so. If it saturates
+    # again the capacity is still the binding constraint and the retrieval
+    # numbers are about eviction, not about the floor.
+    if len(mb._entries) >= cap:
+        log.warning("M^B is at capacity (%d/%d) after warm-up -- eviction is "
+                    "binding, so retrieval is not measuring the floor",
+                    len(mb._entries), cap)
     mb.reset_retrieval_log()   # count only the held-out eval, not the warm-up
     sub = _substrate_fn(instance)(seed)
     delays = W.build_delays(sub)
@@ -926,16 +1125,32 @@ def eval_memory(coord, write_policy, scenario, seed, level, instance, arrivals, 
     pb = W.make_llm_plan_builder(agent_b, kb, lambda: mb)
     if W.TIER_FILTER_LLM_PLANS:
         pb = W.tier_filtered(pb)
+    # Accumulation wraps the builder BEFORE the cache, so a cache hit neither
+    # records an episode nor re-reads the condition -- a hit did not consult the
+    # model or the memory, and counting it as lived experience would inflate the
+    # store with arrivals the mechanism never saw.
+    if mb_mode == "accumulate":
+        pb, W.EVAL_ON_DECISION = _accumulating(pb, mb, level)
     pb, cache_stats = _with_plan_cache(pb)
     cost = {}
     rejects = {}
-    acc, adm, tot, _agree = W.eval_acceptance(coord, level, seed, arrivals,
-                                              delays, plan_builder=pb, mode="advised",
-                                              cost_out=cost, report_out=rejects)
+    entries_before = len(mb._entries)
+    try:
+        acc, adm, tot, _agree = W.eval_acceptance(coord, level, seed, arrivals,
+                                                  delays, plan_builder=pb, mode="advised",
+                                                  cost_out=cost, report_out=rejects)
+    finally:
+        W.EVAL_ON_DECISION = None
     W.EVAL_TOPO_SIG = None
+    if mb_mode == "accumulate":
+        log.info("M^B accumulated %d -> %d entries during eval",
+                 entries_before, len(mb._entries))
     return {"acceptance": round(acc, 4), "admitted": adm, "offered": tot,
             "rejections": rejects.get("rejections"),
-            "mb_entries": len(mb._entries), "write_policy": write_policy,
+            "mb_entries": len(mb._entries), "mb_capacity": cap,
+            "mb_capacity_setting": MEMORY_CAPACITY_K,
+            "mb_mode": mb_mode, "mb_entries_before_eval": entries_before,
+            "write_policy": write_policy,
             "warm_arrivals": warm_arrivals, "retrieval": mb.retrieval_stats(),
             "warm_level": TRAINING_LEVEL, "plan_cache": _cache_report(cache_stats),
             "cost": cost}
@@ -948,6 +1163,16 @@ def run_cell(scenario, approach, seed, level, instance, arrivals, stacks, agent_
         return
     label = f"{scenario}/{approach}/seed{seed}/{level}/inst{instance}"
     t0 = time.time()
+    # orion.profiling's `profiled()` wraps are already on the production path
+    # (episode_runner plan_build/mdo.decision/verify, agent_b llm.generate/
+    # struct.check, coordinator mdo.forward/actor.place) but they are no-ops
+    # unless a collector is active, and nothing ever set one -- so no run has
+    # recorded a single event. This is where it gets switched on.
+    coll = None
+    if PROFILE_SAMPLER is not None:
+        from orion.profiling import ProfileCollector, set_collector
+        coll = ProfileCollector(PROFILE_SAMPLER, label=label)
+        set_collector(coll)
     try:
         with cell_timeout(CELL_TIMEOUT_S, label):
             if approach == "Plain":
@@ -964,9 +1189,10 @@ def run_cell(scenario, approach, seed, level, instance, arrivals, stacks, agent_
                 out = eval_nonmemory(stacks["po_prior"], approach, scenario, seed, level, instance, arrivals, agent_b, kb)
             elif approach in ("Prior-only", "Memory-off"):
                 out = eval_nonmemory(stacks["llm_prior"], approach, scenario, seed, level, instance, arrivals, agent_b, kb)
-            else:  # Full, Reward
+            else:  # Full
                 out = eval_memory(stacks["llm_prior"], MEMORY_APPROACHES[approach], scenario, seed,
-                                  level, instance, arrivals, agent_b, kb, warm_arrivals)
+                                  level, instance, arrivals, agent_b, kb, warm_arrivals,
+                                  MB_MODE)
     except CellTimeout as exc:
         # Banked as a distinct outcome, not dropped: a missing cell is
         # indistinguishable from one never scheduled, and a silently absent cell
@@ -977,6 +1203,10 @@ def run_cell(scenario, approach, seed, level, instance, arrivals, stacks, agent_
                   label, out["wall_s"] / 60)
         _bank(scenario, approach, seed, level, instance, out, prov)
         return
+    finally:
+        if coll is not None:
+            from orion.profiling import set_collector
+            set_collector(None)
     out["status"] = "ok"
     out["level"] = level
     out["instance"] = instance
@@ -988,6 +1218,13 @@ def run_cell(scenario, approach, seed, level, instance, arrivals, stacks, agent_
         out["stack_ckpt"] = stacks.get("_source", {}).get(_stack)
         out["checkpoint_selection"] = stacks.get("_selection", {}).get(_stack)
     out["wall_s"] = round(time.time() - t0, 1)
+    if coll is not None:
+        raw = PROFILE_DIR / f"{scenario}_{approach}_{seed}_{level}_i{instance}.json"
+        out["profile"] = {"raw": str(raw), "cell_totals": coll.cell_totals(),
+                          "summary": coll.save(raw)}
+        _pd = out["profile"]["summary"].get("llm.generate", {})
+        log.info("  profile: %d events, llm.generate n=%s clean=%s",
+                 len(coll.events), _pd.get("count"), _pd.get("n_clean"))
     metric = out.get("acceptance", out.get("foc"))
     log.info("%s -> %s=%s (%.1f min)", label,
              "acceptance" if "acceptance" in out else "FoC", metric,
@@ -1011,7 +1248,7 @@ def get_stacks(scenario, seed, args, agent_b, kb, need):
     eval_only = getattr(args, "eval_only", False)
     wanted = [("rl_alone", {"RL-alone"}, "RL-alone", None, None),
               ("po_prior", {"RL-poprior"}, "RL-poprior", None, None),
-              ("llm_prior", {"Prior-only", "Memory-off", "Full", "Reward"},
+              ("llm_prior", {"Prior-only", "Memory-off", "Full"},
                "LLM-prior", agent_b, kb)]
     for key, approaches, label, ab, k in wanted:
         if not need & approaches:
@@ -1076,9 +1313,13 @@ def main():
                          f"{EVAL_INSTANCE}. Instances "
                          f"{list(VALIDATION_INSTANCES)} are spent on §Y.14 "
                          "checkpoint selection and are refused here.")
-    ap.add_argument("--warm-arrivals", type=int, default=35,
-                    help="M^B warm-up arrivals PER training segment (store is 50 "
-                         "entries; warm-up saturates it well before 100).")
+    ap.add_argument("--warm-arrivals", type=int, default=200,
+                    help="M^B warm-up arrivals PER training instance, over 4 "
+                         "instances. Was 35, which offered 140 candidate writes "
+                         "into a 50-entry store. Capacity is derived from this "
+                         "now and never binds, so this argument alone decides "
+                         "how much there is to retrieve. Costs ~7.5 s per warm "
+                         "arrival, once per (scenario, write_policy, seed).")
     ap.add_argument("--passes", type=int, default=1,
                     help="curriculum passes over the training instances. Default 1 "
                          "since §Y.13: one pass now covers the whole pool, where it "
@@ -1108,6 +1349,32 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--mock", action="store_true")
+    ap.add_argument("--profile", action="store_true",
+                    help="record per-decision wall / CPU-time / GPU energy from "
+                         "the production `profiled()` wraps. Raw events per cell "
+                         "to ORION_PROFILE_DIR. Serialise the run (one port, "
+                         "other slot idle) or the two slots contaminate each "
+                         "other's GPU windows.")
+    ap.add_argument("--profile-hz", type=float, default=20.0,
+                    help="power sampling rate")
+    ap.add_argument("--mb-mode", choices=["frozen", "accumulate"], default="frozen",
+                    help="frozen = the §P protocol (warm, freeze, evaluate). "
+                         "accumulate = M^B writes during the evaluation, so the "
+                         "store holds what the run has lived through. Pair with "
+                         "--warm-arrivals 0 to start empty.")
+    ap.add_argument("--retrieval-floor", type=float, default=None,
+                    help="override episodic_memory.RETRIEVAL_FLOOR. The shipped "
+                         "0.60 was calibrated on a synthetic probe with four "
+                         "separated regimes; a live stream is a continuum, and "
+                         "the calibration comment says to re-read the operating "
+                         "point from retrieval_stats() on the first real run. "
+                         "The floor in force is recorded in every cell.")
+    ap.add_argument("--no-plan-cache", action="store_true",
+                    help="build a plan per arrival instead of per cache key. "
+                         "Diagnostic only: the cells are NOT results of record, "
+                         "so ORION_CELL_DIR must point at a scratch path. "
+                         "Measured 2.83 s per plan build, so an LLM cell is "
+                         "~1.6 h at 2000 arrivals; raise ORION_CELL_TIMEOUT_S.")
     ap.add_argument("--tag", default="GRID")
     args = ap.parse_args()
 
@@ -1122,16 +1389,30 @@ def main():
             f"reports the instances the checkpoint was selected on. Instance "
             f"{EVAL_INSTANCE} is the evaluation instance of record.")
 
-    # The plan cache is pipeline, not ablation. Without it an LLM cell is 2000
-    # calls at ~6s = 3.36 h against the 4 h CELL_TIMEOUT_S, so cells fail rather
-    # than run slowly, and the grid's 160 LLM cells come to 538 h. Refuse here so
-    # the setting cannot drift off in a long run and be discovered afterwards.
-    if not W.RC_USE_PLAN_CACHE:
+    # The plan cache is pipeline, not ablation, and a run of record never turns
+    # it off. --no-plan-cache exists for one question -- whether the approach is
+    # limited by how rarely the model is consulted -- and its cells answer that
+    # question, not the grid's. So it is allowed, loudly, and only into scratch.
+    #
+    # Cost, re-measured 2026-08-11 off the 20 banked Memory-off cells: 2.83 s per
+    # plan build, intercept ~0. The 6 s this refusal used to quote (hence 3.36 h
+    # per cell, 538 h for the grid) is roughly 2x the measured figure.
+    global USE_PLAN_CACHE
+    if args.no_plan_cache:
+        if CELLS == Path("data/grid_cells"):
+            raise SystemExit(
+                "--no-plan-cache writes cells that are not results of record. "
+                "Set ORION_CELL_DIR to a scratch path.")
+        USE_PLAN_CACHE = False
+        log.warning("PLAN CACHE OFF: one plan build per arrival (~2.83 s each, "
+                    "so ~%.1f h per LLM cell at %d arrivals). Cells go to %s and "
+                    "are diagnostic, not results of record.",
+                    args.arrivals * 2.83 / 3600, args.arrivals, CELLS)
+    if not W.RC_USE_PLAN_CACHE and USE_PLAN_CACHE:
         raise SystemExit(
-            "RC_USE_PLAN_CACHE is off. The plan cache is part of the pipeline, "
-            "not an option: cache-off is 3.36 h per LLM cell against a 4 h cell "
-            "timeout (538 h for the grid), and it measures a system that is not "
-            "the one proposed.")
+            "RC_USE_PLAN_CACHE is off but --no-plan-cache was not passed. The "
+            "plan cache is part of the pipeline, not an option, and it must not "
+            "drift off in a long run and be discovered afterwards.")
 
     if args.eval_seg is not None:
         if not args.eval_only:
@@ -1171,6 +1452,44 @@ def main():
                           tag=args.tag, prereg=PREREG)
     log.info("provenance commit=%s dirty=%s part=%s", prov["git_commit"][:8],
              prov["git_dirty"], args.part)
+
+    global MB_MODE
+    MB_MODE = args.mb_mode
+    if MB_MODE == "accumulate":
+        log.warning("M^B ACCUMULATES during eval (not the frozen §P protocol); "
+                    "warm_arrivals=%d", args.warm_arrivals)
+
+    if args.retrieval_floor is not None:
+        # Set on the module so the AUTO_FLOOR resolution inside retrieve() picks
+        # it up; retrieval_stats() reports the floor actually applied, so the
+        # cell records what ran rather than what the source says.
+        import orion.llm.episodic_memory as _em
+        log.warning("RETRIEVAL_FLOOR %.4f -> %.4f", _em.RETRIEVAL_FLOOR,
+                    args.retrieval_floor)
+        _em.RETRIEVAL_FLOOR = args.retrieval_floor
+
+    if args.profile:
+        global PROFILE_SAMPLER
+        from orion.profiling import PowerSampler
+        # Own PIDs: this process and the llama.cpp server it talks to, taken from
+        # the serving provenance. Everything else on the A6000 is another user's
+        # work and its power must not be charged to this experiment.
+        own = {os.getpid()}
+        _pid = ((prov.get("serving") or {}).get("server_pid"))
+        if _pid:
+            own.add(int(_pid))
+        else:
+            log.warning("--profile: no serving PID in provenance, so the LLM "
+                        "server's own GPU work will read as foreign load")
+        PROFILE_SAMPLER = PowerSampler(hz=args.profile_hz, own_pids=own)
+        PROFILE_SAMPLER.start()
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        log.info("profiling ON: own_pids=%s hz=%.0f gpu=%s rapl=%s -> %s",
+                 sorted(own), args.profile_hz, PROFILE_SAMPLER.gpu_available,
+                 PROFILE_SAMPLER.rapl_available, PROFILE_DIR)
+        if not PROFILE_SAMPLER.rapl_available:
+            log.warning("RAPL is not readable (needs root): CPU energy is a "
+                        "TDP ESTIMATE, not a measurement. Label it as such.")
     log.info("GRID part=%s seeds=%s scenarios=%s approaches=%s levels=%s "
              "eval_instances=%s train_level=%s arrivals=%d rounds=%d passes=%d "
              "train_instances=%s eval_only=%s eval_seg=%s cells=%s selection=%s",
@@ -1180,7 +1499,7 @@ def main():
              args.eval_only, args.eval_seg, CELLS,
              "Y13_final_segment" if args.final_segment else "Y14_validation_selected")
 
-    need_llm = bool(set(args.approaches) & {"Prior-only", "Memory-off", "Full", "Reward"})
+    need_llm = bool(set(args.approaches) & {"Prior-only", "Memory-off", "Full"})
     agent_b = kb = None
     if need_llm and not args.mock:
         agent_b = R._build_local_agent(args.port)
@@ -1195,7 +1514,7 @@ def main():
                        if any(not _done(scenario, a, seed, lv, inst)
                               for lv in args.levels for inst in args.eval_instances)}
             stacks = get_stacks(scenario, seed, args, agent_b, kb, pending) if pending else {}
-            # Firing order: Plain -> RL-alone -> Prior-only -> Memory-off -> Full -> Reward.
+            # Firing order: Plain -> RL-alone -> Prior-only -> Memory-off -> Full.
             for approach in [a for a in APPROACHES if a in args.approaches]:
                 for level in args.levels:
                     for inst in args.eval_instances:

@@ -29,7 +29,7 @@ _TIER_RAM_RANGE: dict[InfrastructureTier, tuple[float, float]] = {
     InfrastructureTier.CENTRAL_CLOUD:   (192.0, 256.0),
 }
 _TIER_PROC_DELAY_RANGE: dict[InfrastructureTier, tuple[float, float]] = {
-    InfrastructureTier.EDGE:            (0.5, 1.5),
+    InfrastructureTier.EDGE:            (0.5, 1.0),
     InfrastructureTier.REGIONAL_CLOUD:  (1.0, 2.5),
     InfrastructureTier.CENTRAL_CLOUD:   (1.5, 3.0),
 }

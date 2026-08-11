@@ -29,7 +29,7 @@ FREE = {
     "ram_residual_frac": 0.93,
     "domain_cpu_residual": [0.95, 0.96, 0.94, 0.95, 0.95],
     "domain_ram_residual": [0.93, 0.94, 0.92, 0.93, 0.93],
-    "tier_cpu_residual": {"ran_edge": 0.95, "mec": 0.94,
+    "tier_cpu_residual": {"edge": 0.95, "edge": 0.94,
                           "regional_cloud": 0.96, "central_cloud": 0.97},
     "inter_bw_residual_mean": 0.98,
     "inter_bw_residual_min": 0.96,
@@ -45,7 +45,7 @@ SATURATED = {
     "domain_ram_residual": [0.10, 0.12, 0.09, 0.13, 0.11],
     # Access saturates first, the core keeps headroom — the hierarchy's
     # characteristic scarcity pattern, and what a whole-network average hides.
-    "tier_cpu_residual": {"ran_edge": 0.02, "mec": 0.05,
+    "tier_cpu_residual": {"edge": 0.02, "edge": 0.05,
                           "regional_cloud": 0.15, "central_cloud": 0.45},
     "inter_bw_residual_mean": 0.21,
     "inter_bw_residual_min": 0.04,
@@ -188,5 +188,55 @@ def test_query_terms_name_the_scarce_tier():
     terms = condition_query_terms(SATURATED)
     assert "congestion saturated" in terms
     assert "load L4" in terms
-    assert "ran_edge exhausted" in terms
+    assert "edge exhausted" in terms
     assert "central_cloud exhausted" not in terms
+
+
+# ── What the floor turned away ───────────────────────────────────────────────
+
+
+def test_abstain_records_the_score_it_turned_away():
+    """`best_available` is the only evidence for where the floor should sit, and
+    it is read on exactly the calls that abstain. It used to be computed after
+    the floor filter, so it was 0.0 on every one of them: the §Y.15 grid abstained
+    on 78-99% of consultations and recorded nothing about how close any of them
+    came. Nothing asserted the field, which is why it stayed dead."""
+    mb = _store(FREE, None)
+    hits = mb.retrieve("urllc slice", condition=SATURATED)
+
+    assert hits == []                       # opposite regime, floor holds
+    log = mb._retrieval_log[-1]
+    assert log["abstained"] is True
+    assert log["max"] is None               # nothing was returned
+    assert log["floor"] == RETRIEVAL_FLOOR
+    # The entry scored SOMETHING. A zero here means the field is being read after
+    # the filter again and the floor cannot be re-calibrated from a run.
+    assert log["best_available"] is not None
+    assert 0.0 < log["best_available"] < RETRIEVAL_FLOOR
+
+
+def test_retrieval_stats_report_the_near_miss_distribution():
+    """An abstain rate says the floor fired; the near-miss quantiles say by how
+    much. Re-reading the operating point off a real stream needs the second."""
+    mb = _store(FREE, None)
+    for _ in range(4):
+        mb.retrieve("urllc slice", condition=SATURATED)
+
+    stats = mb.retrieval_stats()
+    assert stats["calls"] == 4
+    assert stats["abstain_rate"] == 1.0
+    assert stats["near_miss_n"] == 4
+    assert stats["floor"] == RETRIEVAL_FLOOR
+    for q in ("near_miss_p50", "near_miss_p90", "near_miss_max"):
+        assert 0.0 < stats[q] < RETRIEVAL_FLOOR
+    assert stats["near_miss_p50"] <= stats["near_miss_max"]
+
+
+def test_near_miss_fields_are_absent_when_nothing_abstains():
+    mb = _store(SATURATED, None)
+    mb.retrieve("urllc slice", condition=SATURATED)   # same regime, fires
+
+    stats = mb.retrieval_stats()
+    assert stats["abstain_rate"] == 0.0
+    assert stats["near_miss_n"] == 0
+    assert stats["near_miss_p50"] is None

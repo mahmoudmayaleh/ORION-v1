@@ -21,7 +21,10 @@ import sys
 import time
 from pathlib import Path
 
-if os.environ.get("PYTHONHASHSEED") != "0":
+# Behind __main__ only: fired on import it replaces ANY importer via os.execv,
+# which under pytest ends the session with no traceback and rc 0. Same reasoning
+# as grid_runner.py:61.
+if __name__ == "__main__" and os.environ.get("PYTHONHASHSEED") != "0":
     os.environ["PYTHONHASHSEED"] = "0"
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -195,7 +198,7 @@ def main():
         m = float(np.mean([c["acceptance"] for k, c in res["cells"].items()
                            if k.startswith(scenario)]))
         pl = banked_mean(scenario, "Plain", fams, args.seeds)
-        pp = banked_mean(scenario, "Plain-partial", fams, args.seeds)
+        pp = banked_mean(scenario, "MDO-partial", fams, args.seeds)
         xh1 = "X-H1 holds (MILP >= Plain)" if m >= pl else \
               "X-H1 VIOLATED (Plain > MILP) — explain per prereg (C7/C9, time limit)"
         print(f"  {scenario:<13} MILP mean = {m:5.1f}   Plain = {pl:5.1f}   "

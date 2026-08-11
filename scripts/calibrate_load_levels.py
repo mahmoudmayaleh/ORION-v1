@@ -137,8 +137,13 @@ def run_plain(substrate, arrival_rate, rng, num_arrivals=NUM_ARRIVALS):
 
 
 def tier_utilisation(substrate):
-    """Per-tier occupied fraction. The access tier binds first, so the aggregate
-    rho understates difficulty and this is what shows it."""
+    """Per-tier occupied fraction.
+
+    Which tier binds is a property of the WORKLOAD's tier restrictions, not of
+    capacity, so callers must read the max over tiers rather than naming one.
+    This readout used to hardcode `ran_edge`; after the three-tier merge that
+    key stopped existing and every sweep point reported 0.00 while the tier that
+    actually saturates was invisible."""
     out = {}
     for tier, row in capacity_by_tier(substrate).items():
         used = sum(substrate.graph.nodes[n]["cpu_capacity"]
@@ -232,7 +237,7 @@ def main():
                  rho, lam, row["erlangs"], row["acceptance_mean"],
                  row["acceptance_std"], row["acceptance_steady_mean"],
                  row["transient_bias"], row["concurrent_mean"],
-                 row["tier_util"].get("ran_edge", 0.0),
+                 (max(row["tier_util"].values()) if row["tier_util"] else 0.0),
                  row["span_in_lifetimes"], flag)
         log.info("    reject causes (mean/episode): %s", row["reject_causes"])
 
@@ -246,6 +251,23 @@ def main():
                     and r["span_in_lifetimes"] >= 3] or rows
         best = min(eligible, key=lambda r: abs(r["acceptance_mean"] - target))
         levels[name] = {"target_acceptance": target, **best}
+
+    # ---- the ladder must actually be a ladder --------------------------------
+    # A target above the achievable ceiling does not fail loudly: every level above
+    # it simply selects the top sweep point, and two levels end up with the SAME
+    # lambda. That is a degenerate ladder wearing distinct names, and every
+    # downstream cell would compare two identical experiments. Caught here because
+    # monotonicity cannot see it: identical rows are trivially monotone.
+    chosen_lambdas = {name: round(levels[name]["lambda"], 6) for name in levels}
+    dupes = {lam for lam in chosen_lambdas.values()
+             if list(chosen_lambdas.values()).count(lam) > 1}
+    distinct = not dupes
+    if not distinct:
+        collide = sorted(n for n, lam in chosen_lambdas.items() if lam in dupes)
+        print(f"\n  !! DEGENERATE LADDER: {collide} all selected the same lambda "
+              f"({sorted(dupes)}).")
+        print("     A target above the achievable ceiling collapses onto the top of")
+        print("     the sweep. Re-target against the measured range; do NOT freeze.")
 
     # ---- named calibration expectations (§Y.3) ------------------------------
     accs = [r["acceptance_mean"] for r in rows]
@@ -274,7 +296,7 @@ def main():
         print(f"  {r['rho_offered']:>6.3f} {r['lambda']:>8.2f} {r['erlangs']:>7.0f} "
               f"{r['acceptance_mean']:>7.3f}±{r['acceptance_std']:<6.3f} "
               f"{r['acceptance_steady_mean']:>7.3f} "
-              f"{r['concurrent_mean']:>8.1f} {r['tier_util'].get('ran_edge', 0):>6.2f} "
+              f"{r['concurrent_mean']:>8.1f} {(max(r['tier_util'].values()) if r['tier_util'] else 0):>6.2f} "
               f"{r['span_in_lifetimes']:>8.1f} {'yes' if usable else 'NO':>7}")
     if not all(r["erlangs_over_arrivals"] <= 0.25 and r["span_in_lifetimes"] >= 3
                for r in rows):
@@ -298,6 +320,8 @@ def main():
           f"{conc_ratio:.2f}  {'PASS' if conc_ratio >= 3 else 'REPORT'}")
     print(f"    binding-tier utilisation at L4 > 0.85   : "
           f"{edge_l4:.2f} ({binding_tier})  {'PASS' if edge_l4 > 0.85 else 'REPORT'}")
+    print(f"    every level has a distinct lambda          : "
+          f"{'PASS' if distinct else 'FAIL -- levels NOT frozen'}")
     if not monotone:
         print("\n  !! Acceptance is not monotone in rho. Per §Y.3 the calibration is")
         print("     INVALID and the levels must not be frozen. Re-derive before firing.")
@@ -314,7 +338,7 @@ def main():
     }, indent=2))
     print(f"\n  written: {OUT}")
     print("  Freeze these into PREREG §Y.3 and populate load_levels.CALIBRATED_LEVELS.")
-    return 0 if monotone else 1
+    return 0 if (monotone and distinct) else 1
 
 
 if __name__ == "__main__":

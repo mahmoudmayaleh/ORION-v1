@@ -120,6 +120,9 @@ def table_cost(recs):
     out = ["| approach | n | decision ms | GPU J/call | calls clean/total | "
            "cell CPU s | cell CPU J (est) | J per admitted |",
            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    # GPU J/call is the mean over clean windows. J per admitted extrapolates it
+    # to every call, so it assumes a contaminated call costs what a clean one
+    # does; clean/total says how much of it rests on that assumption.
     by = defaultdict(list)
     for r in recs:
         by[r["approach"]].append(r)
@@ -133,7 +136,14 @@ def table_cost(recs):
         cpu_j = [x for x in (cpu_energy_j(r) for r in rs) if x is not None]
         adm = sum(r["admitted"] or 0 for r in rs)
         # Energy per admitted slice: GPU where the model ran, plus estimated CPU.
-        tot_gpu = sum(g * n for g, n in zip(gj, nc)) if gj else 0.0
+        #
+        # The per-call mean comes from clean windows but is multiplied by ALL
+        # calls, not just the clean ones. Charging only the clean calls would
+        # divide a partial numerator by a whole denominator and report a cost
+        # lower than the truth in proportion to how contaminated the run was.
+        # The assumption made instead -- that a contaminated call costs what a
+        # clean one costs -- is stated rather than hidden.
+        tot_gpu = sum(g * n for g, n in zip(gj, nt)) if gj else 0.0
         per_adm = (tot_gpu + sum(cpu_j)) / adm if adm else None
         out.append(
             f"| {a} | {len(rs)} | {np.mean(lat) * 1000:.2f} |"
@@ -143,6 +153,11 @@ def table_cost(recs):
             f" {f'{np.mean(cpu_j):.0f}' if cpu_j else '--'} |"
             f" {f'{per_adm:.2f}' if per_adm else '--'} |")
     return "\n".join(out)
+
+
+def _pct(share):
+    """Sub-0.1% stages read as 0.0% otherwise, which is not the same claim."""
+    return "<0.1%" if 0 < share * 100 < 0.1 else f"{share * 100:.1f}%"
 
 
 def table_stages(recs):
@@ -170,7 +185,7 @@ def table_stages(recs):
             nested = " (nested)" if s in NESTED else ""
             out.append(f"| {a} | {s}{nested} | {n_per:.2f} | {p50:.3f} | "
                        f"{p90:.3f} | {p99:.3f} | "
-                       f"{'--' if nested else f'{share * 100:.1f}%'} |")
+                       f"{'--' if nested else _pct(share)} |")
     return "\n".join(out)
 
 

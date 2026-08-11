@@ -33,7 +33,7 @@ def _required_tiers(sr, substrate):
                 t = g.nodes[n]["tier"]
                 counts[t] = counts.get(t, 0) + 1
         tiers.append(InfrastructureTier(max(counts, key=counts.get)) if counts
-                     else InfrastructureTier.MEC)
+                     else InfrastructureTier.EDGE)
     return tiers
 
 

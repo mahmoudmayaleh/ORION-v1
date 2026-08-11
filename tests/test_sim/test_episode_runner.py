@@ -118,3 +118,45 @@ class TestEpisodeSmoke:
         for _, d in runner.substrate.graph.nodes(data=True):
             assert d["cpu_residual"] == pytest.approx(d["cpu_capacity"])
             assert d["ram_residual"] == pytest.approx(d["ram_capacity"])
+
+
+class TestOnDecisionHook:
+    """`on_decision` is what lets M^B accumulate during evaluation. Unset it does
+    nothing, which is the right default and also the way the whole mechanism can
+    fail without a symptom: no exception, no log line, just an empty store at the
+    end of a multi-hour run."""
+
+    def test_default_is_no_call(self, runner) -> None:
+        assert EpisodeRunner.on_decision is None
+        runner.run_episode(mdo_mode="random")   # must not raise with no hook
+
+    def test_fires_once_per_mdo_reaching_arrival(self, runner) -> None:
+        seen = []
+        runner.on_decision = lambda sr, res, verdict, plan: seen.append(
+            (sr.request_id, res.admitted))
+        result = runner.run_episode(mdo_mode="random")
+
+        # Structural rejects never reach the MDO, so they get no callback.
+        expected = result.stats.admitted + result.stats.rejected_by_mdo
+        assert len(seen) == expected
+        assert len(seen) == len({rid for rid, _ in seen})   # no duplicates
+
+    def test_reports_the_outcome_the_kpi_counts(self, runner) -> None:
+        """Fired AFTER the post-commit verify, not at coordinator resolve.
+
+        A record written at resolve time labels every post-commit revocation a
+        success. The store retrieves successes-only, so that mislabelling is what
+        would quietly poison it.
+        """
+        seen = []
+        runner.on_decision = lambda sr, res, verdict, plan: seen.append(res.admitted)
+        result = runner.run_episode(mdo_mode="random")
+
+        assert sum(1 for a in seen if a) == result.stats.admitted
+
+    def test_plan_is_the_one_the_decision_used(self, runner) -> None:
+        seen = []
+        runner.on_decision = lambda sr, res, verdict, plan: seen.append(plan)
+        runner.run_episode(mdo_mode="random")
+        # None would mean a structural reject, which never reaches the hook.
+        assert seen and all(p is not None for p in seen)

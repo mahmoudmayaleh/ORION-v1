@@ -117,6 +117,12 @@ RC_NUM_ARRIVALS = None    # override episode length (defaults to the level's N)
 # situation, not per arrival), so running without it would measure a system
 # nobody proposes. grid_runner refuses to turn it off.
 RC_USE_PLAN_CACHE = True
+# Per-arrival post-outcome callback handed to the EVAL EpisodeRunner. Same seam
+# idiom as EVAL_TOPO_SIG / CUSTOM_PLAN_BUILDER: None leaves the eval path
+# byte-identical. grid_runner sets it when M^B accumulates during evaluation.
+# Deliberately NOT wired into the training loop at `train_approach` -- writing to
+# the store during training is a separate change with its own protocol question.
+EVAL_ON_DECISION = None
 PLAN_CACHE_CAPACITY = 256  # peak live keys in any 200-arrival window is 114 (measured)
 PLAN_CACHE_STATS: dict = {}
 # §R Δ2-R (2026-07-15): cache-OFF Full-ORION. The signature cache is known-pathological
@@ -166,10 +172,18 @@ ADV_MODE = "stream_gae"
 #                 sampling domain X at step 0, it pulls step 1 toward m~[1]
 #                 conditioned on the wrong prefix, against the decoder's
 #                 count-conditioning) — measured: cannot align at any beta.
-#   "distill"     teacher-forced sequence distillation: -mean_k log pi(m~_k |
+#   "distill"     teacher-forced sequence distillation: -sum_k log pi(m~_k |
 #                 m~_<k), the exact gradient form §V.4 BC validated on this
 #                 network. Skips (counted in kl_frame_skips) if any m~ step is
 #                 mask-infeasible.
+#
+# §Z.1 (2026-08-06) REDUCTION: both terms now reduce over the K slots by SUM.
+# "distill" previously used mean() while "sampled_kl" reaches analytical_kl,
+# which ends kl_per_slot.sum(). K runs 2-6, so switching PRIOR_LOSS silently
+# rescaled the effective beta by ~K, and KLS4/KLS5 therefore compared a distill
+# arm at beta=25 against a legacy arm carrying 4-6x that dose. Sum is the
+# sequence-level convention Shah et al. (arXiv:2512.21852) analyse; averaging is
+# outside what they verify. Any beta read from a pre-§Z run is in the old units.
 PRIOR_LOSS = "sampled_kl"
 # §W.2: single reward-config source. RewardWeights.lambda_viol defaulted to 10
 # against the +1.0 admission bonus (MDOConfig.lambda_viol is dead code); §V.3
@@ -453,8 +467,47 @@ def build_stack(substrate, seed, lr, actors=None, mdo_cfg=None):
     return policy, coord, critic, opt_mdo, opt_critic, obs_dim, num_domains
 
 
+def _agreement_support(pairs, exact_arrivals, n_arrivals):
+    """The support a pooled m~-agreement ratio is actually computed on.
+
+    KLS7 read 175 of 200 rounds below 0.05 and 24 above 0.95 with a single
+    value in between, which is a switch and not a ratio. Both sides of the
+    comparison collapse: partial_obs_builder colocates a chain onto one
+    domain, and the deterministic decode also lands on ~one domain, so the
+    pooled ratio asks whether two collapsed choices coincided at an effective
+    n of one rather than averaging over the slots it appears to count.
+
+    `target_modal_frac` is the score a constant policy playing the modal m~
+    domain would get, so agreement below it is worse than a constant;
+    `off_modal_agreement` removes those slots and is the informative part;
+    `exact_arrival_frac` counts whole arrivals, which is the real n.
+    """
+    out = {"n_slots": len(pairs), "n_arrivals": n_arrivals,
+           "target_modal_frac": None, "policy_modal_frac": None,
+           "off_modal_agreement": None, "off_modal_slots": 0,
+           "exact_arrival_frac": None}
+    if not pairs:
+        return out
+    tgt, pol = {}, {}
+    for s_j, d_j in pairs:
+        tgt[s_j] = tgt.get(s_j, 0) + 1
+        pol[d_j] = pol.get(d_j, 0) + 1
+    total = len(pairs)
+    modal_t = max(tgt, key=lambda kk: tgt[kk])
+    out["target_modal_frac"] = tgt[modal_t] / total
+    out["policy_modal_frac"] = max(pol.values()) / total
+    off = [(a, b) for a, b in pairs if a != modal_t]
+    out["off_modal_slots"] = len(off)
+    if off:
+        out["off_modal_agreement"] = sum(1 for a, b in off if a == b) / len(off)
+    if n_arrivals:
+        out["exact_arrival_frac"] = exact_arrivals / n_arrivals
+    return out
+
+
 def eval_acceptance(coord, fam_name, seed, arrivals, delays, plan_builder=None,
-                    mode="deterministic", cost_out=None, report_out=None):
+                    mode="deterministic", cost_out=None, report_out=None,
+                    agree_out=None):
     """§Y.5 eval: acceptance ratio on the held-out stream, no feasibility oracle.
 
     Same episode as `eval_foc`, different denominator: admitted / offered rather
@@ -467,7 +520,8 @@ def eval_acceptance(coord, fam_name, seed, arrivals, delays, plan_builder=None,
     from orion.sim.acceptance import build_report
 
     acc, adm, tot, agree, ep = _eval_episode(
-        coord, fam_name, seed, arrivals, delays, plan_builder, mode, cost_out)
+        coord, fam_name, seed, arrivals, delays, plan_builder, mode, cost_out,
+        agree_out)
     if report_out is not None:
         report_out.update(build_report(ep).to_dict())
     return acc, adm, tot, agree
@@ -487,7 +541,7 @@ def eval_foc(coord, fam_name, seed, arrivals, ceiling, delays, plan_builder=None
 
 
 def _eval_episode(coord, fam_name, seed, arrivals, delays, plan_builder=None,
-                  mode="deterministic", cost_out=None):
+                  mode="deterministic", cost_out=None, agree_out=None):
     """One eval episode on the fixed held-out stream (seed+777).
 
     Shared implementation behind `eval_acceptance` (§Y) and `eval_foc` (pre-§Y),
@@ -505,6 +559,7 @@ def _eval_episode(coord, fam_name, seed, arrivals, delays, plan_builder=None,
     ap.generate()
     runner = EpisodeRunner(sub, ap, coord, delays,
                            plan_builder=plan_builder or greedy_plan_builder)
+    runner.on_decision = EVAL_ON_DECISION
     runner.reset()
     ep = runner.run_episode(mdo_mode=mode)
     adm = ep.stats.admitted
@@ -530,20 +585,36 @@ def _eval_episode(coord, fam_name, seed, arrivals, delays, plan_builder=None,
     # domain IDs — map actions through canonical_to_domain before comparing. Historical
     # mtilde_agreement values (pre-§O) are void.
     num = den = 0
+    # §Z.6 — the ratio is unchanged; what is added is the support it stands on.
+    pairs = []
+    exact = arrivals_scored = 0
     try:
         canonical_to_domain = [s.domain_id for s in build_domain_summaries(sub)]
         for t in ep.rollout.mdo:
             sug = list(t.info.get("suggested_domains", [])) if getattr(t, "info", None) else []
             act = list(t.action) if getattr(t, "action", None) is not None else []
             if sug and act and len(sug) == len(act):
+                hits = slots = 0
                 for a_j, s_j in zip(act, sug):
                     if not (0 <= int(a_j) < len(canonical_to_domain)):
                         continue
                     den += 1
-                    num += int(int(canonical_to_domain[int(a_j)]) == int(s_j))
+                    d_j = int(canonical_to_domain[int(a_j)])
+                    hit = int(d_j == int(s_j))
+                    num += hit
+                    pairs.append((int(s_j), d_j))
+                    hits += hit
+                    slots += 1
+                if slots:
+                    arrivals_scored += 1
+                    exact += int(hits == slots)
     except Exception:  # noqa: BLE001  -- instrumentation must never break eval
         num = den = 0
+        pairs = []
+        exact = arrivals_scored = 0
     agreement = (num / den) if den else None
+    if agree_out is not None:
+        agree_out.update(_agreement_support(pairs, exact, arrivals_scored))
     offered = ep.stats.total_arrivals
     return (adm / offered if offered > 0 else 0.0), adm, offered, agreement, ep
 
@@ -563,6 +634,7 @@ def instrumented_eval(coord, fam_name, seed, arrivals, delays, plan_builder=None
     ap.generate()
     runner = EpisodeRunner(sub, ap, coord, delays,
                            plan_builder=plan_builder or greedy_plan_builder)
+    runner.on_decision = EVAL_ON_DECISION
     runner.reset()
     ep = runner.run_episode(mdo_mode=mode)
     return {"mode": mode, "admit": ep.stats.admitted,
@@ -951,6 +1023,8 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
         motion = 0.0
         kl_frame_skips = 0
         prior_fire_rate = train_agreement = None  # §Y.9 train-side prior telemetry
+        train_agreement_fr = None                 # §Z.5 free-running counterpart
+        train_support_tf = train_support_fr = None  # §Z.6 support of both
         ev = corr_adv_pos = neg_adv_admitted = float("nan")
         if len(buffer) > 0:
             with profiled("train.gae"):
@@ -1040,7 +1114,9 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
                                             sug_t = torch.tensor(sug_c, dtype=torch.long)
                                             lp_sug, _, _ = policy.evaluate_actions(
                                                 obs_i, tm_i, sug_t, k)
-                                            kl_term = -lp_sug.mean()
+                                            # §Z.1: sum, not mean — same reduction
+                                            # analytical_kl uses, so beta is one unit.
+                                            kl_term = -lp_sug.sum()
                                         else:
                                             kl_frame_skips += 1
                                     else:
@@ -1088,6 +1164,8 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
             # fired at all. Both are cheap and read-only.
             fired = eligible = 0
             tr_num = tr_den = 0
+            fr_num = fr_den = 0
+            tf_pairs, fr_pairs, fr_exact = [], [], 0   # §Z.6
             with torch.no_grad():
                 for i in range(len(buffer.mdo_obs)):
                     obs_i = buffer.mdo_obs[i]
@@ -1110,10 +1188,35 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
                     sug_t = torch.tensor(sug_c, dtype=torch.long)
                     _lp, _h, lg = policy.evaluate_actions(obs_i, tm_i, sug_t, k)
                     masked = lg[:k].masked_fill(~tm_i[:k], float("-inf"))
-                    tr_num += int((masked.argmax(dim=-1) == sug_t).sum())
+                    tf_pick = masked.argmax(dim=-1).tolist()
+                    tr_num += sum(int(a) == int(b)
+                                  for a, b in zip(tf_pick, sug_c))
                     tr_den += k
+                    tf_pairs.extend((int(b), int(a))
+                                    for a, b in zip(tf_pick, sug_c))
+                    # §Z.5 — the same comparison under a FREE-RUNNING decode.
+                    # evaluate_actions advances its running counts on the actions
+                    # passed to it, so the line above is teacher-forced on m~ and
+                    # measures agreement at prefixes the decoder never has to
+                    # produce. The eval-side mtilde_agreement is free-running, so
+                    # the two were never the same measurement and their difference
+                    # was read as transfer failure. Free-running HERE isolates
+                    # exposure bias (this minus the teacher-forced number, same
+                    # states) from transfer (this minus the eval number).
+                    part_fr, _lpf, _lgf, _entf = policy(
+                        obs_i, tm_i, k, deterministic=True)
+                    fr_hits = sum(int(a) == int(b)
+                                  for a, b in zip(part_fr, sug_c))
+                    fr_num += int(fr_hits)
+                    fr_den += k
+                    fr_pairs.extend((int(b), int(a))
+                                    for a, b in zip(part_fr, sug_c))
+                    fr_exact += int(fr_hits == k)
             prior_fire_rate = (fired / eligible) if eligible else None
             train_agreement = (tr_num / tr_den) if tr_den else None
+            train_agreement_fr = (fr_num / fr_den) if fr_den else None
+            train_support_tf = _agreement_support(tf_pairs, 0, 0)
+            train_support_fr = _agreement_support(fr_pairs, fr_exact, fired)
 
         # MDO policy entropy (stable-vs-trained: is the policy still exploring?)
         ent_vals = [float(t.entropy) for t in ep.rollout.mdo]
@@ -1123,8 +1226,10 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
         if ent_vals:
             _measured_entropy = mdo_entropy
 
+        eval_support = {}
         foc, eadm, etot, magree = eval_acceptance(coord, fam_name, seed, arrivals, delays,
-                                           plan_builder=eval_pb)
+                                           plan_builder=eval_pb,
+                                           agree_out=eval_support)
         curve.append({
             "round": rnd + 1, "cumulative_arrivals": cumulative_arrivals,
             "train_admit": ep.stats.admitted, "train_total": ep.stats.total_arrivals,
@@ -1144,6 +1249,17 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
             # train-stream one, on the states the update actually saw.
             "prior_fire_rate": prior_fire_rate,
             "train_mtilde_agreement": train_agreement,
+            # §Z.5 — free-running on the SAME train states. Kept alongside the
+            # teacher-forced key rather than replacing it: the gap between them IS
+            # the exposure-bias measurement, and the old key's meaning must not
+            # change under banked readers.
+            "train_mtilde_agreement_fr": train_agreement_fr,
+            # §Z.6 — a pooled agreement ratio is uninterpretable without the
+            # modal baseline it has to beat and the off-modal slots it is
+            # really made of. Published for both train decodes and for eval.
+            "train_support_tf": train_support_tf,
+            "train_support_fr": train_support_fr,
+            "eval_support": eval_support or None,
             "adv_mode": ADV_MODE, "lambda_viol": REWARD_LAMBDA_VIOL,
             "value_norm_mean": value_norm.mean, "value_norm_std": value_norm.std,
         })

@@ -87,18 +87,32 @@ def test_selection_is_the_default_and_the_old_readout_is_the_opt_out():
     assert "store_true" in main_src, "--final-segment must be a flag, so absence means selection"
 
 
-def test_llm_stacks_are_refused_rather_than_selected_on_an_unregistered_probe():
-    """§Y.14 registers the selection probe only for LLM-free stacks. Picking one
-    for an LLM stack silently would make the arm's meaning depend on an
-    undocumented choice."""
-    assert "llm_prior" not in G.SELECTABLE_STACKS
-    assert set(G.SELECTABLE_STACKS) == {"rl_alone", "po_prior"}
+def test_a_stack_with_no_registered_probe_is_refused():
+    """Picking a selection probe silently would make an arm's meaning depend on
+    an undocumented choice. §Y.14b registers `llm_prior`; anything else is still
+    refused rather than defaulted."""
+    assert set(G.SELECTABLE_STACKS) == {"rl_alone", "po_prior", "llm_prior"}
 
     args = type("A", (), {"passes": 1, "train_instances": None, "lr": 3e-3,
                           "arrivals": 2000, "eval_seg": None,
                           "final_segment": False, "eval_only": True})()
     with pytest.raises(SystemExit, match="does not specify the checkpoint-selection probe"):
-        G.select_checkpoint("conventional", 42, "llm_prior", args)
+        G.select_checkpoint("conventional", 42, "not_a_registered_stack", args)
+
+
+def test_llm_prior_is_selected_on_the_registered_llm_free_probe():
+    """§Y.14b: one checkpoint sequence serves Prior-only, Memory-off and Full,
+    so selecting it on any one arm's advised eval would privilege that
+    arm in a comparison whose subject is the plan source. It is selected on the
+    LLM-free probe instead, and the artefact has to say so."""
+    assert G.SELECTABLE_STACKS["llm_prior"] == "RL-alone"
+    assert G.PROXY_SELECTED_STACKS == {"llm_prior"}
+    # The three arms that share the stack, so the "one sequence" premise cannot
+    # drift without this failing.
+    shared = {a for a, c in G.STACK_FOR_APPROACH.items() if c == "llm_prior"}
+    assert shared == {"Prior-only", "Memory-off", "Full"}
+    # A proxy-selected stack must not be selected on its own advised eval.
+    assert G.SELECTABLE_STACKS["llm_prior"] not in G.ADVISED_APPROACHES
 
 
 def test_every_trained_approach_maps_to_a_stack():
@@ -132,3 +146,42 @@ def test_curriculum_order_varies_by_seed_but_the_set_does_not():
     orders = [tuple(i for _l, i in G._curriculum_segments(s)) for s in (42, 43, 44)]
     assert len({frozenset(o) for o in orders}) == 1, "seeds see different instances"
     assert len(set(orders)) > 1, "segment order no longer varies by seed"
+
+
+def test_wire_pins_the_prior_coupling_loss_and_the_advantage_mode():
+    """§Z.7. Both are wp7 module defaults that the grid must override, and the
+    failure mode is identical: the run completes, every cell carries a plausible
+    number, and nothing says the policy trained under a superseded objective.
+    PRIOR_LOSS was the one that got missed, and RL-poprior paid for it in 20/20
+    paired cells before anyone looked."""
+    import wp7_runner as W
+
+    G._wire("conventional", G.TRAINING_LEVEL, G.TRAIN_INSTANCES[0])
+    assert W.PRIOR_LOSS == "distill", (
+        "the grid is training with wp7's module default again; sampled_kl is the "
+        "term measured as unable to align at any beta")
+    assert W.ADV_MODE == "td0"
+
+
+def test_the_contradictory_prior_term_is_not_what_wire_selects():
+    """Pinning the value is not enough on its own: the point is that the legacy
+    term is never what a grid cell runs, whatever wp7's default becomes."""
+    import wp7_runner as W
+
+    G._wire("conventional", G.TRAINING_LEVEL, G.TRAIN_INSTANCES[0])
+    assert W.PRIOR_LOSS != "sampled_kl"
+
+
+def test_plan_call_bounds_its_completion():
+    """The server reserves max_tokens on top of the prompt and refuses the request
+    with a 400 if the sum exceeds n_ctx. Leaving the 2048 default in place killed
+    both overnight LLM jobs after 11.7 h and 15.3 h, mid eval, once M^B exemplars
+    pushed a prompt past ~2000 tokens. A plan is 50-90 tokens."""
+    import inspect
+
+    from orion.llm import agent_b as AB
+
+    assert AB.PLAN_MAX_TOKENS <= 512, "a plan does not need a large completion"
+    src = inspect.getsource(AB.AgentB)
+    assert "max_tokens=PLAN_MAX_TOKENS" in src, (
+        "the plan call fell back to the backend's default ceiling")

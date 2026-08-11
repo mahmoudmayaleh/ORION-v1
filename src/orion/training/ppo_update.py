@@ -75,8 +75,13 @@ def ppo_mdo_update(
 
     policy_loss_sum = torch.zeros(1)
     value_loss_sum = torch.zeros(1)
-    entropy_sum = 0.0
-    kl_prior_sum = 0.0
+    # §Z.1: entropy and KL accumulate as TENSORS. Both used to be Python floats
+    # built with float(x.item()), which put a constant into `total` and gave both
+    # terms exactly zero gradient — beta and entropy_coef scaled nothing. No banked
+    # result is affected (this function has never had a caller) but wiring the
+    # trainer to it would have silently inherited an inert prior and entropy bonus.
+    entropy_sum = torch.zeros(1)
+    kl_prior_sum = torch.zeros(1)
     approx_kl_sum = 0.0
     clip_count = 0
     sample_count = 0
@@ -117,9 +122,10 @@ def ppo_mdo_update(
             temperature=prior_temperature,
         )
         kl_prior = analytical_kl(new_logits, prior_logits, tier_masks[i, :k])
-        kl_prior_sum += float(kl_prior.item())
+        kl_prior_sum = kl_prior_sum + kl_prior
 
-        entropy_sum += float(mean_ent.item() if hasattr(mean_ent, "item") else mean_ent)
+        entropy_sum = entropy_sum + (
+            mean_ent if torch.is_tensor(mean_ent) else torch.tensor(float(mean_ent)))
 
     if sample_count == 0:
         return torch.zeros(1, requires_grad=True), PPOMetrics()
@@ -154,8 +160,8 @@ def ppo_mdo_update(
     metrics = PPOMetrics(
         policy_loss=float(policy_loss.item()),
         value_loss=float(value_loss.item()),
-        entropy_bonus=float(entropy_coef * entropy_mean),
-        kl_prior_term=float(kl_prior_beta * kl_prior_mean),
+        entropy_bonus=float(entropy_coef * float(entropy_mean)),
+        kl_prior_term=float(kl_prior_beta * float(kl_prior_mean)),
         approx_kl=approx_kl_mean,
         clip_fraction=clip_frac,
         total_loss=float(total.item()),
