@@ -46,10 +46,6 @@ class DomainSummary:
     ram_capacity: float
     supported_tiers: list[InfrastructureTier] = field(default_factory=list)
     active_slice_count: int = 0
-    # Single-node fragmentation headroom (PREREG 2026-07-11 §M.4-Δ3): the best-fitting node's
-    # min(cpu_res/c_ref, ram_res/r_ref) over nodes in the domain. Aggregate residuals hide
-    # whether ANY single node is large enough; this exposes it. 0.0 = no node has headroom.
-    max_node_headroom: float = 0.0
     # Residual CPU/RAM PER TIER (§Y.1e). Aggregate residuals cannot express "this
     # domain's edge tier is full but its regional tier is not", which is the common
     # case once domains hold different tier sets. Every tier is always a key,
@@ -58,6 +54,19 @@ class DomainSummary:
     # fixed and an absent tier reads 0.0 in every instance.
     tier_cpu_residual: dict[InfrastructureTier, float] = field(default_factory=dict)
     tier_ram_residual: dict[InfrastructureTier, float] = field(default_factory=dict)
+    # h^m, per tier (restored 2026-08-12). The domain's BEST-FITTING node in each tier:
+    # the node maximising min(cpu_res / CPU_REF, ram_res / RAM_REF), reported as that one
+    # node's residual CPU and RAM. A tier residual is a sum, and a sum cannot say whether
+    # any single node is large enough for a single VNF, which is exactly the question the
+    # domain actor then fails on (`actor_infeasible`). Per tier rather than per domain
+    # because every VNF is tier-restricted, so "is there a big enough node" is only
+    # meaningful within the tier the VNF may use; max over the three recovers the
+    # pre-2026-08-11 scalar h^m exactly.
+    #
+    # The two numbers describe ONE node, chosen once. Taking max CPU and max RAM
+    # independently would describe a node that may not exist.
+    tier_max_node_cpu: dict[InfrastructureTier, float] = field(default_factory=dict)
+    tier_max_node_ram: dict[InfrastructureTier, float] = field(default_factory=dict)
 
 
 @dataclass

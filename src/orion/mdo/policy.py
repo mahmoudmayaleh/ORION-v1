@@ -263,7 +263,20 @@ class AutoregMDOPolicy(nn.Module):
         mean_ent = ent_sum / num_vnfs if num_vnfs > 0 else 0.0
         return partition, log_probs, logits, mean_ent
 
-    def evaluate_actions(self, obs, tier_mask, actions, num_vnfs):
+    def evaluate_actions(self, obs, tier_mask, actions, num_vnfs,
+                         prior_logits=None, prior_weight=0.0):
+        """Recompute log-probs of `actions` under the CURRENT parameters.
+
+        `prior_logits` / `prior_weight` must be the ones the actions were sampled
+        under. PPO's ratio is exp(new_log_prob - old_log_prob), and it is only a
+        ratio between two settings of the SAME policy if both sides include the
+        same advisory bias. Recomputing unbiased while the rollout was sampled
+        biased compares two different distributions, which silently corrupts every
+        advised update: the loss still decreases and training still completes.
+
+        `raw_list` returns the UNBIASED logits, as before, so a KL term computed
+        against them is unaffected.
+        """
         h = self._encode(obs)
         neg_inf = torch.tensor(float("-inf"), dtype=h.dtype, device=h.device)
         counts = [0.0] * self.num_domains
@@ -271,7 +284,8 @@ class AutoregMDOPolicy(nn.Module):
         ent_sum = torch.tensor(0.0)
         for k in range(num_vnfs):
             raw = self._step_logits(h, counts, k, num_vnfs)
-            masked = torch.where(tier_mask[k], raw, neg_inf)
+            dec = raw if prior_logits is None else raw + prior_weight * prior_logits[k]
+            masked = torch.where(tier_mask[k], dec, neg_inf)
             dist = Categorical(logits=masked)
             lp_list.append(dist.log_prob(actions[k]))
             ent_sum = ent_sum + dist.entropy()

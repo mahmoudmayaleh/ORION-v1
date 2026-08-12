@@ -34,8 +34,20 @@ _TIER_ORDER = TIER_INDEX
 # and the emitted width cannot drift apart.
 #
 # Per domain: cpu_res_frac, ram_res_frac, cpu_cap_norm, ram_cap_norm,
-# tier_dominant_idx, max_node_headroom (h^m, PREREG 2026-07-11 §M.4-Δ), then
-# residual CPU and RAM PER TIER (§Y.1e, 2026-07-31).
+# tier_dominant_idx, then PER TIER: residual CPU, residual RAM (§Y.1e, 2026-07-31)
+# and the best-fitting node's residual CPU and RAM (h^m, restored 2026-08-12).
+#
+# On h^m. It was removed on 2026-08-11 on the argument that a node-level statistic
+# does not belong in a domain summary. That argument was about where the number comes
+# from, not about what a domain may publish: an operator advertising "I can host one
+# VNF of up to this size" is publishing a capability, not a layout, and every practical
+# federation interface carries some form of it. Removing it also made the comparison
+# unequal in a way that mattered more than the principle, since the full-observability
+# baselines read node residuals directly and could always answer the question h^m
+# answers. It is restored, and it is now published on the SAME surface to all three
+# consumers of the abstract view: this tensor, the LLM planner
+# (llm/abstract_topology.build_abstract_topology) and the partial-observability
+# heuristic (scripts/partial_obs_prior).
 #
 # Why per-tier. An aggregate residual cannot express "this domain's edge tier is
 # full but its regional tier is not", which under heterogeneous domain composition
@@ -54,9 +66,31 @@ _TIER_ORDER = TIER_INDEX
 # both read zero. That is correct because composition is FIXED, so an absent tier
 # reads zero in every instance and every episode and is learnable from the domain's
 # identity. A flag would cost width and buy nothing.
-DOMAIN_FEAT_DIM = 6 + 2 * len(TIER_ORDER)   # 12
+DOMAIN_FEAT_DIM = 5 + 4 * len(TIER_ORDER)   # 17
 LINK_FEAT_DIM = 3     # bw_res_frac, bw_cap_norm, delay_norm
 VNF_FEAT_DIM = 5      # cpu_norm, ram_norm, tier_idx, vcr, bw_norm
+
+# Per VNF slot the observation ALSO carries a one-hot of the proposed domain m̃_k, in
+# CANONICAL index space, so the plan block is VNF_FEAT_DIM + M wide (2026-08-12).
+#
+# Why the proposal is state. Until now m̃ reached the policy only as an additive bonus
+# on its own output logits at decision time (`prior_weight` in AutoregMDOPolicy.forward),
+# and, during training, through a KL term to the proposer that was measured inert
+# (agreement 0.007 at beta=25; trained argmax worse than untrained). A bias applied
+# after the fact cannot be learned from: the policy could not represent "a proposal was
+# made, and it was this one", so it could never learn WHEN the proposal is worth
+# following and when to override it. It could only converge to agreeing more often.
+#
+# As an input it can. The policy conditions on the proposal together with the substrate
+# state, so "the proposer suggests co-locating here, but this tier's largest free node
+# is too small" is expressible, and deviation becomes a learned decision rather than an
+# absence of influence. This is what makes "the planner proposes, the policy disposes" a
+# measurable relationship rather than a description.
+#
+# Every approach's observation carries the m̃ of ITS OWN plan source, so the width is
+# constant and the arms differ in who proposes, not in whether anyone does. An
+# all-zero block means no proposal was made for that slot (padding beyond the chain).
+PLAN_ONEHOT = True
 
 
 def _dominant_tier(tiers: list[str]) -> InfrastructureTier:
@@ -83,15 +117,6 @@ def build_domain_summaries(substrate: SubstrateNetwork) -> list[DomainSummary]:
         cpu_cap = sum(g.nodes[n]["cpu_capacity"] for n in nodes)
         ram_cap = sum(g.nodes[n]["ram_capacity"] for n in nodes)
 
-        # h^m: single-node fragmentation headroom (PREREG 2026-07-11 §M.4-Δ3). Per node,
-        # min(cpu_res/c_ref, ram_res/r_ref) — the min binds on the scarce resource so a node
-        # rich in one dimension and starved in the other scores low; the domain reports its
-        # best-fitting node. Refs are FROZEN literals (config), not running maxima.
-        max_node_headroom = max(
-            (min(g.nodes[n]["cpu_residual"] / MDO_HEADROOM_CPU_REF,
-                 g.nodes[n]["ram_residual"] / MDO_HEADROOM_RAM_REF) for n in nodes),
-            default=0.0,
-        )
 
         tiers_in_domain = [g.nodes[n]["tier"] for n in nodes]
         unique_tiers = sorted(set(tiers_in_domain), key=lambda t: _TIER_ORDER.get(InfrastructureTier(t), 99))
@@ -102,10 +127,23 @@ def build_domain_summaries(substrate: SubstrateNetwork) -> list[DomainSummary]:
         # vector, so a missing key and a zero must not be different shapes.
         tier_cpu = {t: 0.0 for t in TIER_ORDER}
         tier_ram = {t: 0.0 for t in TIER_ORDER}
+        # h^m per tier: the best-fitting node, scored min(cpu/CPU_REF, ram/RAM_REF) so a
+        # node rich in one resource and starved in the other cannot win. The winner's OWN
+        # residuals are reported, so the pair always describes one real node.
+        best_fit = {t: -1.0 for t in TIER_ORDER}
+        tier_hcpu = {t: 0.0 for t in TIER_ORDER}
+        tier_hram = {t: 0.0 for t in TIER_ORDER}
         for n in nodes:
             t = InfrastructureTier(g.nodes[n]["tier"])
-            tier_cpu[t] += g.nodes[n]["cpu_residual"]
-            tier_ram[t] += g.nodes[n]["ram_residual"]
+            n_cpu = g.nodes[n]["cpu_residual"]
+            n_ram = g.nodes[n]["ram_residual"]
+            tier_cpu[t] += n_cpu
+            tier_ram[t] += n_ram
+            fit = min(n_cpu / MDO_HEADROOM_CPU_REF, n_ram / MDO_HEADROOM_RAM_REF)
+            if fit > best_fit[t]:
+                best_fit[t] = fit
+                tier_hcpu[t] = n_cpu
+                tier_hram[t] = n_ram
 
         summaries.append(DomainSummary(
             domain_id=domain_id,
@@ -115,9 +153,10 @@ def build_domain_summaries(substrate: SubstrateNetwork) -> list[DomainSummary]:
             cpu_capacity=cpu_cap,
             ram_capacity=ram_cap,
             supported_tiers=[InfrastructureTier(t) for t in unique_tiers],
-            max_node_headroom=max_node_headroom,
             tier_cpu_residual=tier_cpu,
             tier_ram_residual=tier_ram,
+            tier_max_node_cpu=tier_hcpu,
+            tier_max_node_ram=tier_hram,
         ))
 
     # Sort by canonical key: (tier_type, domain_id) — stable across state evolution
@@ -195,15 +234,18 @@ def observation_to_tensor(obs: MDOObservation, max_vnfs: int = 10) -> torch.Tens
             s.cpu_capacity / max_cpu_cap,
             s.ram_capacity / max_ram_cap,
             _TIER_ORDER.get(s.dominant_tier, 0) / TIER_INDEX_NORM,
-            s.max_node_headroom,  # h^m single-node fragmentation headroom (§M.4-Δ)
         ])
         # Per-tier residuals (§Y.1e), normalised by the SAME whole-substrate maxima
         # as the aggregates above so the two blocks are on one scale. Iterated over
         # TIER_ORDER, not over the dict, so the slot for a given tier is at a fixed
         # offset in every domain's block even when a domain lacks that tier.
+        # h^m rides on the SAME two maxima, so "this tier holds 400 CPU in total" and
+        # "its biggest free node holds 12 of them" are directly comparable numbers.
         for t in TIER_ORDER:
             parts.append(s.tier_cpu_residual.get(t, 0.0) / max_cpu_cap)
             parts.append(s.tier_ram_residual.get(t, 0.0) / max_ram_cap)
+            parts.append(s.tier_max_node_cpu.get(t, 0.0) / max_cpu_cap)
+            parts.append(s.tier_max_node_ram.get(t, 0.0) / max_ram_cap)
 
     # Inter-domain link features
     for l in obs.inter_domain_links:
@@ -219,6 +261,15 @@ def observation_to_tensor(obs: MDOObservation, max_vnfs: int = 10) -> torch.Tens
     max_ram_d = max(obs.plan.ram_demands, default=1.0) or 1.0
     max_bw_d = max(obs.plan.bw_demands, default=1.0) or 1.0
 
+    # m̃ is emitted in CANONICAL index space, the same space the policy's logits and the
+    # tier mask live in. suggested_domains holds raw domain ids; feeding those straight
+    # in would misalign the one-hot with the action whenever the canonical sort differs
+    # from the id order, which is exactly the §O.5 defect that voided the earlier
+    # agreement numbers.
+    domain_to_canonical = {s.domain_id: i for i, s in enumerate(obs.domain_summaries)}
+    n_dom = len(obs.domain_summaries)
+    suggested = list(getattr(obs.plan, "suggested_domains", None) or [])
+
     for k in range(max_vnfs):
         if k < obs.plan.num_vnfs:
             tier_idx = _TIER_ORDER.get(obs.plan.required_tiers[k], 0)
@@ -229,8 +280,14 @@ def observation_to_tensor(obs: MDOObservation, max_vnfs: int = 10) -> torch.Tens
                 obs.plan.vcrs[k],
                 obs.plan.bw_demands[k] / max_bw_d if k < len(obs.plan.bw_demands) else 0.0,
             ])
+            onehot = [0.0] * n_dom
+            if k < len(suggested):
+                c = domain_to_canonical.get(suggested[k])
+                if c is not None:
+                    onehot[c] = 1.0
+            parts.extend(onehot)
         else:
-            parts.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+            parts.extend([0.0] * (VNF_FEAT_DIM + n_dom))
 
     # Reserved feature slots (constant zero). Kept so the observation width
     # stays stable across checkpointed policies.

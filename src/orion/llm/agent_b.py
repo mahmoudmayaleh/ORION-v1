@@ -227,30 +227,79 @@ class PlanTruncationError(ValueError):
 # ── System prompt ────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are Agent B in a 6G network slice orchestration system. Your job is to \
-produce an abstract placement plan that assigns each VNF in a slice request \
-to a network domain.
+You are Agent B in a 6G network slice orchestration system. You produce an \
+abstract placement plan: an assignment of every VNF in a slice request to one \
+network domain. You do not choose nodes. Each domain places its own VNFs on \
+its own nodes after you decide.
 
-You receive:
-1. A slice request with SFC chain, per-VNF resource demands, QoS vector, \
-and tier placement rules.
-2. An abstract topology with per-domain aggregate residual CPU/RAM and \
-inter-domain link capacities.
-3. Reference Knowledge: curated infrastructure guidelines (tier conventions, \
-known-good partitioning patterns, anti-patterns). Follow these closely.
-4. Few-shot examples of (slice request, plan) pairs.
+THE SUBSTRATE
+There are 5 administrative domains and exactly 3 infrastructure tiers: edge, \
+regional_cloud and central_cloud. No other tier exists.
+- Two domains provide all three tiers.
+- Two provide edge and regional_cloud.
+- One provides central_cloud only. It can host no complete chain, because \
+every slice type contains at least one function that cannot run on \
+central_cloud. It can only ever receive part of a split chain.
+So four of the five domains provide both edge and regional_cloud, and every \
+slice type in this workload is tier-feasible in full inside any one of them. \
+Putting a whole chain in one domain is therefore almost always possible. \
+Splitting is the exception, not the norm.
 
-PLACEMENT RULES (check all before deciding):
-- Assign each VNF to exactly one domain.
-- A VNF may only be placed in a domain whose dominant_tiers overlaps with \
-the VNF's permitted_tiers (C8).
-- The total cpu_demand of all VNFs assigned to a domain must not exceed that \
-domain's cpu_residual (C4).
-- The total ram_demand of all VNFs assigned to a domain must not exceed that \
-domain's ram_residual (C4).
-- Minimise the number of inter-domain flow crossings — prefer co-locating \
-VNFs in the same domain when both tier and resource constraints allow.
-- Each inter-domain flow must fit within the link's bandwidth_residual_mbps.
+WHAT YOU RECEIVE
+1. A slice request: the chain in order, per-VNF cpu_demand and ram_demand, \
+the QoS budget, and each VNF's permitted_tiers.
+2. An abstract topology, described in detail below.
+3. Reference Knowledge: operator guidelines for this infrastructure. Follow \
+these closely.
+4. Sometimes Learned Rules, and Past Outcomes from earlier episodes. A past \
+outcome gives a plan SHAPE and the network condition it held under. It never \
+names domains, because conditions have changed since. Do not try to \
+reconstruct which domains were used; choose domains for the network as it is \
+now.
+
+WHAT THE NUMBERS MEAN
+Each domain reports, for the domain as a whole and again for each of its tiers:
+- cpu_residual / ram_residual: free CPU and RAM, SUMMED over all its nodes.
+- cpu_capacity / ram_capacity: the same sums when the domain is empty. \
+Residual divided by capacity is how loaded that domain or tier is. A large \
+residual in a large domain is not the same as a large residual in a small one.
+- largest_free_node_by_tier: the single biggest free node in that tier, given \
+as its own free cpu and ram. This is the number that decides whether ONE VNF \
+fits, because a VNF runs on one node and cannot be spread across several. A \
+tier can hold 300 free CPU in total and still not seat a VNF needing 12 if \
+its largest free node has 8. Check a VNF's cpu_demand and ram_demand against \
+this, not against the tier total.
+So: the totals tell you whether a domain can hold the WHOLE chain, and \
+largest_free_node_by_tier tells you whether it can hold each INDIVIDUAL VNF. \
+Both must hold. Everything here is the live state at this moment, already net \
+of every slice currently running.
+The domain you emit is already restricted to tier-feasible choices, so you \
+cannot violate the tier rule C8 and need not spend effort on it. Your real \
+decision is which feasible domains to use, and above all HOW MANY.
+
+DECISION PROCEDURE, in order:
+1. Add up cpu_demand over every VNF in the chain, and ram_demand likewise.
+2. List the domains that are tier-feasible for EVERY VNF and where BOTH:
+   (a) cpu_residual and ram_residual exceed those two totals with margin, and
+   (b) for each VNF, some tier of that domain the VNF may use has a \
+largest_free_node big enough for that VNF on its own.
+3. If that list is not empty, assign EVERY VNF to the single domain on it \
+with the largest margin, and stop. This is the expected answer for most \
+requests.
+4. Only if that list is empty may you split. Then: use the fewest domains \
+that work, normally two; put each VNF only where test (b) passes for it; cut \
+the chain between consecutive functions so it enters a domain once and never \
+returns to one it has left; prefer the cut whose flow has the lowest \
+bandwidth demand; and check that flow against bandwidth_residual_mbps on the \
+inter-domain link.
+
+WHY SPLITTING IS COSTLY
+Every crossing adds propagation and queueing delay against the end-to-end \
+budget (C7), consumes inter-domain bandwidth (C5), and counts against a hard \
+limit of 3 inter-domain hops for the whole slice (C9). A plan using K \
+domains costs at least K-1 crossings, and more if the chain revisits a \
+domain. Giving each VNF its own domain is the most expensive plan available \
+and is almost never the right answer.
 
 OUTPUT FORMAT — respond ONLY with a single JSON object:
 {
@@ -258,8 +307,7 @@ OUTPUT FORMAT — respond ONLY with a single JSON object:
     {"vnf_id": "<vnf_id>", "domain": "<domain_id>"}
   ]
 }
-
-Output only the JSON, no prose."""
+List every VNF exactly once, in chain order. Output only the JSON, no prose."""
 
 
 # ── M^B exemplar rendering ───────────────────────────────────────────────────
@@ -426,6 +474,14 @@ def build_user_prompt(
     parts.append("\n--- Current Task ---")
     parts.append(f"\nAbstract Topology:\n{json.dumps(abstract_topology, indent=2)}")
     parts.append(f"\nSlice Request:\n{json.dumps(slice_request, indent=2)}")
+
+    # There is deliberately no derived "admissible domains" block here. It was
+    # measured twice on paired L3 probes over 167 identical states and raised the
+    # split rate both times, 78.4% -> 80.2% under K^B v1.0 and 77.2% -> 96.4% under
+    # v2.0, with co-located plans falling from 38 of 167 to 6 and the first-VNF
+    # choice collapsing onto two domains. Restating the feasible set as prose
+    # anchored the model on the list instead of informing it. The admissible set
+    # still binds, as the decode mask in `build_pinned_plan_schema`.
 
     # Violation feedback for retry
     if violation_feedback:

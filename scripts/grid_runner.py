@@ -27,7 +27,6 @@ Approaches (monotone ablation ladder; all trained approaches share ONE curriculu
   RL-poprior  §V.2: trained selector, KL prior = partial-obs heuristic partition
               (LLM-free), beta 1->BETA_FLOOR during training; eval deterministic
               (argmax, no advice) with the SAME partial-obs m~ in the obs.
-  Prior-only  LLM shaped TRAINING (KL prior); eval = trained selector, greedy m~.
   Memory-off  LLM plan as eval prior, M^B disabled.
   Full        LLM plan + M^B (outcome-driven: selective write, violation-tagged).
 
@@ -119,7 +118,7 @@ CELLS = Path(os.environ.get("ORION_CELL_DIR", "data/grid_cells"))
 # must set ORION_CKPT_DIR to a scratch path; the default stays the real one so
 # no production invocation changes behaviour.
 CKPTS = Path(os.environ.get("ORION_CKPT_DIR", "results/wp7/ckpt_grid"))
-APPROACHES = ["Plain", "MDO-fullobs", "MDO-partial", "MDO-ffd", "RL-alone", "RL-poprior", "Prior-only", "Memory-off", "Full"]
+APPROACHES = ["Plain", "MDO-fullobs", "MDO-partial", "MDO-ffd", "RL-alone", "RL-poprior", "Memory-off", "Full"]
 # M^B capacity. Defined HERE, not inherited from r_local_runner, because this is
 # the runner that decides how much the store is asked to hold.
 #
@@ -174,14 +173,30 @@ USE_PLAN_CACHE = True
 PROFILE_SAMPLER = None
 PROFILE_DIR = Path(os.environ.get("ORION_PROFILE_DIR", "results/profile_cells"))
 MEMORY_APPROACHES = {"Full": "selective"}  # approach -> M^B write_policy
-TRAINED_APPROACHES = {"RL-alone", "RL-poprior", "Prior-only", "Memory-off", "Full"}
+TRAINED_APPROACHES = {"RL-alone", "RL-poprior", "Memory-off", "Full"}
 # Which curriculum stack each trained approach evaluates. Same mapping run_cell
 # dispatches on, named once so --eval-only can report the checkpoint per cell.
+# The ladder, by how much of the planner each approach gets.
+#
+#   RL-alone    heuristic m̃, no advising, in training and at eval. The LLM-free
+#               control: the MDO still receives a proposal, from a cheap planner.
+#   Memory-off  llm_guided: Agent B builds m̃ during training AND at eval, advising on
+#     / Full    in both. This is ORION. Full adds M^B on top of Memory-off.
+#
+# The planner is therefore in training, not only at inference, for the approaches whose
+# claim requires it, and each approach evaluates the way it trained.
+#
+# The stack this replaces, `llm_prior`, put the LLM in training as a KL TARGET and is
+# deleted. That channel was measured inert (agreement 0.007 at beta=25 on a fixed
+# stream, trained argmax worse than untrained), the teacher it distilled never
+# partitions so gating on it was circular, and swapping only those weights cost 6.35 pp
+# at L2, 7.80 at L3 and 10.10 at L4. `llm_guided` keeps the LLM in training and drops
+# only the mechanism that carried nothing.
 STACK_FOR_APPROACH = {"RL-alone": "rl_alone", "RL-poprior": "po_prior",
-                      "Prior-only": "llm_prior", "Memory-off": "llm_prior",
-                      "Full": "llm_prior"}
-# LLM advises the MDO at inference for these approaches (mode="advised"); RL-alone and
-# Prior-only stay LLM-free at inference (deterministic) to preserve the ladder.
+                      "Memory-off": "llm_guided", "Full": "llm_guided"}
+# The planner advises the MDO at inference for these approaches (mode="advised"), and
+# they are the ones that also train advised. RL-alone and RL-poprior decode
+# deterministically, in training and at eval alike.
 ADVISED_APPROACHES = {"Memory-off", "Full"}
 # §Z.1 (2026-08-06): anneals to 0. The prior term is Kickstarting-style auxiliary
 # shaping (arXiv:1803.03835: cross-entropy to the teacher on the STUDENT's own
@@ -211,27 +226,16 @@ Y_SCENARIOS = ["conventional", "complex"]
 EVAL_INSTANCE = HELDOUT_INSTANCES[0]
 VALIDATION_INSTANCES = tuple(HELDOUT_INSTANCES[1:])
 # Stack -> the approach whose eval path scores its segments on the validation
-# instances. For the LLM-free stacks this is the arm itself, so a validation
-# pass costs CPU only.
+# instances. Both stacks are LLM-free here, so the probe IS the arm itself and a
+# validation pass costs CPU only, no model calls.
 #
-# §Y.14b: `llm_prior` is ONE checkpoint sequence shared by Prior-only,
-# Memory-off and Full (TRAINED_CONFIG maps all three onto it), so
-# there is one segment to choose and three arms that would disagree about
-# which. Selecting on any single arm's advised eval privileges that arm in
-# a comparison whose entire subject is the plan source, and selecting on all
-# four is 4 x len(segments) x len(VALIDATION_INSTANCES) episodes with the
-# model in the inference loop. It is selected instead on the same LLM-free
-# probe rl_alone and po_prior use: the selection rule is then a constant
-# across the paper's table rather than a per-arm choice, it privileges none
-# of the four, and it costs no model calls. The assumption it rests on, that
-# the segment ranking under heuristic plans tracks the ranking under Agent B
-# plans, is measured once on one seed rather than asserted; see the §Y.14b
-# verification in docs/PREREG_AMENDMENT_2026-08-03_Y14.md.
+# With `llm_prior` deleted, the LLM approaches share rl_alone's checkpoint sequence
+# and therefore its selected segment. The §Y.14b proxy question, whether a segment
+# chosen on an LLM-free probe is the right one for an advised arm, no longer arises
+# as a choice between stacks: there is one policy, selected once, and the LLM
+# approaches run it. Every row in the table is selected by the same rule.
 SELECTABLE_STACKS = {"rl_alone": "RL-alone", "po_prior": "RL-poprior",
-                     "llm_prior": "RL-alone"}
-# Stacks selected on a probe that is not their own eval path. Kept explicit
-# so a reader of a banked cell can see it without re-deriving the mapping.
-PROXY_SELECTED_STACKS = {"llm_prior"}
+                     "llm_guided": "Memory-off"}
 
 
 # ── per-cell wall-clock timeout (§Y, required before the scalability axis) ────
@@ -379,6 +383,7 @@ def _wire(scenario, level_name, instance_seed):
     W.RC_FIXED_TRAIN_STREAM = True   # content-memo => ~arrivals LLM calls / segment
     W.TIER_FILTER_LLM_PLANS = True
     W.CUSTOM_PLAN_BUILDER = None
+    W.TRAIN_MDO_MODE = "sample"      # advised_sample is opt-in per curriculum config
     W.EVAL_LOAD_LEVEL = level_name   # rides into the M^B condition key (§Y.6)
 
 
@@ -511,9 +516,7 @@ def select_checkpoint(scenario, seed, config, args):
     segments = _curriculum_segments(seed, args.passes, args.train_instances)
     log.info("### §Y.14 selecting %s checkpoint (%s seed=%d): %d segments x %d "
              "validation instances, probe=%s%s", config, scenario, seed,
-             len(segments), len(VALIDATION_INSTANCES), approach,
-             " (§Y.14b PROXY: LLM-free probe, not this stack's eval path)"
-             if config in PROXY_SELECTED_STACKS else "")
+             len(segments), len(VALIDATION_INSTANCES), approach)
     t0 = time.time()
     curve = []
     for g in range(len(segments)):
@@ -531,7 +534,6 @@ def select_checkpoint(scenario, seed, config, args):
              curve[-1], 100 * (curve[best] - curve[-1]), (time.time() - t0) / 60)
     info = {"rule": "Y14_validation_selected", "prereg": "4bf325d",
             "stack": config, "selection_probe": approach,
-            "proxy_probe": config in PROXY_SELECTED_STACKS,
             "selected_segment": best, "n_segments": len(segments),
             "validation_instances": list(VALIDATION_INSTANCES),
             "validation_score": round(curve[best], 4),
@@ -546,19 +548,12 @@ def curriculum_train(scenario, seed, config, rounds, arrivals, lr, agent_b, kb, 
 
     config == "rl_alone"  -> beta=0, greedy m~, mock=True, no LLM.
     config == "po_prior"  -> §V.2: beta anneals 1->BETA_FLOOR, KL prior = the
-                             partial-obs heuristic partition (LLM-free). Same
-                             anneal as llm_prior so the ONLY difference vs the
-                             llm_prior stack is the prior's source.
+                             partial-obs heuristic partition (LLM-free).
     config == "po_warmstart" -> §W.3: beta=0 (KL channel off, it cannot align
                              anyway), m~ = partial-obs heuristic (obs features +
                              eval builder), curriculum entered from `init_from`
                              (the §V.4 BC ckpt). LLM-free. The warm-start IS the
                              guidance channel here.
-    config == "llm_prior" -> beta anneals 1->BETA_FLOOR over the WHOLE curriculum,
-                             LLM prior. §Z.1: BETA_FLOOR is 0, so the training-time
-                             coupling expires. Inference-time advising is a separate
-                             channel (ADVISED_APPROACHES + prior_weight) and is
-                             unaffected.
     `init_from`: optional ckpt path to warm-start SEGMENT 0 from (later segments
     chain as always). Returns (final_coord, final_ckpt_path).
     """
@@ -615,12 +610,44 @@ def curriculum_train(scenario, seed, config, rounds, arrivals, lr, agent_b, kb, 
             bs = 1.0 - (i * rps / total) * (1.0 - BETA_FLOOR)
             be = 1.0 - ((i + 1) * rps / total) * (1.0 - BETA_FLOOR)
             approach, mock, ab, k, ewt = "RL-alone", True, None, None, True
+        elif config == "llm_guided":
+            # ORION's stack. The planner is present in training, not only at
+            # inference, through the two channels that carry signal:
+            #   1. it builds every m̃, so the plan features, the proposal one-hot in
+            #      the observation and the substrate trajectory are all its doing;
+            #   2. advising is ON in the rollouts (`advised_sample`), so the policy
+            #      is optimised under the same biased distribution it will act with.
+            # beta stays 0. The third channel, a KL term to the proposer, is not used:
+            # measured at 0.007 agreement with beta=25 on a fixed stream, with the
+            # trained argmax worse than an untrained one. Two working channels beat
+            # three with one dead one, and its absence is stated rather than hidden.
+            W.CUSTOM_PLAN_BUILDER = None      # -> make_llm_plan_builder
+            W.RC_FIXED_TRAIN_STREAM = True    # content-memo: ~1 model call per distinct slice
+            W.TRAIN_MDO_MODE = "advised_sample"
+            bs = be = 0.0
+            approach, mock, ab, k, ewt = "LLM+RL-memoff", False, agent_b, kb, True
         else:
-            # Global linear anneal from 1.0 -> BETA_FLOOR over the whole curriculum.
-            bs = 1.0 - (i * rps / total) * (1.0 - BETA_FLOOR)
-            be = 1.0 - ((i + 1) * rps / total) * (1.0 - BETA_FLOOR)
-            approach, mock, ab, k, ewt = "LLM+RL-memoff", False, agent_b, kb, False
-        _wire(scenario, level_i, inst_i)
+            # This branch used to train `llm_prior`: Agent B in the loop as the KL
+            # TARGET. Deleted 2026-08-12; `llm_guided` above replaces it with the
+            # channels that work. A silent fallthrough would put the model back in
+            # the hot loop for whatever config was misspelled.
+            raise SystemExit(
+                f"unknown curriculum config '{config}'. Trainable stacks are "
+                "rl_alone, po_warmstart, po_prior and llm_guided.")
+        # NO second _wire() here. There was one until 2026-08-12, and because `_wire`
+        # resets the per-cell knobs it silently undid everything the branch above had
+        # just set. Measured consequences, all of which had been reported as design:
+        #   * CUSTOM_PLAN_BUILDER back to None, so rl_alone / po_prior / po_warmstart
+        #     fell through to `greedy_plan_builder` and trained on FULL-SUBSTRATE FFD
+        #     partitions while being evaluated on `partial_obs_builder`. The §X.3
+        #     "observation-legal m̃, never from a full-substrate placement" discipline
+        #     was never in force, and po_prior's KL target was not the partial-obs
+        #     heuristic it is defined as.
+        #   * RC_FIXED_TRAIN_STREAM back to True, so the stacks that ask for varied
+        #     streams got a fixed one.
+        # The failure was invisible: every run completed and produced a plausible
+        # acceptance number. `_wire` is called once, at the top of the loop, before the
+        # branch; `test_the_curriculum_branch_is_not_overwritten` pins that.
         out = W.train_approach(approach, level_i, seed, rps, arrivals, lr, bs, be, ab, k,
                           mock=mock, actors=None, entropy_schedule=(0.03, 0.01),
                           eval_with_train_builder=ewt, ckpt_path=str(ck),
@@ -680,6 +707,11 @@ def eval_plain(scenario, seed, level, instance, arrivals):
             continue
         total += 1
         sr = ev.slice_request
+        # Same sampling point as every other approach: top of the arrival, before
+        # the decision and before any allocation. Plain drives its own loop, so the
+        # EpisodeRunner's `on_arrival` hook does not reach it and the call is
+        # explicit here rather than implied.
+        cost_acc.sample_utilization()
         # Plain runs its own loop rather than the EpisodeRunner, so it inherits
         # none of the `profiled()` wraps and had no cost row at all. It is the
         # reference approach, so without one there is nothing to state the
@@ -706,8 +738,10 @@ def eval_plain(scenario, seed, level, instance, arrivals):
             # previously invisible; binned rather than dropped so the row sums.
             rejects["unattributed"] += 1
     acceptance = admitted / total if total else 0.0
+    _cost = cost_acc.summary()
+    _cost["utilization"] = cost_acc.utilization_summary()
     out = {"acceptance": round(acceptance, 4), "admitted": admitted,
-           "offered": total, "rejections": rejects, "cost": cost_acc.summary(),
+           "offered": total, "rejections": rejects, "cost": _cost,
            # Diagnostic, deliberately OUTSIDE the conserving bins: which
            # constraint the gate refused on. Plain's qos_gate column is the same
            # load-dependent model behind post_commit_c7_delay elsewhere.
@@ -850,8 +884,12 @@ def eval_nonmemory(coord, approach, scenario, seed, level, instance, arrivals, a
     elif approach in ("RL-poprior", "RL-alone"):
         # §V.2 / §X.3: eval on the SAME observation-legal m~ the approach trained on.
         pb = partial_obs_builder
-    else:  # Prior-only: trained selector, greedy m~ (LLM approach, pending re-run)
-        pb = W.greedy_plan_builder
+    else:
+        raise SystemExit(
+            f"eval_nonmemory has no plan source for approach '{approach}'. This used to "
+            "fall through to the full-substrate greedy builder for Prior-only, which "
+            "gave a partial-observability policy a full-observability plan; the arm is "
+            "deleted rather than repaired.")
     mode = "advised" if approach in ADVISED_APPROACHES else "deterministic"
     cost = {}
     rejects = {}
@@ -1187,10 +1225,10 @@ def run_cell(scenario, approach, seed, level, instance, arrivals, stacks, agent_
                 out = eval_nonmemory(stacks["rl_alone"], approach, scenario, seed, level, instance, arrivals, agent_b, kb)
             elif approach == "RL-poprior":
                 out = eval_nonmemory(stacks["po_prior"], approach, scenario, seed, level, instance, arrivals, agent_b, kb)
-            elif approach in ("Prior-only", "Memory-off"):
-                out = eval_nonmemory(stacks["llm_prior"], approach, scenario, seed, level, instance, arrivals, agent_b, kb)
+            elif approach == "Memory-off":
+                out = eval_nonmemory(stacks[STACK_FOR_APPROACH[approach]], approach, scenario, seed, level, instance, arrivals, agent_b, kb)
             else:  # Full
-                out = eval_memory(stacks["llm_prior"], MEMORY_APPROACHES[approach], scenario, seed,
+                out = eval_memory(stacks[STACK_FOR_APPROACH[approach]], MEMORY_APPROACHES[approach], scenario, seed,
                                   level, instance, arrivals, agent_b, kb, warm_arrivals,
                                   MB_MODE)
     except CellTimeout as exc:
@@ -1215,6 +1253,7 @@ def run_cell(scenario, approach, seed, level, instance, arrivals, stacks, agent_
         # cell that does not say cannot be compared with one produced under the
         # other rule, and the two differ by up to 4 pp at L2.
         _stack = STACK_FOR_APPROACH[approach]
+        out["stack"] = _stack
         out["stack_ckpt"] = stacks.get("_source", {}).get(_stack)
         out["checkpoint_selection"] = stacks.get("_selection", {}).get(_stack)
     out["wall_s"] = round(time.time() - t0, 1)
@@ -1246,10 +1285,17 @@ def get_stacks(scenario, seed, args, agent_b, kb, need):
     """
     stacks = {"_source": {}, "_selection": {}}
     eval_only = getattr(args, "eval_only", False)
-    wanted = [("rl_alone", {"RL-alone"}, "RL-alone", None, None),
-              ("po_prior", {"RL-poprior"}, "RL-poprior", None, None),
-              ("llm_prior", {"Prior-only", "Memory-off", "Full"},
-               "LLM-prior", agent_b, kb)]
+    # Derived from STACK_FOR_APPROACH rather than restated, so the two cannot
+    # disagree with the dispatch below.
+    by_stack: dict = {}
+    for _ap, _st in STACK_FOR_APPROACH.items():
+        by_stack.setdefault(_st, set()).add(_ap)
+    # `rl_alone` and `po_prior` train LLM-free, so their curricula get no agent.
+    # `llm_guided` trains WITH the planner in the loop and needs both.
+    wanted = [("rl_alone", by_stack.get("rl_alone", set()), "RL-alone", None, None),
+              ("po_prior", by_stack.get("po_prior", set()), "RL-poprior", None, None),
+              ("llm_guided", by_stack.get("llm_guided", set()), "LLM-guided",
+               agent_b, kb)]
     for key, approaches, label, ab, k in wanted:
         if not need & approaches:
             continue
@@ -1397,6 +1443,7 @@ def main():
     # Cost, re-measured 2026-08-11 off the 20 banked Memory-off cells: 2.83 s per
     # plan build, intercept ~0. The 6 s this refusal used to quote (hence 3.36 h
     # per cell, 538 h for the grid) is roughly 2x the measured figure.
+
     global USE_PLAN_CACHE
     if args.no_plan_cache:
         if CELLS == Path("data/grid_cells"):
@@ -1499,7 +1546,7 @@ def main():
              args.eval_only, args.eval_seg, CELLS,
              "Y13_final_segment" if args.final_segment else "Y14_validation_selected")
 
-    need_llm = bool(set(args.approaches) & {"Prior-only", "Memory-off", "Full"})
+    need_llm = bool(set(args.approaches) & {"Memory-off", "Full"})
     agent_b = kb = None
     if need_llm and not args.mock:
         agent_b = R._build_local_agent(args.port)
@@ -1514,8 +1561,12 @@ def main():
                        if any(not _done(scenario, a, seed, lv, inst)
                               for lv in args.levels for inst in args.eval_instances)}
             stacks = get_stacks(scenario, seed, args, agent_b, kb, pending) if pending else {}
-            # Firing order: Plain -> RL-alone -> Prior-only -> Memory-off -> Full.
-            for approach in [a for a in APPROACHES if a in args.approaches]:
+            # Firing order is the order the approaches were REQUESTED in, not the
+            # declaration order of APPROACHES. Cells are independent and banked as
+            # they complete, so on a run that may be cut short the order decides
+            # which rows exist, and that is the caller's judgement rather than an
+            # artefact of how the list happens to be written. Duplicates collapse.
+            for approach in _requested_order(args.approaches):
                 for level in args.levels:
                     for inst in args.eval_instances:
                         run_cell(scenario, approach, seed, level, inst, args.arrivals,
@@ -1524,6 +1575,16 @@ def main():
     log.info("GRID part=%s DONE in %.1f h", args.part, (time.time() - t_start) / 3600)
     _readout(args, args.levels)
     print("GRID_%s_DONE" % args.part.upper())
+
+
+def _requested_order(approaches):
+    """The requested approaches, de-duplicated, first-occurrence order preserved."""
+    seen, out = set(), []
+    for a in approaches:
+        if a not in seen:
+            seen.add(a)
+            out.append(a)
+    return out
 
 
 def _readout(args, levels):
@@ -1552,7 +1613,7 @@ def _readout_block(args, levels, title):
         hdr = f"  {'approach':11s} " + " ".join(f"{f:>12s}" for f in levels) + f" {'mean':>7s}"
         print(hdr)
         n_timeout = 0
-        for approach in [a for a in APPROACHES if a in args.approaches]:
+        for approach in _requested_order(args.approaches):
             cells_by_fam = {}
             for fam in levels:
                 vals = []

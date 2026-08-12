@@ -12,9 +12,13 @@ while building it, so none can be reintroduced silently:
 
 from __future__ import annotations
 
+import inspect
+
 import networkx as nx
 import numpy as np
 import pytest
+
+from orion.config import MDO_HEADROOM_CPU_REF, MDO_HEADROOM_RAM_REF
 
 from orion.sim.load_levels import (
     CALIBRATED_LEVELS,
@@ -301,12 +305,29 @@ def test_obs_dim_matches_the_realised_substrate():
     ADJACENCY contributes 2 entries and INTER_LINKS_PER_PAIR does not widen it. The
     Y.1e change moves L 12 -> 16 and the per-domain block 6 -> 12 (per-tier
     residuals), so obs_dim goes 121 -> 163 and every earlier checkpoint is invalid.
+
+    2026-08-11: h^m (largest single-node headroom) removed from the domain block,
+    12 -> 11, obs_dim 163 -> 158.
+
+    2026-08-12: h^m restored and generalised, per tier and as the best-fitting
+    node's own residual CPU and RAM rather than one blended ratio, so the domain
+    block carries 4 numbers per tier instead of 2 and goes 11 -> 17, obs_dim
+    158 -> 188. Every checkpoint written before this date is invalid. Two reasons
+    the removal was wrong. A domain publishing "I can seat one VNF of up to this
+    size" is advertising a capability, not its internal layout, which is what the
+    boundary argument actually forbids. And it made the comparison unequal, since
+    the full-observability baselines read node residuals directly and could always
+    answer the question h^m answers, while the partial-observability arms could not
+    even ask it. It is now published on the same surface to all three consumers of
+    the abstract view: this tensor, Agent B's topology dict, and the
+    partial-observability heuristic.
     """
     sub = generate_hierarchical_topology(0)
     n_pairs = len(build_inter_domain_links(sub))
     assert n_pairs == NUM_DOMAIN_PAIRS == 2 * len(INTER_DOMAIN_ADJACENCIES) == 16
-    assert DOMAIN_FEAT_DIM == 6 + 2 * len(TIER_ORDER) == 12
-    assert OBS_DIM == DOMAIN_FEAT_DIM * NUM_DOMAINS + 3 * n_pairs + 5 * 10 + 5 == 163
+    assert DOMAIN_FEAT_DIM == 5 + 4 * len(TIER_ORDER) == 17
+    assert OBS_DIM == (DOMAIN_FEAT_DIM * NUM_DOMAINS + 3 * n_pairs
+                       + (5 + NUM_DOMAINS) * 10 + 5) == 238
 
 
 def test_the_size_and_composition_are_constants_not_parameters():
@@ -315,7 +336,7 @@ def test_the_size_and_composition_are_constants_not_parameters():
     own results."""
     import inspect
 
-    assert (NUM_DOMAINS, TOTAL_NODES, OBS_DIM) == (5, 80, 163)
+    assert (NUM_DOMAINS, TOTAL_NODES, OBS_DIM) == (5, 80, 238)
     params = inspect.signature(generate_hierarchical_topology).parameters
     assert not {"size", "num_domains", "composition", "tiers"} & set(params)
     sub = generate_hierarchical_topology(0)
@@ -529,7 +550,7 @@ def test_observation_width_is_measured_not_declared():
         bw_demands=[f.bandwidth_demand for f in sr.flow_edges])
 
     tensor = observation_to_tensor(build_mdo_observation(sub, plan), max_vnfs=10)
-    assert tensor.shape[0] == OBS_DIM == 163
+    assert tensor.shape[0] == OBS_DIM == 238
 
 
 def test_per_tier_residuals_distinguish_domains_that_lack_a_tier():
@@ -664,3 +685,136 @@ def test_complexity_axis_varies_only_the_mix():
             f"{t.value} demand differs between levels ({a:.2f} vs {b:.2f}); the "
             f"axis is supposed to reweight types, not change them"
         )
+
+
+# --------------------------------------------------------------------------
+# The abstract surface is ONE surface (2026-08-12)
+# --------------------------------------------------------------------------
+#
+# ORION's plan layer, the RL policy and the partial-observability baseline all
+# choose between domains. If they choose on different evidence, the comparison
+# between them measures who was told more, not who planned better. Three defects
+# of exactly that kind were found on 2026-08-12: Agent B had no capacities and so
+# could not compute utilisation at all, only Agent B lacked h^m, and the LLM plan
+# builder derived a VNF's required tier alphabetically while the heuristic used
+# the modal tier, which handed the SAME policy two different action masks. These
+# guards exist so none of the three can come back quietly.
+
+def test_agent_b_sees_the_mdo_surface():
+    """Every quantity in the MDO's DomainSummary has a counterpart in Agent B's
+    abstract topology, with the same value."""
+    from orion.llm.abstract_topology import build_abstract_topology
+    from orion.mdo.observation import build_domain_summaries
+
+    sub = generate_hierarchical_topology(0)
+    summaries = {s.domain_id: s for s in build_domain_summaries(sub)}
+    topo = build_abstract_topology(sub)
+    assert len(topo["domains"]) == len(summaries) == NUM_DOMAINS
+
+    for d in topo["domains"]:
+        s = summaries[int(d["domain_id"][1:])]
+        assert d["cpu_residual"] == pytest.approx(s.cpu_residual, abs=0.1)
+        assert d["ram_residual"] == pytest.approx(s.ram_residual, abs=0.1)
+        # Capacity: absent from the view until 2026-08-12, so Agent B could not
+        # tell 500 free CPU out of 5000 from 500 out of 600, while the policy read
+        # cpu_cap_norm and the plan cache keyed on residual FRACTIONS.
+        assert d["cpu_capacity"] == pytest.approx(s.cpu_capacity, abs=0.1)
+        assert d["ram_capacity"] == pytest.approx(s.ram_capacity, abs=0.1)
+        for t in TIER_ORDER:
+            assert d["cpu_residual_by_tier"][t.value] == pytest.approx(
+                s.tier_cpu_residual[t], abs=0.1)
+            assert d["ram_residual_by_tier"][t.value] == pytest.approx(
+                s.tier_ram_residual[t], abs=0.1)
+            # h^m, per tier.
+            assert d["largest_free_node_by_tier"][t.value]["cpu"] == pytest.approx(
+                s.tier_max_node_cpu[t], abs=0.1)
+            assert d["largest_free_node_by_tier"][t.value]["ram"] == pytest.approx(
+                s.tier_max_node_ram[t], abs=0.1)
+
+    links = {(l.source_domain, l.target_domain): l
+             for l in build_inter_domain_links(sub)}
+    assert len(topo["inter_domain_links"]) == len(links)
+    for l in topo["inter_domain_links"]:
+        ref = links[(int(l["source_domain"][1:]), int(l["target_domain"][1:]))]
+        assert l["bandwidth_residual_mbps"] == pytest.approx(ref.bw_residual, abs=0.1)
+        assert l["bandwidth_capacity_mbps"] == pytest.approx(ref.bw_capacity, abs=0.1)
+
+
+def test_largest_free_node_describes_one_real_node():
+    """The reported (cpu, ram) pair must be ONE node's residuals. Taking the max of
+    each independently would advertise a node that does not exist, and the domain
+    actor would then fail to place against a summary that promised it could."""
+    from orion.mdo.observation import build_domain_summaries
+
+    sub = generate_hierarchical_topology(0)
+    for s in build_domain_summaries(sub):
+        nodes = sub.nodes_in_domain(s.domain_id)
+        for t in TIER_ORDER:
+            in_tier = [n for n in nodes if sub.graph.nodes[n]["tier"] == t.value]
+            pair = (s.tier_max_node_cpu[t], s.tier_max_node_ram[t])
+            if not in_tier:
+                assert pair == (0.0, 0.0), "an absent tier must read zero"
+                continue
+            real = {(sub.graph.nodes[n]["cpu_residual"],
+                     sub.graph.nodes[n]["ram_residual"]) for n in in_tier}
+            assert pair in real
+            # And it must be the BEST-fitting one under the frozen references.
+            best = max(min(c / MDO_HEADROOM_CPU_REF, r / MDO_HEADROOM_RAM_REF)
+                       for c, r in real)
+            assert min(pair[0] / MDO_HEADROOM_CPU_REF,
+                       pair[1] / MDO_HEADROOM_RAM_REF) == pytest.approx(best)
+
+
+def test_headroom_refs_still_bound_templates():
+    """The h^m references are frozen literals, by design, so they cannot drift with
+    the generator. That only stays safe if a template outgrowing them FAILS here:
+    a VNF larger than the reference makes the fit score exceed 1.0 and the
+    'best-fitting node' stops meaning what its docstring says."""
+    from orion.sim.slice_generator import _VNF_TEMPLATES
+
+    max_cpu = max(t["cpu"][1] for ts in _VNF_TEMPLATES.values() for t in ts)
+    max_ram = max(t["ram"][1] for ts in _VNF_TEMPLATES.values() for t in ts)
+    assert max_cpu <= MDO_HEADROOM_CPU_REF
+    assert max_ram <= MDO_HEADROOM_RAM_REF
+
+
+def test_both_plan_builders_derive_the_same_required_tier():
+    """`required_tier` is the MDO's hard action mask (USE_NODE_BASED_TIER_MASK is
+    False), so if the LLM builder and the heuristic builder compute it differently
+    the same policy gets two different action spaces and the LLM rows stop being
+    comparable with the baselines.
+
+    They did. The LLM builder used sorted(permitted_tiers)[0], alphabetically first,
+    which puts central_cloud ahead of edge and regional_cloud, so any VNF permitting
+    central_cloud at all was pinned to it. Measured over 400 L3 requests, domains
+    able to host the whole chain: 2.00 under that rule against 4.00 under the modal
+    rule for eMBB, mMTC and XR, which are 60% of arrivals.
+    """
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "scripts"))
+    import wp7_runner  # noqa: F401  (import path check only)
+    from partial_obs_prior import _required_tiers
+
+    # Comments stripped: the fix's own comment quotes the rule it replaced.
+    code = "\n".join(ln for ln in inspect.getsource(
+        wp7_runner.make_llm_plan_builder).splitlines()
+        if not ln.strip().startswith("#"))
+    assert "sorted(" not in code, (
+        "the alphabetical-tier rule is back in the LLM plan builder")
+
+    sub = generate_hierarchical_topology(0)
+    rng = np.random.default_rng(0)
+    for i in range(50):
+        sr = generate_slice_request(f"r{i}", sub, rng, arrival_time=0.0, lifetime=20.0)
+        heuristic = _required_tiers(sr, sub)
+        llm_rule = []
+        for v in sr.vnfs:
+            counts: dict = {}
+            for n in v.permitted_nodes:
+                if n in sub.graph.nodes:
+                    tt = sub.graph.nodes[n]["tier"]
+                    counts[tt] = counts.get(tt, 0) + 1
+            llm_rule.append(InfrastructureTier(max(counts, key=counts.get))
+                            if counts else InfrastructureTier.EDGE)
+        assert llm_rule == heuristic

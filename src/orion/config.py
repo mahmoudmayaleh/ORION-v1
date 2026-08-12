@@ -8,10 +8,11 @@ from pydantic import Field
 from pydantic_settings import BaseSettings
 
 # --- MDO observation reference constants (frozen pre-run; PREREG 2026-07-11 §M.4-Δ4) ---
-# Largest per-VNF demand in the training spec generator (_VNF_TEMPLATES, MediaProc upper
-# bounds cpu=(8,16), ram=(16,32)) as of 2026-07-11. FROZEN LITERALS BY DESIGN: used to
-# normalize the per-domain single-node headroom feature h^m. If the VNF templates are later
-# edited, these reference constants must NOT silently move — do not replace with a lookup.
+# Largest per-VNF demand in the slice generator (_VNF_TEMPLATES, MediaProc upper bounds
+# cpu=(8,16), ram=(16,32)). FROZEN LITERALS BY DESIGN: they pick which node a domain
+# reports as its best-fitting one (h^m, see mdo/observation.build_domain_summaries). If the
+# VNF templates are later edited these must NOT silently move, so they are not a lookup;
+# `test_headroom_refs_still_bound_templates` fails loudly if a template outgrows them.
 MDO_HEADROOM_CPU_REF: float = 16.0
 MDO_HEADROOM_RAM_REF: float = 32.0
 

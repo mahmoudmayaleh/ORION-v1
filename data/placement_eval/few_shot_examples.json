@@ -6,10 +6,10 @@
       "vnfs": [
         {"vnf_id": "urllc_factory_002_f1", "vnf_type": "Firewall",
          "cpu_demand": 2.0, "ram_demand": 2.0,
-         "permitted_tiers": ["ran_edge", "mec"], "vcr": 1.0},
+         "permitted_tiers": ["edge"], "vcr": 1.0},
         {"vnf_id": "urllc_factory_002_f2", "vnf_type": "vUPF",
          "cpu_demand": 4.0, "ram_demand": 4.0,
-         "permitted_tiers": ["ran_edge", "mec"], "vcr": 1.0}
+         "permitted_tiers": ["edge"], "vcr": 1.0}
       ],
       "flow_edges": [
         {"source_vnf": "urllc_factory_002_f1", "target_vnf": "urllc_factory_002_f2",
@@ -21,9 +21,9 @@
       "plan_id": "urllc_factory_002_plan",
       "vnf_assignments": [
         {"vnf_id": "urllc_factory_002_f1", "domain": "d0",
-         "required_tier": "ran_edge", "cpu_demand": 2.0, "ram_demand": 2.0},
+         "required_tier": "edge", "cpu_demand": 2.0, "ram_demand": 2.0},
         {"vnf_id": "urllc_factory_002_f2", "domain": "d0",
-         "required_tier": "ran_edge", "cpu_demand": 4.0, "ram_demand": 4.0}
+         "required_tier": "edge", "cpu_demand": 4.0, "ram_demand": 4.0}
       ],
       "flow_requirements": [
         {"source_vnf": "urllc_factory_002_f1", "target_vnf": "urllc_factory_002_f2",
@@ -39,10 +39,10 @@
       "vnfs": [
         {"vnf_id": "mmtc_city_003_f1", "vnf_type": "IoTGateway",
          "cpu_demand": 2.0, "ram_demand": 2.0,
-         "permitted_tiers": ["ran_edge", "mec"], "vcr": 0.3},
+         "permitted_tiers": ["edge"], "vcr": 0.3},
         {"vnf_id": "mmtc_city_003_f2", "vnf_type": "Aggregator",
          "cpu_demand": 3.0, "ram_demand": 6.0,
-         "permitted_tiers": ["mec", "regional_cloud"], "vcr": 0.5},
+         "permitted_tiers": ["edge", "regional_cloud"], "vcr": 0.5},
         {"vnf_id": "mmtc_city_003_f3", "vnf_type": "Analytics",
          "cpu_demand": 6.0, "ram_demand": 12.0,
          "permitted_tiers": ["regional_cloud", "central_cloud"], "vcr": 0.1}
@@ -59,9 +59,9 @@
       "plan_id": "mmtc_city_003_plan",
       "vnf_assignments": [
         {"vnf_id": "mmtc_city_003_f1", "domain": "d0",
-         "required_tier": "ran_edge", "cpu_demand": 2.0, "ram_demand": 2.0},
+         "required_tier": "edge", "cpu_demand": 2.0, "ram_demand": 2.0},
         {"vnf_id": "mmtc_city_003_f2", "domain": "d1",
-         "required_tier": "mec", "cpu_demand": 3.0, "ram_demand": 6.0},
+         "required_tier": "edge", "cpu_demand": 3.0, "ram_demand": 6.0},
         {"vnf_id": "mmtc_city_003_f3", "domain": "d2",
          "required_tier": "regional_cloud", "cpu_demand": 6.0, "ram_demand": 12.0}
       ],
@@ -81,10 +81,10 @@
       "vnfs": [
         {"vnf_id": "embb_stream_004_f1", "vnf_type": "Firewall",
          "cpu_demand": 2.0, "ram_demand": 2.0,
-         "permitted_tiers": ["ran_edge", "mec"], "vcr": 1.0},
+         "permitted_tiers": ["edge"], "vcr": 1.0},
         {"vnf_id": "embb_stream_004_f2", "vnf_type": "CDN",
          "cpu_demand": 4.0, "ram_demand": 8.0,
-         "permitted_tiers": ["mec", "regional_cloud"], "vcr": 0.7},
+         "permitted_tiers": ["edge", "regional_cloud"], "vcr": 0.7},
         {"vnf_id": "embb_stream_004_f3", "vnf_type": "vEPC",
          "cpu_demand": 6.0, "ram_demand": 12.0,
          "permitted_tiers": ["regional_cloud", "central_cloud"], "vcr": 1.0}
@@ -101,9 +101,9 @@
       "plan_id": "embb_stream_004_plan",
       "vnf_assignments": [
         {"vnf_id": "embb_stream_004_f1", "domain": "d1",
-         "required_tier": "mec", "cpu_demand": 2.0, "ram_demand": 2.0},
+         "required_tier": "edge", "cpu_demand": 2.0, "ram_demand": 2.0},
         {"vnf_id": "embb_stream_004_f2", "domain": "d1",
-         "required_tier": "mec", "cpu_demand": 4.0, "ram_demand": 8.0},
+         "required_tier": "edge", "cpu_demand": 4.0, "ram_demand": 8.0},
         {"vnf_id": "embb_stream_004_f3", "domain": "d2",
          "required_tier": "regional_cloud", "cpu_demand": 6.0, "ram_demand": 12.0}
       ],

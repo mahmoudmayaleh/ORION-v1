@@ -398,9 +398,35 @@ class MDOCoordinator:
             return self._sequential_argmax(obs_tensor, tier_mask, K)
 
         deterministic = mode == "deterministic"
+        # `advised_sample` is the TRAINING counterpart of `advised` (2026-08-12): the
+        # same additive bias on the decision logits, but sampled rather than argmaxed
+        # and with gradient retained.
+        #
+        # It is not a trick to explore better. The advised policy
+        #   pi_advised(a|s) = softmax(raw(s) + w * prior(s))
+        # is the policy that will act at evaluation, so it is the one that must be
+        # optimised. `w * prior` is a fixed shift with no parameters of its own, so
+        # the gradient flows through `raw` exactly as before and PPO's ratio is taken
+        # between two advised distributions, which is what makes the update valid.
+        # Training on the UNadvised policy and evaluating on the advised one would
+        # optimise a distribution nothing ever samples from.
+        advised_sample = mode == "advised_sample"
+        prior_logits = None
+        if advised_sample:
+            domain_to_canonical = (
+                {d: i for i, d in enumerate(canonical_to_domain)}
+                if canonical_to_domain else {})
+            prior_logits = torch.zeros(K, M)
+            for k, d in enumerate(plan.suggested_domains[:K]):
+                c = domain_to_canonical.get(d, d)
+                if 0 <= c < M:
+                    prior_logits[k, c] = 1.0
+
         with torch.no_grad() if deterministic else torch.enable_grad():
             partition, log_probs, logits, entropy = self.policy(
                 obs_tensor, tier_mask, K, deterministic=deterministic,
+                prior_logits=prior_logits,
+                prior_weight=ADVISE_WEIGHT if advised_sample else 0.0,
             )
             value = self.policy.get_value(obs_tensor).item()
 

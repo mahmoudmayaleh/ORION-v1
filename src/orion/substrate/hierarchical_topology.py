@@ -193,14 +193,14 @@ NUM_DOMAIN_PAIRS = 2 * len(INTER_DOMAIN_ADJACENCIES)                  # 16
 #: owns the layout, and a second definition here would be a number that must agree
 #: with the emitter and would fail silently if it ever stopped agreeing.
 NUM_TIERS = len(TIER_ORDER)
-DOMAIN_FEAT_DIM = _DOMAIN_FEAT_DIM                                    # 12
+DOMAIN_FEAT_DIM = _DOMAIN_FEAT_DIM                                    # 17
 
 #: MDO observation width at this substrate. Constant across every §Y cell.
 MAX_VNFS = 10
 OBS_DIM = (DOMAIN_FEAT_DIM * NUM_DOMAINS
            + 3 * NUM_DOMAIN_PAIRS
-           + 5 * MAX_VNFS
-           + 5)                                                       # 163
+           + (5 + NUM_DOMAINS) * MAX_VNFS   # per-VNF features + one-hot of m̃_k
+           + 5)                                                       # 238
 
 # The adjacency list is written down explicitly, so it must name real domains and
 # contain no duplicate or self adjacency. A silent bad entry would be dropped by

@@ -45,7 +45,7 @@ import approach_runner as R  # domain-parse + AgentB/K^B/M^B setup + ceiling
 from orion.actors.greedy_domain_actor import GreedyDomainActor
 from orion.baselines.greedy_ffd import _run_greedy_ffd, GreedyConfig
 from orion.llm.condition_signature import compute_condition_signature
-from orion.mdo.coordinator import MDOConfig, MDOCoordinator
+from orion.mdo.coordinator import ADVISE_WEIGHT, MDOConfig, MDOCoordinator
 from orion.mdo.kl_prior import analytical_kl, build_prior_logits, beta_schedule
 from orion.mdo.observation import (
     build_domain_summaries,
@@ -153,6 +153,12 @@ AUTOREG_PRIOR_TEMP = 0.3       # §U.1e committed: peak logit 3.33 on m̃[k] per
 # §U.1h: optional custom plan builder (sr, substrate)->PlanSummary|None, overrides the
 # LLM/greedy m̃ source. Used to inject a GOOD prior (Plain's partition). None = off.
 CUSTOM_PLAN_BUILDER = None
+
+# MDO decode mode for TRAINING rollouts (2026-08-12). "sample" is the unadvised policy.
+# "advised_sample" adds the proposer's bias to the decision logits before sampling, and
+# is what the LLM-guided stack trains under, so the distribution being optimised is the
+# one that will act at evaluation. Set per curriculum config; reset by grid_runner._wire.
+TRAIN_MDO_MODE = "sample"
 
 # §W.1 (2026-07-25): advantage construction for the MDO update. §V.4 (BCD1)
 # confirmed the stream-GAE update destroys a known-good policy: with the whole
@@ -412,10 +418,26 @@ def make_llm_plan_builder(agent_b, kb, mb_getter):
             if d is None or d not in valid_domains:
                 return None
             suggested.append(d)
-            # required tier: prefer the tier the LLM/vnf implies; fall back to a
-            # permitted tier so the tier mask stays feasible.
-            perm = sorted({g.nodes[n]["tier"] for n in v.permitted_nodes if n in g.nodes})
-            tiers.append(InfrastructureTier(perm[0]) if perm else InfrastructureTier.EDGE)
+            # Required tier: the MODAL tier of the VNF's permitted nodes, which is
+            # exactly what partial_obs_prior._required_tiers gives the heuristic
+            # builder. This field becomes the MDO's hard action mask via
+            # build_tier_masks (USE_NODE_BASED_TIER_MASK is False), so if the two
+            # plan sources compute it differently the same policy gets two
+            # different action spaces and the comparison stops being about plans.
+            #
+            # It used to be sorted(...)[0], i.e. alphabetically first, which puts
+            # central_cloud ahead of edge and regional_cloud. Any VNF permitting
+            # central_cloud at all was pinned to it, including eMBB's Firewall,
+            # which permits all three. Measured 2026-08-12 over 400 L3 requests:
+            # eMBB, mMTC and XR could co-locate in 2.00 domains under that rule
+            # against 4.00 under the modal rule, on 60% of arrivals.
+            counts: dict[str, int] = {}
+            for n in v.permitted_nodes:
+                if n in g.nodes:
+                    t = g.nodes[n]["tier"]
+                    counts[t] = counts.get(t, 0) + 1
+            tiers.append(InfrastructureTier(max(counts, key=counts.get)) if counts
+                         else InfrastructureTier.EDGE)
         return PlanSummary(
             vnf_ids=[v.vnf_id for v in slice_req.vnfs],
             required_tiers=tiers, suggested_domains=suggested,
@@ -560,22 +582,34 @@ def _eval_episode(coord, fam_name, seed, arrivals, delays, plan_builder=None,
     runner = EpisodeRunner(sub, ap, coord, delays,
                            plan_builder=plan_builder or greedy_plan_builder)
     runner.on_decision = EVAL_ON_DECISION
+    # Occupancy is a property of the trajectory, so the accumulator has to exist
+    # BEFORE the episode and sample during it. The per-admission rows below are
+    # still filled afterwards from mdo_results, as they always were.
+    acc = None
+    if cost_out is not None:
+        try:
+            from cost_metrics import CostAccumulator
+            acc = CostAccumulator(sub)
+            runner.on_arrival = acc.sample_utilization
+        except Exception:  # noqa: BLE001 -- instrumentation must never break eval
+            acc = None
     runner.reset()
     ep = runner.run_episode(mdo_mode=mode)
     adm = ep.stats.admitted
     if cost_out is not None:
         try:
-            from cost_metrics import CostAccumulator
+            if acc is None:
+                raise RuntimeError("accumulator unavailable")
             sr_by_rid = {ev.slice_request.request_id: ev.slice_request
                          for ev in ap.events
                          if ev.event_type == EventType.ARRIVAL
                          and ev.slice_request is not None}
-            acc = CostAccumulator(sub)
             for res in ep.mdo_results:
                 sr = sr_by_rid.get(res.request_id)
                 if res.admitted and sr is not None:
                     acc.add_mdo(sr, res)
             cost_out.update(acc.summary())
+            cost_out["utilization"] = acc.utilization_summary()
         except Exception:  # noqa: BLE001 -- secondary instrumentation must never break eval
             cost_out.setdefault("n_admitted", None)
     # m~-agreement (fifth-degenerate check, PREREG 5I): fraction of committed per-VNF domain
@@ -987,7 +1021,7 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
             reward_weights=RewardWeights(lambda_viol=REWARD_LAMBDA_VIOL))
         runner._cap_max_arrivals = arrivals
         runner.reset()
-        ep = runner.run_episode(mdo_mode="sample")
+        ep = runner.run_episode(mdo_mode=TRAIN_MDO_MODE)
         cumulative_arrivals += ep.stats.total_arrivals
 
         # Training-time behavioral trace (§N.2): append this round's per-arrival
@@ -1090,8 +1124,25 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
                         action_i = torch.tensor(buffer.mdo_actions[i], dtype=torch.long)
                         tm_i = buffer.mdo_tier_masks[i]
                         adv_i = float(advantages[i]) if i < len(advantages) else 0.0
+                        # The rollout was sampled from the ADVISED policy when the
+                        # stack trains advised, so the recomputation must include the
+                        # same bias or the ratio compares two different policies. The
+                        # advisory term carries no parameters, so the gradient is
+                        # unchanged; what changes is which distribution it belongs to.
+                        pri_i = None
+                        if TRAIN_MDO_MODE == "advised_sample" and i < len(suggested_list):
+                            sug_i = suggested_list[i]
+                            if sug_i and len(sug_i) == k:
+                                sc = [domain_to_canonical.get(d) for d in sug_i]
+                                if all(c is not None for c in sc):
+                                    pri_i = torch.zeros(k, num_domains)
+                                    for j, c in enumerate(sc):
+                                        if 0 <= c < num_domains:
+                                            pri_i[j, c] = 1.0
                         new_lp, new_ent, new_logits = policy.evaluate_actions(
-                            obs_i, tm_i, action_i, k)
+                            obs_i, tm_i, action_i, k,
+                            prior_logits=pri_i,
+                            prior_weight=ADVISE_WEIGHT if pri_i is not None else 0.0)
                         ratio = torch.exp(new_lp.sum() - buffer.mdo_log_probs[i].sum())
                         step_loss = -torch.min(
                             ratio * adv_i,
@@ -1227,8 +1278,14 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
             _measured_entropy = mdo_entropy
 
         eval_support = {}
+        # The per-round eval decodes the way the stack will be USED: advised for the
+        # advised stack, deterministic otherwise. This curve is what §Y.14 selects a
+        # checkpoint on, so scoring an advised stack unadvised would select on a
+        # policy nobody runs.
         foc, eadm, etot, magree = eval_acceptance(coord, fam_name, seed, arrivals, delays,
                                            plan_builder=eval_pb,
+                                           mode=("advised" if TRAIN_MDO_MODE == "advised_sample"
+                                                 else "deterministic"),
                                            agree_out=eval_support)
         curve.append({
             "round": rnd + 1, "cumulative_arrivals": cumulative_arrivals,

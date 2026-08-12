@@ -3,14 +3,14 @@
     {
       "domain_id": "d0",
       "label": "RAN/Edge",
-      "dominant_tiers": ["ran_edge", "mec"],
+      "dominant_tiers": ["edge"],
       "cpu_residual": 12.0,
       "ram_residual": 24.0
     },
     {
       "domain_id": "d1",
       "label": "MEC/Regional",
-      "dominant_tiers": ["mec", "regional_cloud"],
+      "dominant_tiers": ["edge", "regional_cloud"],
       "cpu_residual": 25.0,
       "ram_residual": 60.0
     },

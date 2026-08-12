@@ -3,80 +3,80 @@
     "topic": "Infrastructure tier definitions and resource profiles",
     "slice_type_tag": "all",
     "topology_tag": "all",
-    "content": "The operator network defines four infrastructure tiers. ran_edge: 8-16 vCPU, 16-32 GB RAM, propagation delay to UE < 1 ms, intended for lightweight latency-critical functions (Firewall, vUPF, IoTGateway). mec: 16-32 vCPU, 32-128 GB RAM, 1-3 ms from ran_edge, general-purpose mid-tier for CDN, Aggregator, V2XController and overflow from ran_edge. regional_cloud: 32-64 vCPU, 128-256 GB RAM, 3-8 ms from mec, hosts compute-heavy functions (vEPC, Analytics, MediaProc). central_cloud: 64+ vCPU, 256+ GB RAM, 5-15 ms from regional_cloud, last resort for delay-tolerant heavy workloads. Inter-domain hop delays are cumulative along the SFC path.",
-    "version": "1.0",
+    "content": "The operator network defines THREE infrastructure tiers, and these are the only tier names that appear in dominant_tiers or permitted_tiers. edge: 8-32 vCPU, 16-128 GB RAM, 0.5-1.0 ms processing delay. This is a merged access/MEC tier, so it spans both small cell-site hosts and larger MEC hosts, and the spread within the tier is real heterogeneity. It carries the latency-critical functions (Firewall, vUPF, IoTGateway, V2XController). regional_cloud: 32-48 vCPU, 128-192 GB RAM, 1.0-2.5 ms processing delay, aggregation-layer compute for vEPC, Analytics, MediaProc and CDN. central_cloud: 48-64 vCPU, 192-256 GB RAM, 1.5-3.0 ms processing delay, for delay-tolerant heavy workloads only. There is no ran_edge tier and no mec tier. If you are looking for either, you want edge. A single inter-domain hop adds 0.5-2.0 ms of propagation, and hop delays accumulate along the chain.",
+    "version": "2.0",
     "author": "operator"
   },
   {
     "topic": "Standard VNF families — resource demands and VCR",
     "slice_type_tag": "all",
     "topology_tag": "all",
-    "content": "Firewall: 1-2 vCPU, 1-2 GB RAM, VCR=1.0 (pass-through). vUPF: 2-4 vCPU, 2-4 GB RAM, VCR=1.0. IoTGateway: 1-2 vCPU, 1-2 GB RAM, VCR=0.3 (protocol aggregation compresses 70%). Aggregator: 2-4 vCPU, 4-8 GB RAM, VCR=0.5 (data reduction). CDN: 2-4 vCPU, 4-8 GB RAM, VCR=0.7 (caching reduces 30%). MediaProc: 8-16 vCPU, 16-32 GB RAM, VCR=1.2 (transcoding expands 20%). Analytics: 4-8 vCPU, 8-16 GB RAM, VCR=0.1 (outputs summaries). V2XController: 2-4 vCPU, 4-8 GB RAM, VCR=0.8. vEPC: 4-8 vCPU, 8-16 GB RAM, VCR=1.0. Per-edge bandwidth is computed as beta_min * product of upstream VCRs.",
-    "version": "1.0",
+    "content": "VNF families, with the CPU and RAM ranges they are drawn from and the tiers they permit. Firewall: 1-4 vCPU, 1-8 GB, vcr 1.0; permitted tiers depend on the slice type, edge-only for URLLC, V2X and XR, all three tiers for eMBB. vUPF: 2-4 vCPU, 2-8 GB, vcr 1.0, edge only. IoTGateway: 1-2 vCPU, 1-4 GB, vcr 0.3, edge only. V2XController: 2-4 vCPU, 4-8 GB, vcr 1.0, edge only. Aggregator: 2-4 vCPU, 2-8 GB, vcr 0.5, edge or regional_cloud. CDN: 4-8 vCPU, 8-16 GB, vcr 0.7; edge or regional_cloud in eMBB, regional_cloud or central_cloud in XR. MediaProc: 8-16 vCPU, 16-32 GB, vcr 1.2, edge or regional_cloud. This is the largest single demand in the workload. Analytics: 4-8 vCPU, 8-16 GB, vcr 1.0, regional_cloud or central_cloud. vEPC: 2-8 vCPU, 2-16 GB, vcr 1.0; regional_cloud or central_cloud in eMBB, regional_cloud only in V2X, edge or regional_cloud in XR. Read permitted_tiers from the request rather than from this list: the same family carries different tier rules in different slice types.",
+    "version": "2.0",
     "author": "operator"
   },
   {
     "topic": "URLLC ultra-low latency placement rules",
     "slice_type_tag": "URLLC",
     "topology_tag": "all",
-    "content": "URLLC slices require end-to-end latency below 5 ms. Firewall and vUPF must be placed at ran_edge to minimise propagation delay to the UE. When possible, co-locate all URLLC VNFs within the same ran_edge domain to eliminate inter-domain hop latency (each hop adds 2-5 ms). Never place latency-critical URLLC VNFs beyond the mec tier. If two consecutive URLLC VNFs cannot share the same domain, verify that the inter-domain link propagation delay fits within the remaining latency budget. A ran_edge domain pair hop is 2 ms; ran_edge to mec is acceptable for URLLC only when the chain budget allows.",
-    "version": "1.0",
+    "content": "URLLC is a 2-VNF chain, Firewall then vUPF, both edge only, with an end-to-end budget of 1-10 ms and an ingress rate of 10-50 Mbps. Both functions permit the same single tier, so ANY domain holding edge can host the whole chain, and four of the five domains do. Co-locate. Splitting a URLLC chain puts a 0.5-2.0 ms propagation hop plus queueing into a budget that can be as tight as 1 ms, and it buys nothing, because the two functions compete for the same tier in either case. Demands are small, 1-4 vCPU per function, so capacity is rarely the binding constraint. Choose the edge-capable domain with the most residual CPU.",
+    "version": "2.0",
     "author": "operator"
   },
   {
     "topic": "eMBB throughput optimisation and co-location patterns",
     "slice_type_tag": "eMBB",
     "topology_tag": "all",
-    "content": "eMBB slices prioritise high throughput over latency. CDN VNFs (VCR=0.7) should be co-located with upstream Firewall VNFs in the mec tier to avoid crossing a high-bandwidth inter-domain link with the full pre-CDN traffic volume. MediaProc (VCR=1.2) expands traffic by 20% and should be placed at mec or regional_cloud where RAM is abundant (16-32 GB). vEPC belongs at regional_cloud or central_cloud. For eMBB, co-locating Firewall and CDN in the same mec domain eliminates the high-bandwidth f1→f2 inter-domain flow. The expanded downstream traffic from MediaProc must be verified against the downstream link residual.",
-    "version": "1.0",
+    "content": "eMBB is a 3-VNF chain, Firewall (edge, regional_cloud or central_cloud) then CDN (edge or regional_cloud) then vEPC (regional_cloud or central_cloud), with a 20-100 ms budget and the joint-highest ingress rate, 50-500 Mbps. Any domain holding both edge and regional_cloud covers all three functions: put Firewall and CDN on edge or regional, and vEPC on regional. Co-location is always tier-feasible on such a domain. The delay budget is loose enough that a split would not violate C7, but eMBB carries the heaviest flows, so every crossing consumes inter-domain bandwidth in proportion to a 50-500 Mbps ingress rate and spends the hop budget C9. Split only when no single domain has the residual CPU for all three. CDN is the largest demand at 4-8 vCPU, so it decides which domains qualify.",
+    "version": "2.0",
     "author": "operator"
   },
   {
     "topic": "Multi-domain placement anti-patterns",
     "slice_type_tag": "all",
     "topology_tag": "all",
-    "content": "Avoid the following anti-patterns: (1) Splitting consecutive high-bandwidth VNFs across domains when the link residual is insufficient — verify the aggregate min_bandwidth_mbps for all flows on each directed link before committing. (2) Placing a VNF in a domain that supports none of its permitted_tiers — always check that at least one permitted_tier is in the domain's dominant_tiers. (3) Placing latency-critical functions (vUPF, Firewall for URLLC) beyond the mec tier. (4) Marking crosses_domain_boundary=False when source and target VNFs are assigned to different domains. (5) Assigning more CPU or RAM to a domain than its residual capacity allows (C4 violation).",
-    "version": "1.0",
+    "content": "Anti-pattern 1, splitting by default. Assigning each VNF to a different domain is the single most common failure. Every crossing costs propagation, consumes inter-domain bandwidth, and spends the hop budget C9, and in this substrate it is almost never required: all five chain templates fit inside any domain holding both edge and regional_cloud. Start from co-location and split only when a stated constraint forbids it. Anti-pattern 2, inventing a tier. If a function's permitted_tiers names a tier you cannot find in any domain, re-read the list; the tiers are edge, regional_cloud and central_cloud, and nothing else exists. Anti-pattern 3, sending a chain to the central-cloud-only domain. That domain holds no edge and no regional_cloud, and every chain template contains at least one function permitting neither central_cloud nor anything it has, so it can host no complete chain. It can only ever receive a fragment. Anti-pattern 4, reading aggregate residual as a guarantee. cpu_residual is the domain total. It says nothing about how that capacity is distributed across nodes, so a domain with ample total residual can still fail to seat a single large VNF such as MediaProc.",
+    "version": "2.0",
     "author": "operator"
   },
   {
     "topic": "mMTC IoT placement and traffic aggregation",
     "slice_type_tag": "mMTC",
     "topology_tag": "all",
-    "content": "mMTC slices are delay-tolerant (max E2E delay 100-1000 ms) but handle massive device counts. IoTGateway (VCR=0.3) compresses 70% of incoming traffic and should be placed at ran_edge. Aggregator (VCR=0.5) further reduces traffic and belongs at mec or regional_cloud. Analytics (VCR=0.1) produces summary data and can reside at regional_cloud or central_cloud. Multi-domain chaining is acceptable for mMTC. The dramatic traffic reduction across the chain (beta_min -> 0.3*beta_min -> 0.15*beta_min after IoTGateway and Aggregator) means inter-domain link bandwidth is rarely the bottleneck for mMTC.",
-    "version": "1.0",
+    "content": "mMTC is a 3-VNF chain, IoTGateway (edge only) then Aggregator (edge or regional_cloud) then Analytics (regional_cloud or central_cloud), with the loosest budget in the workload, 50-500 ms, and the lightest ingress rate, 1-10 Mbps. Any domain holding both edge and regional_cloud covers the chain: IoTGateway on edge, Aggregator on either, Analytics on regional. Co-locate. The loose budget means a split will not fail C7, but it still spends hops and inter-domain bandwidth for no gain, since the traffic is tiny and the chain fits. Split only under capacity pressure. The chain compresses hard, vcr 0.3 at the gateway and 0.5 at the aggregator, so flows downstream of the gateway are a small fraction of ingress. Bandwidth is never the binding constraint for mMTC.",
+    "version": "2.0",
     "author": "operator"
   },
   {
     "topic": "XR immersive media placement rules",
     "slice_type_tag": "XR",
     "topology_tag": "all",
-    "content": "XR slices require end-to-end latency below 20 ms for comfortable telepresence. Place Firewall at ran_edge or mec. MediaProc (VCR=1.2, 8-16 vCPU, 16-32 GB RAM) expands traffic and should be placed at mec or regional_cloud. CDN (VCR=0.7, 2-4 vCPU, 4-8 GB RAM) reduces downstream traffic by 30% and can be co-located with MediaProc in mec or regional_cloud. vEPC belongs at regional_cloud or central_cloud. For a 4-VNF chain spanning d0->d1->d2, cumulative propagation delay is d0->d1 (2 ms) + d1->d2 (5 ms) = 7 ms, leaving 13 ms for intra-domain processing within a 20 ms budget.",
-    "version": "1.0",
+    "content": "XR is the longest chain, 4 VNFs: Firewall (edge) then MediaProc (edge or regional_cloud) then CDN (regional_cloud or central_cloud) then vEPC (edge or regional_cloud). Budget 5-30 ms, ingress 100-500 Mbps. Any domain holding both edge and regional_cloud covers all four: Firewall on edge, MediaProc on either, CDN on regional, vEPC on either. Co-location is tier-feasible, and with a budget as tight as 5 ms it is what the delay constraint wants. The user-plane function stays at the edge or regional cloud deliberately. XR cannot be served from the central cloud: motion-to-photon is about 20 ms and render plus round trip already consumes most of it. Capacity, not tiers, is what splits XR. MediaProc alone draws 8-16 vCPU and 16-32 GB, the largest demand in the workload, so at high load it is often the one function that does not fit. If the chain must split, move MediaProc alone and keep the other three together, rather than scattering all four.",
+    "version": "2.0",
     "author": "operator"
   },
   {
     "topic": "V2X vehicular latency and reliability requirements",
     "slice_type_tag": "V2X",
     "topology_tag": "all",
-    "content": "V2X slices require URLLC-class reliability and latency below 5 ms. V2XController (VCR=0.8, 2-4 vCPU, 4-8 GB RAM) must be placed at mec or ran_edge to ensure sub-3 ms round-trip to the vehicle. Firewall for V2X should be at ran_edge. Never place V2XController at regional_cloud or central_cloud due to propagation latency. Co-locating V2XController with vUPF in the same mec domain eliminates inter-domain latency on the critical control path. V2X control plane traffic is compact and latency-sensitive; data plane offload to regional_cloud is acceptable only for delay-tolerant analytics.",
-    "version": "1.0",
+    "content": "V2X is a 3-VNF chain, Firewall (edge only) then V2XController (edge only) then vEPC (regional_cloud only), with a 5-20 ms budget and 20-80 Mbps ingress. Every function permits exactly one tier, so the chain needs a domain holding BOTH edge and regional_cloud, and four of the five domains do. On any of them the whole chain is tier-feasible: Firewall and V2XController on edge, vEPC on regional. Co-locate. Do not split this chain on tier grounds. The two edge functions must share a tier in any case, and the one regional function is available in the same domain, so a split adds propagation and hop cost against a 5 ms floor while changing nothing about feasibility. Demands are modest, 1-4 vCPU per function, so V2X fits wherever both tiers are present unless the domain is close to saturated.",
+    "version": "2.0",
     "author": "operator"
   },
   {
     "topic": "VNF co-location heuristics for resource efficiency",
     "slice_type_tag": "all",
     "topology_tag": "all",
-    "content": "Co-locate consecutive VNFs in the same domain when: (1) the flow bandwidth between them is high (> 200 Mbps) and crossing the domain boundary would consume significant link residual; (2) both VNFs share at least one permitted_tier with the domain's dominant_tiers; (3) the domain has sufficient residual CPU and RAM for both VNFs combined. Split across domains when: (1) the domain lacks sufficient resources for both; (2) one VNF has a strict tier requirement incompatible with the other (e.g., vEPC requires regional_cloud while Firewall requires ran_edge/mec); (3) distributing load across domains improves admission probability for future slices.",
-    "version": "1.0",
+    "content": "Decide in this order. Step 1, list the domains that are tier-feasible for EVERY function in the chain, by intersecting each permitted_tiers against each domain's dominant_tiers. Step 2, of those, keep the ones whose cpu_residual and ram_residual each exceed the TOTAL demand of the whole chain. Step 3, if that set is non-empty, assign every function to one member of it, preferring the one with the most residual headroom. This is the normal case in this substrate and it should be the outcome for the large majority of requests. Step 4, only if that set is empty, split. Use as few domains as the constraints allow, keep consecutive functions in the chain together so that the number of crossings stays at the minimum, and prefer adjacent domains with the largest bandwidth_residual_mbps between them. A chain split across d domains costs d-1 crossings at minimum, and only if the split respects chain order. Scattering functions so that the chain crosses back and forth costs more crossings than the number of domains used.",
+    "version": "2.0",
     "author": "operator"
   },
   {
     "topic": "Bandwidth planning using VCR chain product",
     "slice_type_tag": "all",
     "topology_tag": "all",
-    "content": "Per-edge bandwidth on the SFC chain equals beta_min multiplied by the product of VCR values of all upstream VNFs. Example for chain Firewall(VCR=1.0) -> MediaProc(VCR=1.2) -> CDN(VCR=0.7) -> vEPC(VCR=1.0) with beta_min=300 Mbps: edge f1->f2: 300*1.0=300 Mbps; edge f2->f3: 300*1.0*1.2=360 Mbps (MediaProc transcoding expands traffic); edge f3->f4: 300*1.0*1.2*0.7=252 Mbps (CDN caching reduces traffic). Each cross-domain flow's min_bandwidth_mbps must be set to the VCR-computed value. Aggregate all flows on a directed inter-domain link and verify the total does not exceed the link's bandwidth_residual_mbps.",
-    "version": "1.0",
+    "content": "The flow demand on the edge leaving function k is the ingress rate multiplied by the product of the VCRs of every function up to and including k. VCR above 1.0 expands the flow, below 1.0 compresses it. Consequences for where to cut a chain if it must be split. In mMTC the gateway compresses to 0.3 and the aggregator to 0.5, so any crossing after the first is cheap. In eMBB the CDN compresses to 0.7, so a crossing after the CDN costs less than one before it. In XR MediaProc EXPANDS to 1.2 and the ingress rate is already 100-500 Mbps, so a crossing immediately after MediaProc is the most expensive cut available and should be the last one considered. In URLLC and V2X every VCR is 1.0, so all cuts cost the same and the choice is decided by delay instead. Check the chosen crossing against bandwidth_residual_mbps on the inter-domain link, and remember that the flow demands stated in the request already have the VCR product applied.",
+    "version": "2.0",
     "author": "operator"
   }
 ]

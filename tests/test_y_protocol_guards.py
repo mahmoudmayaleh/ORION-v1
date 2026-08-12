@@ -9,6 +9,7 @@ later. That is the class of defect §Y has been paying for repeatedly.
 
 from __future__ import annotations
 
+import inspect
 import sys
 from pathlib import Path
 
@@ -89,9 +90,8 @@ def test_selection_is_the_default_and_the_old_readout_is_the_opt_out():
 
 def test_a_stack_with_no_registered_probe_is_refused():
     """Picking a selection probe silently would make an arm's meaning depend on
-    an undocumented choice. §Y.14b registers `llm_prior`; anything else is still
-    refused rather than defaulted."""
-    assert set(G.SELECTABLE_STACKS) == {"rl_alone", "po_prior", "llm_prior"}
+    an undocumented choice. Anything unregistered is refused, not defaulted."""
+    assert set(G.SELECTABLE_STACKS) == {"rl_alone", "po_prior", "llm_guided"}
 
     args = type("A", (), {"passes": 1, "train_instances": None, "lr": 3e-3,
                           "arrivals": 2000, "eval_seg": None,
@@ -100,19 +100,50 @@ def test_a_stack_with_no_registered_probe_is_refused():
         G.select_checkpoint("conventional", 42, "not_a_registered_stack", args)
 
 
-def test_llm_prior_is_selected_on_the_registered_llm_free_probe():
-    """§Y.14b: one checkpoint sequence serves Prior-only, Memory-off and Full,
-    so selecting it on any one arm's advised eval would privilege that
-    arm in a comparison whose subject is the plan source. It is selected on the
-    LLM-free probe instead, and the artefact has to say so."""
-    assert G.SELECTABLE_STACKS["llm_prior"] == "RL-alone"
-    assert G.PROXY_SELECTED_STACKS == {"llm_prior"}
-    # The three arms that share the stack, so the "one sequence" premise cannot
-    # drift without this failing.
-    shared = {a for a, c in G.STACK_FOR_APPROACH.items() if c == "llm_prior"}
-    assert shared == {"Prior-only", "Memory-off", "Full"}
-    # A proxy-selected stack must not be selected on its own advised eval.
-    assert G.SELECTABLE_STACKS["llm_prior"] not in G.ADVISED_APPROACHES
+def test_orion_trains_with_the_planner_in_the_loop():
+    """ORION's claim is that the planner guides LEARNING, not only inference, so its
+    stack must train with the planner present. Pinned because the planner reached the
+    policy through three channels historically and only two carry signal: the plan it
+    builds during the curriculum, and advising applied inside the training rollouts."""
+    assert G.STACK_FOR_APPROACH["Memory-off"] == "llm_guided"
+    assert G.STACK_FOR_APPROACH["Full"] == "llm_guided"
+    # The LLM-free control stays on the unadvised stack.
+    assert G.STACK_FOR_APPROACH["RL-alone"] == "rl_alone"
+    # `Prior-only` is deleted. It meant "the KL prior shaped training, the planner is
+    # absent at eval"; with no KL channel it named a policy trained on
+    # partial-observability heuristic plans and scored on full-observability greedy
+    # ones, with no planner anywhere. Nothing may reintroduce it silently.
+    assert "Prior-only" not in G.APPROACHES
+    assert "Prior-only" not in G.STACK_FOR_APPROACH
+
+    src = inspect.getsource(G.curriculum_train)
+    assert "unknown curriculum config" in src, "no refusal on an unknown config"
+    assert 'W.TRAIN_MDO_MODE = "advised_sample"' in src, (
+        "llm_guided must train under the advised distribution it evaluates under")
+    # Comments stripped: the branch's own comment explains the KL term it omits.
+    branch = "\n".join(ln for ln in src.split('config == "llm_guided"')[1]
+                       .split("else:")[0].splitlines()
+                       if not ln.strip().startswith("#"))
+    assert "bs = be = 0.0" in branch, "llm_guided must hold beta at zero"
+    assert "BETA_FLOOR" not in branch, "llm_guided must not anneal a KL term"
+
+
+def test_an_advised_stack_is_selected_and_scored_advised():
+    """A checkpoint chosen by scoring the policy in a decode mode it never runs in is
+    chosen for the wrong policy. The per-round curve §Y.14 selects on must therefore
+    decode the way the stack will be used."""
+    assert G.SELECTABLE_STACKS["llm_guided"] == "Memory-off"
+    assert G.SELECTABLE_STACKS["llm_guided"] in G.ADVISED_APPROACHES
+    import wp7_runner as W
+    src = inspect.getsource(W.train_approach)
+    assert 'mode=("advised" if TRAIN_MDO_MODE == "advised_sample"' in src
+
+
+def test_the_training_decode_mode_is_reset_per_cell():
+    """`TRAIN_MDO_MODE` is module state on wp7_runner. Left set, the next stack in the
+    same process would train advised without asking, which is silent and would not
+    fail anything."""
+    assert inspect.getsource(G._wire).count('W.TRAIN_MDO_MODE = "sample"') == 1
 
 
 def test_every_trained_approach_maps_to_a_stack():
@@ -185,3 +216,53 @@ def test_plan_call_bounds_its_completion():
     src = inspect.getsource(AB.AgentB)
     assert "max_tokens=PLAN_MAX_TOKENS" in src, (
         "the plan call fell back to the backend's default ceiling")
+
+
+def test_the_curriculum_branch_is_not_overwritten():
+    """`_wire` resets the per-cell knobs, so calling it AFTER the per-config branch
+    silently undoes that branch. It was called twice until 2026-08-12, which meant
+    CUSTOM_PLAN_BUILDER went back to None and every LLM-free stack trained on
+    full-substrate greedy plans while being evaluated on partial-observability ones.
+
+    Nothing failed when that happened. The runs completed and every cell carried a
+    plausible acceptance number, which is why this is pinned by position rather than
+    by outcome."""
+    src = inspect.getsource(G.curriculum_train)
+    body = src.split("for i, (level_i, inst_i) in enumerate(segments):")[1]
+    assert body.count("_wire(scenario, level_i, inst_i)") == 1, (
+        "_wire is called more than once per segment; a call after the config "
+        "branch resets CUSTOM_PLAN_BUILDER, RC_FIXED_TRAIN_STREAM and "
+        "TRAIN_MDO_MODE back to their defaults")
+    # And it must come BEFORE the branch, or the branch is still clobbered.
+    assert body.index("_wire(scenario, level_i, inst_i)") < body.index('config == "rl_alone"')
+
+
+def test_wire_resets_every_knob_the_curriculum_sets():
+    """The reset list and the set list must not drift apart. A knob set by a config
+    branch but not reset by `_wire` leaks into the next stack trained in the same
+    process, which is the same class of silent failure in the other direction."""
+    wire = inspect.getsource(G._wire)
+    for knob in ("W.CUSTOM_PLAN_BUILDER", "W.RC_FIXED_TRAIN_STREAM", "W.TRAIN_MDO_MODE"):
+        assert knob in wire, f"{knob} is set per config but never reset by _wire"
+
+
+def test_the_ppo_ratio_is_taken_between_two_advised_distributions():
+    """PPO's ratio is exp(new_log_prob - old_log_prob). It is only a ratio between
+    two settings of ONE policy if both sides carry the same advisory bias. The
+    rollout samples from the advised policy, so the recomputation in the update must
+    be advised too.
+
+    Recomputing unbiased is silent: the loss still falls and training still finishes,
+    but every advised update is computed for a policy that never acted."""
+    import wp7_runner as W
+    from orion.mdo.policy import AutoregMDOPolicy
+
+    sig = inspect.signature(AutoregMDOPolicy.evaluate_actions).parameters
+    assert "prior_logits" in sig and "prior_weight" in sig, (
+        "evaluate_actions cannot express the bias the rollout was sampled under")
+
+    src = inspect.getsource(W.train_approach)
+    call = src.split("new_lp, new_ent, new_logits = policy.evaluate_actions(")[1][:400]
+    assert "prior_logits=pri_i" in call, "the PPO recomputation dropped the bias"
+    assert 'TRAIN_MDO_MODE == "advised_sample"' in src, (
+        "the bias must be applied exactly when the rollout was advised")

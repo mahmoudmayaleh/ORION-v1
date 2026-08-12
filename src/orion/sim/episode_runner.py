@@ -113,6 +113,15 @@ class EpisodeRunner:
     #: an episodic store accumulating during evaluation.
     on_decision = None
 
+    #: Optional zero-argument callback fired at the TOP of every arrival, before
+    #: the plan is built and before anything is allocated. Separate from
+    #: `on_decision` so occupancy sampling and outcome observation can both be
+    #: attached at once, and because occupancy has to be read at a point every
+    #: approach reaches: `on_decision` never fires for a structural reject, which
+    #: would silently drop those arrivals from a utilisation average and drop MORE
+    #: of them for the approaches that reject structurally more often.
+    on_arrival = None
+
     """Drives one episode end-to-end.
 
     Args:
@@ -201,6 +210,8 @@ class EpisodeRunner:
     ) -> None:
         stats.total_arrivals += 1
         arrival_index = stats.total_arrivals - 1  # global stream position (§N.2)
+        if self.on_arrival is not None:
+            self.on_arrival()
         stats.per_slice_type_total[slice_req.slice_type.value] = (
             stats.per_slice_type_total.get(slice_req.slice_type.value, 0) + 1
         )
@@ -217,13 +228,6 @@ class EpisodeRunner:
             return
 
         cost_greedy = compute_cost_greedy(self.substrate, slice_req)
-
-        # h^m snapshot (§N.2) — captured pre-decision / pre-allocation, so it is the
-        # same per-domain headroom the policy's observation was built from.
-        hm_snapshot = {
-            ds.domain_id: ds.max_node_headroom
-            for ds in build_domain_summaries(self.substrate)
-        } if arrival_trace is not None else None
 
         with profiled("mdo.decision", {"mode": mdo_mode, "k": len(slice_req.vnfs)}):
             mdo_result = self.coordinator.resolve_arrival(
@@ -307,7 +311,6 @@ class EpisodeRunner:
                 "partition": selected,
                 "committed": mdo_result.partition is not None,
                 "admit": bool(mdo_result.admitted),
-                "hm": hm_snapshot,
             })
 
     def _handle_departure(self, request_id: str, stats: EpisodeStats) -> None:
