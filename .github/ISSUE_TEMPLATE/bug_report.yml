@@ -1,0 +1,66 @@
+name: Bug report
+description: Something raises, hangs, or does the wrong thing
+labels: [bug]
+body:
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command, including PYTHONHASHSEED and any flags.
+      render: shell
+      placeholder: PYTHONHASHSEED=0 python scripts/grid_runner.py --part smoke --no-prereg
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The full traceback or the output that is wrong. Trim the middle if it is long, but keep the start and the end.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: Python version and operating system
+      placeholder: "3.11.9, Ubuntu 24.04"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: llm
+    attributes:
+      label: Was a language-model server involved?
+      options:
+        - "No, the approach is LLM-free"
+        - "Yes, a local OpenAI-compatible server"
+        - "Yes, a frontier API"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: provenance
+    attributes:
+      label: Provenance block
+      description: If a result file was written, paste its `provenance` block. It names the commit and the serving model, which identifies the tree exactly.
+      render: json
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before opening
+      options:
+        - label: "`PYTHONHASHSEED=0 pytest` was run and I have said below whether it passes"
+          required: true

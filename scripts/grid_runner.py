@@ -118,7 +118,7 @@ CELLS = Path(os.environ.get("ORION_CELL_DIR", "data/grid_cells"))
 # must set ORION_CKPT_DIR to a scratch path; the default stays the real one so
 # no production invocation changes behaviour.
 CKPTS = Path(os.environ.get("ORION_CKPT_DIR", "results/wp7/ckpt_grid"))
-APPROACHES = ["Plain", "MDO-fullobs", "MDO-partial", "MDO-ffd", "RL-alone", "RL-poprior", "Memory-off", "Full"]
+APPROACHES = ["Plain", "MDO-fullobs", "MDO-partial", "MDO-partial-noh", "MDO-partial-modal", "MDO-partial-obsenc", "MDO-partial-fact", "MDO-partial-noh-fact", "MDO-ffd", "RL-alone", "RL-advised", "RL-poprior", "Memory-off", "Memory-off-rpg", "Memory-off-rp", "Full", "Full-rp"]
 # M^B capacity. Defined HERE, not inherited from r_local_runner, because this is
 # the runner that decides how much the store is asked to hold.
 #
@@ -173,7 +173,25 @@ USE_PLAN_CACHE = True
 PROFILE_SAMPLER = None
 PROFILE_DIR = Path(os.environ.get("ORION_PROFILE_DIR", "results/profile_cells"))
 MEMORY_APPROACHES = {"Full": "selective"}  # approach -> M^B write_policy
-TRAINED_APPROACHES = {"RL-alone", "RL-poprior", "Memory-off", "Full"}
+# §AA (2026-08-17): the LLM plan path held to the same admissibility tests the
+# partial-observability heuristic applies to its own proposal. See
+# `partial_obs_prior.repair_plan` for the measurement that motivates them and for
+# why this is a parity correction rather than a new advantage. Both are additive
+# over `Memory-off`, so `Memory-off` itself is the control and the shipped cells do
+# not move: the repair is OFF unless one of these names is requested.
+#
+#   Memory-off-rpg   REPAIR_MODE="guard"  per-VNF h^m repair, splits preserved
+#   Memory-off-rp    REPAIR_MODE="full"   + collapse an elective split
+#   Full-rp          REPAIR_MODE="full"   on the M^B approach, i.e. ORION as reported
+REPAIR_APPROACHES = {"Memory-off-rpg": "guard", "Memory-off-rp": "full",
+                     "Full-rp": "full"}
+# The approach each repair variant is the twin of: same stack, same plan source,
+# same mode, same M^B setting. Named once so the dispatch and the checkpoint
+# lookup cannot disagree about what a repair cell IS.
+REPAIR_BASE = {"Memory-off-rpg": "Memory-off", "Memory-off-rp": "Memory-off",
+               "Full-rp": "Full"}
+TRAINED_APPROACHES = {"RL-alone", "RL-advised", "RL-poprior", "Memory-off", "Full",
+                      *REPAIR_APPROACHES}
 # Which curriculum stack each trained approach evaluates. Same mapping run_cell
 # dispatches on, named once so --eval-only can report the checkpoint per cell.
 # The ladder, by how much of the planner each approach gets.
@@ -192,12 +210,21 @@ TRAINED_APPROACHES = {"RL-alone", "RL-poprior", "Memory-off", "Full"}
 # partitions so gating on it was circular, and swapping only those weights cost 6.35 pp
 # at L2, 7.80 at L3 and 10.10 at L4. `llm_guided` keeps the LLM in training and drops
 # only the mechanism that carried nothing.
-STACK_FOR_APPROACH = {"RL-alone": "rl_alone", "RL-poprior": "po_prior",
+STACK_FOR_APPROACH = {"RL-alone": "rl_alone", "RL-advised": "po_advised",
+                      "RL-poprior": "po_prior",
                       "Memory-off": "llm_guided", "Full": "llm_guided"}
+# Derived, never restated: a repair variant runs its base approach's stack, so the
+# two cannot drift apart and a repair cell can never silently evaluate a different
+# checkpoint than the row it is compared against.
+STACK_FOR_APPROACH.update({a: STACK_FOR_APPROACH[b] for a, b in REPAIR_BASE.items()})
+MEMORY_APPROACHES.update({a: MEMORY_APPROACHES[b] for a, b in REPAIR_BASE.items()
+                          if b in MEMORY_APPROACHES})
 # The planner advises the MDO at inference for these approaches (mode="advised"), and
 # they are the ones that also train advised. RL-alone and RL-poprior decode
 # deterministically, in training and at eval alike.
-ADVISED_APPROACHES = {"Memory-off", "Full"}
+ADVISED_APPROACHES = {"Memory-off", "Full", "RL-advised",
+                      *(a for a, b in REPAIR_BASE.items()
+                        if b in {"Memory-off", "Full", "RL-advised"})}
 # §Z.1 (2026-08-06): anneals to 0. The prior term is Kickstarting-style auxiliary
 # shaping (arXiv:1803.03835: cross-entropy to the teacher on the STUDENT's own
 # trajectories, weight decayed to zero), not a standing objective. Two reasons the
@@ -307,8 +334,18 @@ def _done(scenario, approach, seed, level, instance):
 
 def _bank(scenario, approach, seed, level, instance, payload, prov):
     CELLS.mkdir(parents=True, exist_ok=True)
+    # §AA — the two knobs that change what an approach IS ride into every cell,
+    # unconditionally. A cell that does not state them cannot be compared with one
+    # produced under the other setting, and both default to the shipped value, so an
+    # absent field would be indistinguishable from a diagnostic value.
+    import partial_obs_prior as _pop
+    from orion.mdo.coordinator import ADVISE_WEIGHT as _aw
     payload = dict(payload, scenario=scenario, approach=approach, seed=seed,
-                   level=level, instance=instance, provenance=prov)
+                   level=level, instance=instance, provenance=prov,
+                   knobs={"advise_weight": _aw,
+                          "plan_repair": REPAIR_APPROACHES.get(approach, "off"),
+                          "partial_guard": _pop.GUARD_MODE,
+                          "partial_seq": _pop.SEQ_ACCOUNTING})
     path = _cell_path(scenario, approach, seed, level, instance)
     path.write_text(json.dumps(payload, indent=2, default=str))
     log.info("BANKED %s", path)
@@ -595,6 +632,17 @@ def curriculum_train(scenario, seed, config, rounds, arrivals, lr, agent_b, kb, 
             W.RC_FIXED_TRAIN_STREAM = False
             bs = be = 0.0
             approach, mock, ab, k, ewt = "RL-alone", True, None, None, True
+        elif config == "po_advised":
+            # Control for the headline comparison. Identical to rl_alone in
+            # every respect except that advising is ON in the rollouts, so
+            # {RL-alone, RL-advised} isolates the decode bias of the advised
+            # softmax and {RL-advised, Full} isolates who authored the plan.
+            # LLM-free: the proposal is the partial-obs heuristic partition.
+            W.CUSTOM_PLAN_BUILDER = partial_obs_builder
+            W.RC_FIXED_TRAIN_STREAM = False
+            W.TRAIN_MDO_MODE = "advised_sample"
+            bs = be = 0.0
+            approach, mock, ab, k, ewt = "RL-alone", True, None, None, True
         elif config == "po_warmstart":
             # §W.3 — heuristic-BC init + repaired update; guidance via init, not KL.
             W.CUSTOM_PLAN_BUILDER = partial_obs_builder
@@ -633,7 +681,7 @@ def curriculum_train(scenario, seed, config, rounds, arrivals, lr, agent_b, kb, 
             # the hot loop for whatever config was misspelled.
             raise SystemExit(
                 f"unknown curriculum config '{config}'. Trainable stacks are "
-                "rl_alone, po_warmstart, po_prior and llm_guided.")
+                "rl_alone, po_advised, po_warmstart, po_prior and llm_guided.")
         # NO second _wire() here. There was one until 2026-08-12, and because `_wire`
         # resets the per-cell knobs it silently undid everything the branch above had
         # just set. Measured consequences, all of which had been reported as design:
@@ -784,6 +832,47 @@ def eval_plain_partial(scenario, seed, level, instance, arrivals):
                                    instance, arrivals)
 
 
+def _eval_partial_guard(mode, scenario, seed, level, instance, arrivals, seq=True):
+    """MDO-partial with the h^m guard restricted to `mode`.
+
+    Isolates how much of MDO-partial's margin over the learned approaches comes
+    from the guard rather than from the heuristic. Everything else is held fixed:
+    same builder, same colocation-first idea, same aggregate slack test, same
+    pipeline, so any delta is the guard.
+
+    The flag is set on the module rather than through the environment because
+    `partial_obs_prior` is imported at startup; it is restored in `finally` so a
+    later MDO-partial cell in the same process is unaffected.
+    """
+    import partial_obs_prior as _pop
+    prev, prev_seq = _pop.GUARD_MODE, _pop.SEQ_ACCOUNTING
+    _pop.GUARD_MODE, _pop.SEQ_ACCOUNTING = mode, seq
+    try:
+        return eval_heuristic_pipeline(partial_obs_builder, scenario, seed, level,
+                                       instance, arrivals)
+    finally:
+        _pop.GUARD_MODE, _pop.SEQ_ACCOUNTING = prev, prev_seq
+
+
+def eval_plain_partial_noh(scenario, seed, level, instance, arrivals):
+    """Guard off entirely: commits on the per-domain aggregates alone."""
+    return _eval_partial_guard("off", scenario, seed, level, instance, arrivals)
+
+
+def eval_plain_partial_obsenc(scenario, seed, level, instance, arrivals):
+    """Guard computed in the observation's own units, so the heuristic is held to
+    exactly the evidence the policy receives. See partial_obs_prior.GUARD_MODE."""
+    return _eval_partial_guard("obsenc", scenario, seed, level, instance, arrivals)
+
+
+def eval_plain_partial_modal(scenario, seed, level, instance, arrivals):
+    """Guard restricted to the VNF's modal required tier, the one tier index the
+    MDO observation actually publishes per VNF. This is the observation-legal
+    baseline: it keeps the guard but denies the heuristic the per-(k,m) tier SET
+    that the observation has no field for."""
+    return _eval_partial_guard("modal", scenario, seed, level, instance, arrivals)
+
+
 def colocation_plan_builder(slice_req, substrate):
     """m~ from the FULL-substrate colocation-first heuristic (Plain's own placer).
 
@@ -876,12 +965,26 @@ def eval_nonmemory(coord, approach, scenario, seed, level, instance, arrivals, a
     sub = _substrate_fn(instance)(seed)
     delays = W.build_delays(sub)
     cache_stats = None
-    if approach == "Memory-off":
+    repair_stats = None
+    if approach in ("Memory-off", "Memory-off-rpg", "Memory-off-rp"):
         pb = W.make_llm_plan_builder(agent_b, kb, lambda: None)
         if W.TIER_FILTER_LLM_PLANS:
             pb = W.tier_filtered(pb)
         pb, cache_stats = _with_plan_cache(pb)
-    elif approach in ("RL-poprior", "RL-alone"):
+        # §AA — repair OUTSIDE the cache, so EVERY served plan is checked against the
+        # substrate as it is now. This ordering is the whole point.
+        # `_cached_plan_builder` serves ~91% of arrivals from a stored plan whose
+        # concrete `suggested_domains` were chosen for an earlier arrival, and its
+        # only gate is `revalidate_plan`, which checks that each named domain still
+        # CONTAINS a node of the required tier. Composition is fixed, so that test is
+        # always true; it is topology revalidation, not capacity revalidation, and it
+        # is why a cache hit can commit a domain that is now exhausted.
+        # Repairing inside the cache would fix only the ~9% of arrivals that miss.
+        if approach in REPAIR_APPROACHES:
+            import partial_obs_prior as _pop
+            repair_stats = _pop.reset_repair_stats()
+            pb = _pop.plan_repaired(pb, mode=REPAIR_APPROACHES[approach])
+    elif approach in ("RL-poprior", "RL-alone", "RL-advised"):
         # §V.2 / §X.3: eval on the SAME observation-legal m~ the approach trained on.
         pb = partial_obs_builder
     else:
@@ -899,7 +1002,8 @@ def eval_nonmemory(coord, approach, scenario, seed, level, instance, arrivals, a
     return {"acceptance": round(acc, 4), "admitted": adm, "offered": tot,
             "rejections": rejects.get("rejections"),
             "mtilde_agreement": agree, "cost": cost,
-            "plan_cache": _cache_report(cache_stats) if cache_stats is not None else None}
+            "plan_cache": _cache_report(cache_stats) if cache_stats is not None else None,
+            "plan_repair": dict(repair_stats) if repair_stats is not None else None}
 
 
 # ── memory-approach eval (trained coord + live M^B write; warm on train families) ──
@@ -1070,7 +1174,7 @@ def _accumulating(pb, mb, level):
 
 
 def eval_memory(coord, write_policy, scenario, seed, level, instance, arrivals, agent_b, kb,
-                warm_arrivals, mb_mode):
+                warm_arrivals, mb_mode, repair_mode=None):
     _wire(scenario, level, instance)
     sf = make_scenario_slice_factory(scenario)
     # Warm M^B ONCE per (scenario, write_policy, seed), capped at warm_arrivals per
@@ -1170,6 +1274,16 @@ def eval_memory(coord, write_policy, scenario, seed, level, instance, arrivals, 
     if mb_mode == "accumulate":
         pb, W.EVAL_ON_DECISION = _accumulating(pb, mb, level)
     pb, cache_stats = _with_plan_cache(pb)
+    # §AA — OUTSIDE the cache, and outside accumulation. Outside the cache because a
+    # hit replays a plan chosen under an earlier substrate state and `revalidate_plan`
+    # only re-checks topology; see eval_nonmemory. Outside accumulation because M^B
+    # must record the plan the PLANNER authored, not the guard's correction, or the
+    # store stops being evidence about the planner.
+    repair_stats = None
+    if repair_mode is not None:
+        import partial_obs_prior as _pop
+        repair_stats = _pop.reset_repair_stats()
+        pb = _pop.plan_repaired(pb, mode=repair_mode)
     cost = {}
     rejects = {}
     entries_before = len(mb._entries)
@@ -1191,6 +1305,7 @@ def eval_memory(coord, write_policy, scenario, seed, level, instance, arrivals, 
             "write_policy": write_policy,
             "warm_arrivals": warm_arrivals, "retrieval": mb.retrieval_stats(),
             "warm_level": TRAINING_LEVEL, "plan_cache": _cache_report(cache_stats),
+            "plan_repair": dict(repair_stats) if repair_stats is not None else None,
             "cost": cost}
 
 
@@ -1221,16 +1336,32 @@ def run_cell(scenario, approach, seed, level, instance, arrivals, stacks, agent_
                 out = eval_plain_ffd(scenario, seed, level, instance, arrivals)
             elif approach == "MDO-partial":
                 out = eval_plain_partial(scenario, seed, level, instance, arrivals)
+            elif approach == "MDO-partial-noh":
+                out = eval_plain_partial_noh(scenario, seed, level, instance, arrivals)
+            elif approach == "MDO-partial-modal":
+                out = eval_plain_partial_modal(scenario, seed, level, instance, arrivals)
+            elif approach == "MDO-partial-obsenc":
+                out = eval_plain_partial_obsenc(scenario, seed, level, instance, arrivals)
+            elif approach == "MDO-partial-fact":
+                out = _eval_partial_guard("full", scenario, seed, level, instance,
+                                          arrivals, seq=False)
+            elif approach == "MDO-partial-noh-fact":
+                out = _eval_partial_guard("off", scenario, seed, level, instance,
+                                          arrivals, seq=False)
             elif approach == "RL-alone":
                 out = eval_nonmemory(stacks["rl_alone"], approach, scenario, seed, level, instance, arrivals, agent_b, kb)
+            elif approach == "RL-advised":
+                out = eval_nonmemory(stacks["po_advised"], approach, scenario, seed, level, instance, arrivals, agent_b, kb)
             elif approach == "RL-poprior":
                 out = eval_nonmemory(stacks["po_prior"], approach, scenario, seed, level, instance, arrivals, agent_b, kb)
-            elif approach == "Memory-off":
+            elif approach in ("Memory-off", "Memory-off-rpg", "Memory-off-rp"):
                 out = eval_nonmemory(stacks[STACK_FOR_APPROACH[approach]], approach, scenario, seed, level, instance, arrivals, agent_b, kb)
-            else:  # Full
+            elif approach not in ("Full", "Full-rp"):
+                raise SystemExit(f"no eval dispatch for approach {approach!r}")
+            else:  # Full / Full-rp
                 out = eval_memory(stacks[STACK_FOR_APPROACH[approach]], MEMORY_APPROACHES[approach], scenario, seed,
                                   level, instance, arrivals, agent_b, kb, warm_arrivals,
-                                  MB_MODE)
+                                  MB_MODE, repair_mode=REPAIR_APPROACHES.get(approach))
     except CellTimeout as exc:
         # Banked as a distinct outcome, not dropped: a missing cell is
         # indistinguishable from one never scheduled, and a silently absent cell
@@ -1290,9 +1421,10 @@ def get_stacks(scenario, seed, args, agent_b, kb, need):
     by_stack: dict = {}
     for _ap, _st in STACK_FOR_APPROACH.items():
         by_stack.setdefault(_st, set()).add(_ap)
-    # `rl_alone` and `po_prior` train LLM-free, so their curricula get no agent.
+    # rl_alone, po_advised and po_prior train LLM-free, so their curricula get no agent.
     # `llm_guided` trains WITH the planner in the loop and needs both.
     wanted = [("rl_alone", by_stack.get("rl_alone", set()), "RL-alone", None, None),
+              ("po_advised", by_stack.get("po_advised", set()), "RL-advised", None, None),
               ("po_prior", by_stack.get("po_prior", set()), "RL-poprior", None, None),
               ("llm_guided", by_stack.get("llm_guided", set()), "LLM-guided",
                agent_b, kb)]
@@ -1422,6 +1554,10 @@ def main():
                          "Measured 2.83 s per plan build, so an LLM cell is "
                          "~1.6 h at 2000 arrivals; raise ORION_CELL_TIMEOUT_S.")
     ap.add_argument("--tag", default="GRID")
+    ap.add_argument("--no-prereg", action="store_true",
+                    help="run without the pre-registration, which is not distributed with "
+                         "this repository. Applies only when the document is absent; the "
+                         "result JSON records prereg.status=\"skipped\".")
     args = ap.parse_args()
 
     # §Y.14 — 101 to 104 are spent on checkpoint selection. Reporting a cell on
@@ -1461,6 +1597,20 @@ def main():
             "plan cache is part of the pipeline, not an option, and it must not "
             "drift off in a long run and be discovered afterwards.")
 
+    # §AA — the advise weight is a property of the POLICY, not of the run: it enters
+    # the softmax that PPO takes its ratio over, so a cell produced at a different
+    # weight is a cell for a different policy under the same filename. Same refusal
+    # as --no-plan-cache and --eval-seg, and for the same reason.
+    from orion.mdo.coordinator import ADVISE_WEIGHT as _AW
+    if _AW != 2.0:
+        if CELLS == Path("data/grid_cells"):
+            raise SystemExit(
+                f"ORION_ADVISE_WEIGHT={_AW} writes cells that are not results of "
+                "record. Set ORION_CELL_DIR to a scratch path.")
+        log.warning("ADVISE WEIGHT %.3f (default 2.0): the advised approaches are "
+                    "running a different policy. Cells go to %s and are "
+                    "diagnostic.", _AW, CELLS)
+
     if args.eval_seg is not None:
         if not args.eval_only:
             raise SystemExit("--eval-seg requires --eval-only (there is no "
@@ -1496,7 +1646,8 @@ def main():
             "slices, which a shorter episode cannot hold.")
 
     prov = git_provenance(serving=serving_provenance(args.port) if not args.mock else None,
-                          tag=args.tag, prereg=PREREG)
+                          tag=args.tag, prereg=PREREG,
+                          allow_absent_prereg=args.no_prereg)
     log.info("provenance commit=%s dirty=%s part=%s", prov["git_commit"][:8],
              prov["git_dirty"], args.part)
 

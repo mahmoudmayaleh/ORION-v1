@@ -1,21 +1,47 @@
-# Artifacts stay out (size, regenerable). Interpretation records do NOT:
-# RESULT.md files, banners and manifests are what the paper cites as a record
-# of interpretation, so they must be commits, not mutable files. Note the
-# `results/*` form is deliberate -- git cannot re-include a file whose parent
-# directory is excluded, so a bare `results/` + `!results/*.md` silently fails.
+# Run artifacts. Regenerable, and large enough that committing them would make the
+# repository unusable to clone. `results/*` rather than `results/` is deliberate: git
+# cannot re-include a file whose parent directory is excluded, so a bare `results/`
+# plus `!results/*.md` silently fails.
 results/*
 !results/*.md
 runs/
 llm-outputs/
+data/grid_cells/
+data/parity_cells/
 data/*.pt
+data/*_results*.json
 *.log
+
+# Model weights. Fetched, never committed.
+models/
+*.gguf
+*.safetensors
+
+# Python
 .venv/
+venv/
 __pycache__/
+*.py[cod]
 .pytest_cache/
-scripts/audit/out/
-# Secrets — API keys never enter git (SS Q frontier arm)
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+src/orion.egg-info/
+
+# Secrets. API keys never enter git.
 .env
 .env.*
 *.key
 *_secret*
-src/orion.egg-info/
+
+# Editor and OS
+.vscode/
+.idea/
+.history/
+.DS_Store
+Thumbs.db

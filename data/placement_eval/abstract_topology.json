@@ -2,22 +2,30 @@
   "domains": [
     {
       "domain_id": "d0",
-      "label": "RAN/Edge",
-      "dominant_tiers": ["edge"],
+      "label": "Edge",
+      "dominant_tiers": [
+        "edge"
+      ],
       "cpu_residual": 12.0,
       "ram_residual": 24.0
     },
     {
       "domain_id": "d1",
-      "label": "MEC/Regional",
-      "dominant_tiers": ["edge", "regional_cloud"],
+      "label": "Edge/Regional",
+      "dominant_tiers": [
+        "edge",
+        "regional_cloud"
+      ],
       "cpu_residual": 25.0,
       "ram_residual": 60.0
     },
     {
       "domain_id": "d2",
       "label": "Regional/Central Cloud",
-      "dominant_tiers": ["regional_cloud", "central_cloud"],
+      "dominant_tiers": [
+        "regional_cloud",
+        "central_cloud"
+      ],
       "cpu_residual": 100.0,
       "ram_residual": 240.0
     }

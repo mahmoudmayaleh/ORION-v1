@@ -1,0 +1,44 @@
+name: Result does not reproduce
+description: A number you obtained differs from one reported
+labels: [reproduction]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, check two things that account for most differences.
+
+        A run started without `PYTHONHASHSEED=0` replays behaviour cloning against a
+        different tie-breaking order, and a run whose result file records
+        `prereg.status = "skipped"` was not pinned to a protocol.
+
+  - type: input
+    id: approach
+    attributes:
+      label: Approach, scenario, load level and seed
+      placeholder: "Full, conventional, L3, seed 42"
+    validations:
+      required: true
+
+  - type: textarea
+    id: numbers
+    attributes:
+      label: What you got, and what you expected
+      description: Give both numbers and say where the expected one comes from.
+    validations:
+      required: true
+
+  - type: textarea
+    id: provenance
+    attributes:
+      label: Provenance block from your result file
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: serving
+    attributes:
+      label: Language model served
+      description: Model file or snapshot, quantization, chat format, and the server used. A different quantization of the same model is a different planner.
+    validations:
+      required: false

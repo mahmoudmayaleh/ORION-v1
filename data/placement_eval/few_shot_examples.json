@@ -4,32 +4,66 @@
       "request_id": "urllc_factory_002",
       "slice_type": "URLLC",
       "vnfs": [
-        {"vnf_id": "urllc_factory_002_f1", "vnf_type": "Firewall",
-         "cpu_demand": 2.0, "ram_demand": 2.0,
-         "permitted_tiers": ["edge"], "vcr": 1.0},
-        {"vnf_id": "urllc_factory_002_f2", "vnf_type": "vUPF",
-         "cpu_demand": 4.0, "ram_demand": 4.0,
-         "permitted_tiers": ["edge"], "vcr": 1.0}
+        {
+          "vnf_id": "urllc_factory_002_f1",
+          "vnf_type": "Firewall",
+          "cpu_demand": 2.0,
+          "ram_demand": 2.0,
+          "permitted_tiers": [
+            "edge"
+          ],
+          "vcr": 1.0
+        },
+        {
+          "vnf_id": "urllc_factory_002_f2",
+          "vnf_type": "vUPF",
+          "cpu_demand": 4.0,
+          "ram_demand": 4.0,
+          "permitted_tiers": [
+            "edge"
+          ],
+          "vcr": 1.0
+        }
       ],
       "flow_edges": [
-        {"source_vnf": "urllc_factory_002_f1", "target_vnf": "urllc_factory_002_f2",
-         "bandwidth_demand": 80.0}
+        {
+          "source_vnf": "urllc_factory_002_f1",
+          "target_vnf": "urllc_factory_002_f2",
+          "bandwidth_demand": 80.0
+        }
       ],
-      "qos": {"max_e2e_delay": 3.0, "min_throughput": 80.0}
+      "qos": {
+        "max_e2e_delay": 3.0,
+        "min_throughput": 80.0
+      }
     },
     "placement_plan": {
       "plan_id": "urllc_factory_002_plan",
       "vnf_assignments": [
-        {"vnf_id": "urllc_factory_002_f1", "domain": "d0",
-         "required_tier": "edge", "cpu_demand": 2.0, "ram_demand": 2.0},
-        {"vnf_id": "urllc_factory_002_f2", "domain": "d0",
-         "required_tier": "edge", "cpu_demand": 4.0, "ram_demand": 4.0}
+        {
+          "vnf_id": "urllc_factory_002_f1",
+          "domain": "d0",
+          "required_tier": "edge",
+          "cpu_demand": 2.0,
+          "ram_demand": 2.0
+        },
+        {
+          "vnf_id": "urllc_factory_002_f2",
+          "domain": "d0",
+          "required_tier": "edge",
+          "cpu_demand": 4.0,
+          "ram_demand": 4.0
+        }
       ],
       "flow_requirements": [
-        {"source_vnf": "urllc_factory_002_f1", "target_vnf": "urllc_factory_002_f2",
-         "min_bandwidth_mbps": 80.0, "crosses_domain_boundary": false}
+        {
+          "source_vnf": "urllc_factory_002_f1",
+          "target_vnf": "urllc_factory_002_f2",
+          "min_bandwidth_mbps": 80.0,
+          "crosses_domain_boundary": false
+        }
       ],
-      "rationale": "Both VNFs permit ran_edge, and d0 supports ran_edge with 12 CPU residual. CPU check: 2+4=6 < 12. RAM check: 2+4=6 < 24. Co-locating both in d0 satisfies URLLC's ultra-low latency (max 3 ms E2E) by avoiding inter-domain hops entirely. The f1→f2 flow stays intra-domain."
+      "rationale": "Both VNFs permit ran_edge, and d0 supports ran_edge with 12 CPU residual. CPU check: 2+4=6 < 12. RAM check: 2+4=6 < 24. Co-locating both in d0 satisfies URLLC's ultra-low latency (max 3 ms E2E) by avoiding inter-domain hops entirely. The f1\u2192f2 flow stays intra-domain."
     }
   },
   {
@@ -37,41 +71,96 @@
       "request_id": "mmtc_city_003",
       "slice_type": "mMTC",
       "vnfs": [
-        {"vnf_id": "mmtc_city_003_f1", "vnf_type": "IoTGateway",
-         "cpu_demand": 2.0, "ram_demand": 2.0,
-         "permitted_tiers": ["edge"], "vcr": 0.3},
-        {"vnf_id": "mmtc_city_003_f2", "vnf_type": "Aggregator",
-         "cpu_demand": 3.0, "ram_demand": 6.0,
-         "permitted_tiers": ["edge", "regional_cloud"], "vcr": 0.5},
-        {"vnf_id": "mmtc_city_003_f3", "vnf_type": "Analytics",
-         "cpu_demand": 6.0, "ram_demand": 12.0,
-         "permitted_tiers": ["regional_cloud", "central_cloud"], "vcr": 0.1}
+        {
+          "vnf_id": "mmtc_city_003_f1",
+          "vnf_type": "IoTGateway",
+          "cpu_demand": 2.0,
+          "ram_demand": 2.0,
+          "permitted_tiers": [
+            "edge"
+          ],
+          "vcr": 0.3
+        },
+        {
+          "vnf_id": "mmtc_city_003_f2",
+          "vnf_type": "Aggregator",
+          "cpu_demand": 3.0,
+          "ram_demand": 6.0,
+          "permitted_tiers": [
+            "edge",
+            "regional_cloud"
+          ],
+          "vcr": 0.5
+        },
+        {
+          "vnf_id": "mmtc_city_003_f3",
+          "vnf_type": "Analytics",
+          "cpu_demand": 6.0,
+          "ram_demand": 12.0,
+          "permitted_tiers": [
+            "regional_cloud",
+            "central_cloud"
+          ],
+          "vcr": 0.1
+        }
       ],
       "flow_edges": [
-        {"source_vnf": "mmtc_city_003_f1", "target_vnf": "mmtc_city_003_f2",
-         "bandwidth_demand": 30.0},
-        {"source_vnf": "mmtc_city_003_f2", "target_vnf": "mmtc_city_003_f3",
-         "bandwidth_demand": 4.5}
+        {
+          "source_vnf": "mmtc_city_003_f1",
+          "target_vnf": "mmtc_city_003_f2",
+          "bandwidth_demand": 30.0
+        },
+        {
+          "source_vnf": "mmtc_city_003_f2",
+          "target_vnf": "mmtc_city_003_f3",
+          "bandwidth_demand": 4.5
+        }
       ],
-      "qos": {"max_e2e_delay": 100.0, "min_throughput": 5.0}
+      "qos": {
+        "max_e2e_delay": 100.0,
+        "min_throughput": 5.0
+      }
     },
     "placement_plan": {
       "plan_id": "mmtc_city_003_plan",
       "vnf_assignments": [
-        {"vnf_id": "mmtc_city_003_f1", "domain": "d0",
-         "required_tier": "edge", "cpu_demand": 2.0, "ram_demand": 2.0},
-        {"vnf_id": "mmtc_city_003_f2", "domain": "d1",
-         "required_tier": "edge", "cpu_demand": 3.0, "ram_demand": 6.0},
-        {"vnf_id": "mmtc_city_003_f3", "domain": "d2",
-         "required_tier": "regional_cloud", "cpu_demand": 6.0, "ram_demand": 12.0}
+        {
+          "vnf_id": "mmtc_city_003_f1",
+          "domain": "d0",
+          "required_tier": "edge",
+          "cpu_demand": 2.0,
+          "ram_demand": 2.0
+        },
+        {
+          "vnf_id": "mmtc_city_003_f2",
+          "domain": "d1",
+          "required_tier": "edge",
+          "cpu_demand": 3.0,
+          "ram_demand": 6.0
+        },
+        {
+          "vnf_id": "mmtc_city_003_f3",
+          "domain": "d2",
+          "required_tier": "regional_cloud",
+          "cpu_demand": 6.0,
+          "ram_demand": 12.0
+        }
       ],
       "flow_requirements": [
-        {"source_vnf": "mmtc_city_003_f1", "target_vnf": "mmtc_city_003_f2",
-         "min_bandwidth_mbps": 30.0, "crosses_domain_boundary": true},
-        {"source_vnf": "mmtc_city_003_f2", "target_vnf": "mmtc_city_003_f3",
-         "min_bandwidth_mbps": 4.5, "crosses_domain_boundary": true}
+        {
+          "source_vnf": "mmtc_city_003_f1",
+          "target_vnf": "mmtc_city_003_f2",
+          "min_bandwidth_mbps": 30.0,
+          "crosses_domain_boundary": true
+        },
+        {
+          "source_vnf": "mmtc_city_003_f2",
+          "target_vnf": "mmtc_city_003_f3",
+          "min_bandwidth_mbps": 4.5,
+          "crosses_domain_boundary": true
+        }
       ],
-      "rationale": "IoTGateway (VCR=0.3) compresses 70% of traffic, placed at ran_edge (d0, 2 CPU fits in 12). Aggregator (VCR=0.5) further reduces data, placed at mec (d1, 3 CPU fits in 25). Analytics requires regional/central_cloud — d2 is the only option. BW: f1→f2 = 30 Mbps (beta_min * VCR_f1 = 30*1.0 = 30). f2→f3 = 30 * 0.3 * 0.5 = 4.5 Mbps — IoT aggregation compresses heavily. mMTC is delay-tolerant (100 ms budget), so multi-domain hops are acceptable."
+      "rationale": "IoTGateway (VCR=0.3) compresses 70% of traffic, placed at ran_edge (d0, 2 CPU fits in 12). Aggregator (VCR=0.5) further reduces data, placed at mec (d1, 3 CPU fits in 25). Analytics requires regional/central_cloud \u2014 d2 is the only option. BW: f1\u2192f2 = 30 Mbps (beta_min * VCR_f1 = 30*1.0 = 30). f2\u2192f3 = 30 * 0.3 * 0.5 = 4.5 Mbps \u2014 IoT aggregation compresses heavily. mMTC is delay-tolerant (100 ms budget), so multi-domain hops are acceptable."
     }
   },
   {
@@ -79,41 +168,96 @@
       "request_id": "embb_stream_004",
       "slice_type": "eMBB",
       "vnfs": [
-        {"vnf_id": "embb_stream_004_f1", "vnf_type": "Firewall",
-         "cpu_demand": 2.0, "ram_demand": 2.0,
-         "permitted_tiers": ["edge"], "vcr": 1.0},
-        {"vnf_id": "embb_stream_004_f2", "vnf_type": "CDN",
-         "cpu_demand": 4.0, "ram_demand": 8.0,
-         "permitted_tiers": ["edge", "regional_cloud"], "vcr": 0.7},
-        {"vnf_id": "embb_stream_004_f3", "vnf_type": "vEPC",
-         "cpu_demand": 6.0, "ram_demand": 12.0,
-         "permitted_tiers": ["regional_cloud", "central_cloud"], "vcr": 1.0}
+        {
+          "vnf_id": "embb_stream_004_f1",
+          "vnf_type": "Firewall",
+          "cpu_demand": 2.0,
+          "ram_demand": 2.0,
+          "permitted_tiers": [
+            "edge"
+          ],
+          "vcr": 1.0
+        },
+        {
+          "vnf_id": "embb_stream_004_f2",
+          "vnf_type": "CDN",
+          "cpu_demand": 4.0,
+          "ram_demand": 8.0,
+          "permitted_tiers": [
+            "edge",
+            "regional_cloud"
+          ],
+          "vcr": 0.7
+        },
+        {
+          "vnf_id": "embb_stream_004_f3",
+          "vnf_type": "vEPC",
+          "cpu_demand": 6.0,
+          "ram_demand": 12.0,
+          "permitted_tiers": [
+            "regional_cloud",
+            "central_cloud"
+          ],
+          "vcr": 1.0
+        }
       ],
       "flow_edges": [
-        {"source_vnf": "embb_stream_004_f1", "target_vnf": "embb_stream_004_f2",
-         "bandwidth_demand": 400.0},
-        {"source_vnf": "embb_stream_004_f2", "target_vnf": "embb_stream_004_f3",
-         "bandwidth_demand": 280.0}
+        {
+          "source_vnf": "embb_stream_004_f1",
+          "target_vnf": "embb_stream_004_f2",
+          "bandwidth_demand": 400.0
+        },
+        {
+          "source_vnf": "embb_stream_004_f2",
+          "target_vnf": "embb_stream_004_f3",
+          "bandwidth_demand": 280.0
+        }
       ],
-      "qos": {"max_e2e_delay": 50.0, "min_throughput": 200.0}
+      "qos": {
+        "max_e2e_delay": 50.0,
+        "min_throughput": 200.0
+      }
     },
     "placement_plan": {
       "plan_id": "embb_stream_004_plan",
       "vnf_assignments": [
-        {"vnf_id": "embb_stream_004_f1", "domain": "d1",
-         "required_tier": "edge", "cpu_demand": 2.0, "ram_demand": 2.0},
-        {"vnf_id": "embb_stream_004_f2", "domain": "d1",
-         "required_tier": "edge", "cpu_demand": 4.0, "ram_demand": 8.0},
-        {"vnf_id": "embb_stream_004_f3", "domain": "d2",
-         "required_tier": "regional_cloud", "cpu_demand": 6.0, "ram_demand": 12.0}
+        {
+          "vnf_id": "embb_stream_004_f1",
+          "domain": "d1",
+          "required_tier": "edge",
+          "cpu_demand": 2.0,
+          "ram_demand": 2.0
+        },
+        {
+          "vnf_id": "embb_stream_004_f2",
+          "domain": "d1",
+          "required_tier": "edge",
+          "cpu_demand": 4.0,
+          "ram_demand": 8.0
+        },
+        {
+          "vnf_id": "embb_stream_004_f3",
+          "domain": "d2",
+          "required_tier": "regional_cloud",
+          "cpu_demand": 6.0,
+          "ram_demand": 12.0
+        }
       ],
       "flow_requirements": [
-        {"source_vnf": "embb_stream_004_f1", "target_vnf": "embb_stream_004_f2",
-         "min_bandwidth_mbps": 400.0, "crosses_domain_boundary": false},
-        {"source_vnf": "embb_stream_004_f2", "target_vnf": "embb_stream_004_f3",
-         "min_bandwidth_mbps": 280.0, "crosses_domain_boundary": true}
+        {
+          "source_vnf": "embb_stream_004_f1",
+          "target_vnf": "embb_stream_004_f2",
+          "min_bandwidth_mbps": 400.0,
+          "crosses_domain_boundary": false
+        },
+        {
+          "source_vnf": "embb_stream_004_f2",
+          "target_vnf": "embb_stream_004_f3",
+          "min_bandwidth_mbps": 280.0,
+          "crosses_domain_boundary": true
+        }
       ],
-      "rationale": "Co-locating Firewall and CDN in d1 (mec) avoids the 400 Mbps f1→f2 flow crossing a domain boundary. CPU check: 2+4=6 < 25. RAM: 2+8=10 < 60. CDN (VCR=0.7) caches and reduces 30% of traffic, so f2→f3 BW = 400 * 1.0 * 0.7 = 280 Mbps. vEPC requires regional/central_cloud, placed in d2. The f2→f3 flow (280 Mbps) crosses d1→d2 (1000 Mbps available)."
+      "rationale": "Co-locating Firewall and CDN in d1 (mec) avoids the 400 Mbps f1\u2192f2 flow crossing a domain boundary. CPU check: 2+4=6 < 25. RAM: 2+8=10 < 60. CDN (VCR=0.7) caches and reduces 30% of traffic, so f2\u2192f3 BW = 400 * 1.0 * 0.7 = 280 Mbps. vEPC requires regional/central_cloud, placed in d2. The f2\u2192f3 flow (280 Mbps) crosses d1\u2192d2 (1000 Mbps available)."
     }
   }
 ]

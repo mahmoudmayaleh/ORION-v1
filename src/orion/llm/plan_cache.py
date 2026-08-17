@@ -95,6 +95,37 @@ def plan_signature(slice_req: SliceRequest) -> tuple[str, str, str, tuple[str, .
     )
 
 
+# §AA (2026-08-17): whether the cache key carries PER-DOMAIN scarcity.
+#
+# The cached object is an `AbstractPlan` holding concrete `suggested_domains`, so
+# what has to be stable between the arrival that authored a plan and the arrival
+# that reuses it is *which domain is loaded*. The shipped key carries only
+# whole-network aggregates: `cpu_residual_frac` and per-tier totals summed across
+# every domain. Those are identical for "domain 2 exhausted, domain 4 empty" and
+# "domain 4 exhausted, domain 2 empty", so the key cannot separate the two while
+# the stored plan names one of them.
+#
+# `revalidate_plan` does not catch it either: it checks that each named domain
+# still CONTAINS a node of the required tier, and composition is fixed, so that
+# test is always true. It is topology revalidation, not capacity revalidation.
+#
+# Measured, LLM-free: `partial_obs_builder` behind this exact cache loses 6.1 /
+# 11.6 / 12.7 pp at L2/L3/L4 against calling it fresh, and its `actor_infeasible`
+# goes 5 -> 201, 111 -> 489, 135 -> 668 per 2000. That is the same magnitude and
+# the same bin as the Full-minus-RL-advised gap, and RL-advised/RL-alone/
+# MDO-partial run the builder UNCACHED while Memory-off/Full run it cached. So the
+# gap attributed to the planner is substantially the cache.
+#
+# `dom_cpu` / `dom_ram` are already computed by `compute_condition_signature` and
+# then discarded here. Setting this True keys on them, at a coarse step: the plan
+# only needs to change when a domain crosses from "can host a chain" to "cannot".
+#
+# Default False keeps every banked cell reproducible. Turning it True changes the
+# key, so the hit rate and every cached result move; bank to a scratch directory.
+USE_PER_DOMAIN_CONDITION_KEY = False
+DOMAIN_STEP = 0.25
+
+
 def condition_key(
     condition: dict, cpu_step: float = 0.10, tier_step: float = 0.25
 ) -> tuple:
@@ -118,9 +149,19 @@ def condition_key(
         return round(round(float(x) / step) * step, 4)
 
     tiers = condition.get("tier_cpu_residual") or {}
-    return (
+    base = (
         _q(condition.get("cpu_residual_frac", 0.0), cpu_step),
         tuple(_q(tiers[k], tier_step) for k in sorted(tiers)),
+    )
+    if not USE_PER_DOMAIN_CONDITION_KEY:
+        return base
+    # Per-domain scarcity, in domain-id order so the tuple lines up with the
+    # `suggested_domains` the cached plan actually names.
+    dom_cpu = condition.get("domain_cpu_residual") or []
+    dom_ram = condition.get("domain_ram_residual") or []
+    return base + (
+        tuple(_q(x, DOMAIN_STEP) for x in dom_cpu),
+        tuple(_q(x, DOMAIN_STEP) for x in dom_ram),
     )
 
 

@@ -18,6 +18,7 @@ end-to-end with random or deterministic ("follow m̃") MDO policies.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -55,7 +56,29 @@ from orion.types import FlowEdge, QoSRequirements, SliceRequest
 logger = logging.getLogger(__name__)
 
 # Strength of the LLM's inference-time advice in mode="advised".
-ADVISE_WEIGHT = 2.0
+#
+# 2.0 is the value every banked cell was produced with and stays the default. What
+# it buys, measured on those cells: `Memory-off` commits m̃ on 95.3-98.0% of per-VNF
+# slots (`mtilde_agreement`, L1-L4) against 11.9-19.7% for `RL-alone`, which decodes
+# unadvised. At this weight the trained policy is very nearly a copier: "the planner
+# proposes and the policy disposes" is not a description of the measured behaviour,
+# it is a description of the mechanism that is available but almost never exercised.
+#
+# That is only a defect if the proposal is bad, which is the finding in
+# `partial_obs_prior.repair_plan`: the planner's splits, not the policy's decode,
+# account for the whole Full-minus-RL-alone gap. Copying an admissible plan is what
+# `MDO-partial` does by construction (`follow_prior`, agreement 1.0) and it is the
+# strongest partial-observability row in the table. So the first fix is the plan,
+# not the weight.
+#
+# The weight remains worth sweeping, because it is what decides whether the policy
+# CAN override a proposal it should reject, and today it effectively cannot. Kept as
+# an environment override rather than an argument so it reaches both the training
+# (`advised_sample`) and inference (`advised`) paths through one value: PPO's ratio
+# is only a ratio between two settings of the same policy if both sides carry the
+# same bias, so these must never be set independently. Any run at a non-default
+# weight must bank to a scratch cell directory; it is a different policy.
+ADVISE_WEIGHT = float(os.environ.get("ORION_ADVISE_WEIGHT", "2.0"))
 
 
 @dataclass

@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install CPU torch
+        # The default wheel pulls the full CUDA stack, which is several GB and
+        # useless on a CPU runner.
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install ORION
+        # rank-bm25 rather than the whole [retrieval] extra: it is the one the
+        # tests need, and faiss-cpu plus sentence-transformers are not exercised
+        # here. [actors] brings torch-geometric for the GATv2 domain actors.
+        run: |
+          pip install -e ".[dev,actors]"
+          pip install "rank-bm25>=0.2.2"
+
+      - name: Test
+        # PYTHONHASHSEED is pinned because behaviour cloning replays a greedy
+        # placement whose tie-breaking reads set iteration order.
+        env:
+          PYTHONHASHSEED: "0"
+        run: pytest --no-cov -q
+
+  lint:
+    name: lint (defects)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install ruff
+
+      - name: Ruff, defect rules
+        # The blocking gate is the subset that finds defects rather than style:
+        # syntax errors, undefined names, redefinitions, invalid comparisons.
+        # The full rule set in pyproject.toml is the style target and is reported
+        # below without blocking. It is not the gate because reformatting the
+        # experiment code in bulk would make every result file's commit stamp
+        # point at a tree that differs from the one the run actually used.
+        run: ruff check . --select E9,F63,F7,F82,F811
+
+      - name: Ruff, full rule set (advisory)
+        continue-on-error: true
+        run: ruff check . --statistics

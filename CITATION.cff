@@ -1,19 +1,23 @@
 cff-version: 1.2.0
-title: "ORION: Slice Orchestrator Assistant for Multi-Domain 6G Network Slicing"
+title: "ORION: Guiding RL with LLM Plans for Multi-Domain Slice Placement"
 message: "If you use this software, please cite it as below."
 type: software
 authors:
   - family-names: Mayaleh
-    given-names: Mahmoud
+    given-names: Mahmoud S.
+    affiliation: "Conservatoire national des arts et metiers"
+version: "0.1.0"
+date-released: "2026-08-17"
 repository-code: "https://github.com/mahmoudmayaleh/ORION-v1"
+license: MIT
 abstract: >-
-  ORION is an LLM-guided reinforcement-learning system for admission and placement of
-  network slices across federated administrative domains. A language model turns an
-  operator intent into a structured slice specification and an abstract placement plan;
-  a PPO-trained Multi-Domain Orchestrator, KL-regularised toward that plan, decides
-  admission and partitions the plan across domains; behaviour-cloned per-domain actors
-  place within each domain. The repository contains the system, its test suite, the
-  pre-registered experiment protocol, and the experiment entry points.
+  ORION admits and places 6G network slices across federated administrative domains. A
+  language model turns an operator intent into a structured slice specification and an
+  abstract placement plan over domains. A PPO-trained Multi-Domain Orchestrator decides
+  admission and partitions that plan across domains from per-domain aggregates rather
+  than full substrate state, and behaviour-cloned per-domain actors place the assigned
+  VNFs on concrete nodes inside their own domain. The repository contains the system,
+  its test suite and the experiment entry points.
 keywords:
   - network-slicing
   - 6G
@@ -21,4 +25,4 @@ keywords:
   - reinforcement-learning
   - large-language-models
   - multi-agent-ppo
-license: MIT
+  - service-function-chaining

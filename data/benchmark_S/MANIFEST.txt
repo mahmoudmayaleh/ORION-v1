@@ -1,0 +1,4 @@
+benchmark_S_sha256=212c9d055fe4ac43550cd9dc74476f8acbb88fae40a61b1cbb522b3732dcd1f3
+n_items=100
+hash_method=sha256(benchmark_S.json bytes, utf-8, indent=2, ensure_ascii=False)
+strata={"eMBB": 25, "URLLC": 25, "mMTC": 20, "V2X": 10, "XR": 10, "ambiguous": 10}

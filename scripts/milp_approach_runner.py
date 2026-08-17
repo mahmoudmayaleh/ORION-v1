@@ -153,10 +153,15 @@ def main():
     ap.add_argument("--levels", nargs="+", default=["L1", "L2", "L3", "L4"])
     ap.add_argument("--instance", type=int, default=HELDOUT_INSTANCES[0])
     ap.add_argument("--tag", default="MILP1")
+    ap.add_argument("--no-prereg", action="store_true",
+                    help="run without the pre-registration, which is not distributed with "
+                         "this repository. Applies only when the document is absent; the "
+                         "result JSON records prereg.status=\"skipped\".")
     args = ap.parse_args()
 
     prov = git_provenance(serving=None, tag=args.tag,
-                          prereg="docs/PREREG_AMENDMENT_2026-07-26_X.md")
+                          prereg="docs/PREREG_AMENDMENT_2026-07-26_X.md",
+                          allow_absent_prereg=args.no_prereg)
     log.info("provenance commit=%s dirty=%s", prov["git_commit"][:8], prov["git_dirty"])
 
     levels = fams = args.levels

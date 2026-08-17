@@ -7,7 +7,9 @@
       "vnf_type": "Firewall",
       "cpu_demand": 2.0,
       "ram_demand": 2.0,
-      "permitted_tiers": ["edge"],
+      "permitted_tiers": [
+        "edge"
+      ],
       "vcr": 1.0
     },
     {
@@ -15,7 +17,10 @@
       "vnf_type": "MediaProc",
       "cpu_demand": 14.0,
       "ram_demand": 30.0,
-      "permitted_tiers": ["edge", "regional_cloud"],
+      "permitted_tiers": [
+        "edge",
+        "regional_cloud"
+      ],
       "vcr": 1.2
     },
     {
@@ -23,7 +28,10 @@
       "vnf_type": "CDN",
       "cpu_demand": 4.0,
       "ram_demand": 8.0,
-      "permitted_tiers": ["edge", "regional_cloud"],
+      "permitted_tiers": [
+        "edge",
+        "regional_cloud"
+      ],
       "vcr": 0.7
     },
     {
@@ -31,7 +39,10 @@
       "vnf_type": "vEPC",
       "cpu_demand": 6.0,
       "ram_demand": 12.0,
-      "permitted_tiers": ["regional_cloud", "central_cloud"],
+      "permitted_tiers": [
+        "regional_cloud",
+        "central_cloud"
+      ],
       "vcr": 1.0
     }
   ],
