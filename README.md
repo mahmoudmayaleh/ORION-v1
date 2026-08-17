@@ -3,15 +3,23 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-ORION admits and places 6G network slices across federated administrative domains, using a Large Language Model (LLM) to propose a placement and reinforcement learning to dispose of it.
+ORION is a hierarchical framework for placing network slices across multiple administrative
+domains, where no operator has node-level visibility of the others. It separates proposing a
+slice decomposition from committing it: Large Language Model (LLM) agents propose, and a
+reinforcement learning orchestrator disposes.
 
-A slice request arrives as an operator intent. A language model turns it into a structured
-slice specification and an abstract placement plan over domains. A PPO-trained Multi-Domain
-Orchestrator decides whether to admit the slice and how to partition the plan across
-domains, seeing only per-domain aggregates rather than the full substrate. Behaviour-cloned
-per-domain actors then place the assigned VNFs on concrete nodes inside their own domain,
-and a verifier checks the result against the slice's QoS and capacity constraints before
-anything is committed.
+The setting is what makes this hard. Domains expose only aggregate summaries and hold
+different compute tiers, so placement restrictions can force a slice to span domains even
+when aggregate resources suffice, and utilization-dependent delays can break a latency
+budget before capacity is exhausted.
+
+LLM agents translate the service intent into a structured request and propose an abstract
+partition across domains and infrastructure tiers. A multi-domain orchestrator trained by
+reinforcement learning commits the partition, treating the proposal as a soft prior rather
+than an instruction, and per-domain actors place the functions on physical nodes. The
+proposal guides the orchestrator in training as well as at deployment, and verified
+placements are stored with the conditions under which they held, so the agents reuse
+structures that succeeded under comparable conditions.
 
 ![ORION system design](Orion-arch.jpg)
 

@@ -11,13 +11,20 @@ date-released: "2026-08-17"
 repository-code: "https://github.com/mahmoudmayaleh/ORION-v1"
 license: MIT
 abstract: >-
-  ORION admits and places 6G network slices across federated administrative domains. A
-  language model turns an operator intent into a structured slice specification and an
-  abstract placement plan over domains. A PPO-trained Multi-Domain Orchestrator decides
-  admission and partitions that plan across domains from per-domain aggregates rather
-  than full substrate state, and behaviour-cloned per-domain actors place the assigned
-  VNFs on concrete nodes inside their own domain. The repository contains the system,
-  its test suite and the experiment entry points.
+  Slices deployed across multiple administrative domains must be placed without node-level
+  visibility: domains expose only aggregate summaries and hold different compute tiers, so
+  placement restrictions can force a slice to span domains even when aggregate resources
+  suffice, and utilization-dependent delays can break a latency budget before capacity is
+  exhausted. ORION is a hierarchical framework that separates proposing a slice
+  decomposition from committing it. Large language model agents translate the service
+  intent into a structured request and propose an abstract partition across domains and
+  infrastructure tiers. A multi-domain orchestrator trained by reinforcement learning
+  commits the partition, treating the proposal as a soft prior rather than an instruction,
+  and per-domain actors place the functions on physical nodes. The proposal guides the
+  orchestrator in training as well as at deployment, and verified placements are stored
+  with the conditions under which they held, so the agents reuse structures that succeeded
+  under comparable conditions. This repository contains the system, its test suite and the
+  experiment entry points.
 keywords:
   - network-slicing
   - 6G
