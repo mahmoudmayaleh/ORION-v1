@@ -1,11 +1,9 @@
 # ORION
 
-[![CI](https://github.com/mahmoudmayaleh/ORION-v1/actions/workflows/ci.yml/badge.svg)](https://github.com/mahmoudmayaleh/ORION-v1/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-ORION admits and places 6G network slices across federated administrative domains, using a
-language model to propose a placement and reinforcement learning to dispose of it.
+ORION admits and places 6G network slices across federated administrative domains, using a Large Language Model (LLM) to propose a placement and reinforcement learning to dispose of it.
 
 A slice request arrives as an operator intent. A language model turns it into a structured
 slice specification and an abstract placement plan over domains. A PPO-trained Multi-Domain
@@ -126,12 +124,9 @@ mechanism rather than a bundle of changes.
 | `Plain`        | Heuristic      | Full substrate  | No      | No     |
 | `MDO-fullobs`  | Heuristic      | Full substrate  | No      | No     |
 | `MDO-partial`  | Heuristic      | Domain summaries| No      | No     |
-| `MDO-ffd`      | First-fit      | Domain summaries| No      | No     |
-| `RL-alone`     | Heuristic      | Domain summaries| Yes     | No     |
-| `RL-advised`   | Heuristic      | Domain summaries| Yes     | No     |
-| `RL-poprior`   | Heuristic prior| Domain summaries| Yes     | No     |
-| `Memory-off`   | Agent B        | Domain summaries| Yes     | No     |
-| `Full`         | Agent B        | Domain summaries| Yes     | M^B    |
+| `RL-alone`     | Policy         | Domain summaries| Yes     | No     |
+| `Memory-off`   | LLM            | Domain summaries| Yes     | No     |
+| `Full`         | LLM            | Domain summaries| Yes     | Yes    |
 
 `Plain` allocates directly; `MDO-fullobs` runs the same placer through the coordinator and
 the domain actors, so the two differ only in pipeline while `MDO-fullobs` and
@@ -140,50 +135,6 @@ repair, holding the language model's plan to the same admissibility tests the he
 applies to its own proposal. They are additive over their base approach, which stays the
 control.
 
-### Other entry points
-
-| Script                     | Purpose                                                        |
-|----------------------------|----------------------------------------------------------------|
-| `approach_runner.py`       | Single approach on a single instance                           |
-| `milp_approach_runner.py`  | Per-arrival optimal embedding reference                        |
-| `track_b_runner.py`        | Local model against a frozen benchmark and a frontier model    |
-| `partial_obs_prior.py`     | The partial-observability heuristic planner and its plan repair|
-| `calibrate_load_levels.py` | Re-derive the load ladder, then `freeze_load_levels.py`        |
-| `y15_figures.py`           | Acceptance figures and tables from banked cells                |
-| `llm_health_probe.py`      | Check the language-model server is answering before a long run |
-
-`scripts/README.md` describes all of them.
-
-## Provenance
-
-Every result-writing runner passes through `orion.provenance`, which stamps the commit,
-the dirty-file list and the serving model into the result JSON, and refuses to run at all
-if there is untracked code under `src/` or `scripts/`. A number produced by code that
-exists in no revision cannot later be reproduced or refuted, which is the failure this
-guard was built after. There is no bypass for it.
-
-The pre-registrations that govern the reported experiments are not distributed here. The
-entry points cite them by path and hash, so on a fresh clone they refuse to start. Pass
-`--no-prereg` to run anyway. It applies only when the document is genuinely absent, it
-relaxes nothing else, and the result JSON records `prereg.status = "skipped"` so a number
-produced without a pinned protocol says so on its face.
-
-## Testing
-
-```bash
-PYTHONHASHSEED=0 pytest                              # full suite with coverage
-PYTHONHASHSEED=0 pytest --no-cov -q                  # faster
-ruff check . --select E9,F63,F7,F82,F811             # the blocking lint gate
-ruff check .                                         # full style set, advisory
-```
-
-Two tests exercise a timeout path through `SIGALRM` and skip on Windows. CI runs the suite
-on Python 3.11 and 3.12.
-
-The blocking lint gate is the defect subset: syntax errors, undefined names, redefinitions
-and invalid comparisons. The wider style set in `pyproject.toml` is reported without
-blocking, because reformatting the experiment code in bulk would make every result file's
-commit stamp point at a tree that differs from the one the run used.
 
 ## Citation
 
