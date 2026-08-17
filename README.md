@@ -21,7 +21,7 @@ proposal guides the orchestrator in training as well as at deployment, and verif
 placements are stored with the conditions under which they held, so the agents reuse
 structures that succeeded under comparable conditions.
 
-![ORION system design](Orion-arch.png)
+![ORION system design](orion-arch.png)
 
 ## Why the orchestrator sees less than the baselines
 
