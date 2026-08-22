@@ -13,7 +13,7 @@ at the *abstract* level can improve a reinforcement-learning placement policy
 operating under **partial observability**, and by how much against baselines that
 are told the same or more.
 
-![ORION system design](V6-ORION.png)
+![ORION system design](orion-arch.png)
 
 ---
 
