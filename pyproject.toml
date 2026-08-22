@@ -4,24 +4,19 @@ version = "0.1.0"
 description = "Slice Orchestrator Assistant for Multi-Domain 6G Network Slicing"
 requires-python = ">=3.11"
 dependencies = [
+    # Core model of the substrate and the simulation.
     "networkx>=3.2",
-    "pulp>=2.8",
-    "gymnasium>=0.29",
-    "stable-baselines3>=2.3",
-    "torch>=2.2",
     "numpy>=1.26",
+    "scipy>=1.12",
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
-    "pyyaml>=6.0",
-    "structlog>=24.1",
-    "anthropic>=0.40",
+    # Learning stack.
+    "torch>=2.2",
+    "gymnasium>=0.29",
+    # LLM planner. The client is OpenAI-compatible and is pointed at either the
+    # local llama.cpp server or a frontier endpoint; there is no vendor SDK here.
+    "openai>=1.30",
     "httpx>=0.27",
-    "matplotlib>=3.8",
-    "seaborn>=0.13",
-    "pandas>=2.2",
-    "tqdm>=4.66",
-    "rich>=13.7",
-    "scipy>=1.12",
 ]
 
 [project.optional-dependencies]

@@ -27,6 +27,8 @@ plan layer.
 
 from __future__ import annotations
 
+import os
+
 from typing import Any
 
 from orion.substrate.graph_model import SubstrateNetwork
@@ -181,6 +183,48 @@ _TIER_SCALE = {
 _DEAD_FIELDS = ("inter_bw_residual_mean", "inter_bw_residual_min")
 
 
+# §AB (2026-08-18): whether the load-level term is a CLIFF or a ramp.
+#
+# The term is `1.0 if same level else 0.0` -- categorical, on a variable that is
+# ordered (L1 < L2 < L3 < L4 by offered load). `condition_similarity` averages six
+# terms and retrieval scores `0.5*f_task + 0.5*f_state` against a 0.60 floor, so
+# that one label is worth exactly 0.0833 of the combined score.
+#
+# Measured consequence, from data/parity_cells (store warmed at L2, frozen):
+# abstain runs .954/.903/.981 at L1, .027/.000/.019 at L2, and .99+ at L3/L4. It
+# fires at exactly one level. At L1 the near-miss quantiles are p50 .5805, p90
+# .5939, max .5999 against a floor of .6000 -- add the 0.0833 back and ALL of them
+# clear it, so L1's 95% abstain is entirely this label and not any real
+# dissimilarity. At L3/L4 the label is worth about a decile on top of a genuine
+# congestion mismatch.
+#
+# Graded uses ordinal distance over the ladder, so adjacent levels score 2/3
+# rather than 0. This keeps the signal the categorical form was there for -- L2
+# and L4 really are different regimes -- while removing the cliff. It is
+# deliberately NOT a drop of the term: the other five terms measure congestion
+# directly, so dropping it entirely is also defensible, but that is a larger
+# change and this one is enough to make retrieval reachable.
+#
+# Default False so every banked cell reproduces. Retrieval scores move when True,
+# so bank to a scratch directory.
+GRADED_LOAD_LEVEL = os.environ.get("ORION_GRADED_LEVEL", "0") != "0"
+
+_LEVEL_ORDER = {"L1": 0, "L2": 1, "L3": 2, "L4": 3}
+
+
+def _level_similarity(la: str, lb: str) -> float:
+    """1.0 for the same level; a ramp or a cliff off it, per GRADED_LOAD_LEVEL."""
+    if la == lb:
+        return 1.0
+    if not GRADED_LOAD_LEVEL:
+        return 0.0
+    ia, ib = _LEVEL_ORDER.get(la), _LEVEL_ORDER.get(lb)
+    if ia is None or ib is None:
+        return 0.0            # an unknown label is not a near neighbour of anything
+    span = len(_LEVEL_ORDER) - 1
+    return max(0.0, 1.0 - abs(ia - ib) / span)
+
+
 def condition_similarity(a: dict, b: dict) -> float:
     """Congestion similarity in [0,1] over the numeric condition fields.
 
@@ -232,7 +276,7 @@ def condition_similarity(a: dict, b: dict) -> float:
 
     la, lb = a.get("load_level"), b.get("load_level")
     if la and lb:
-        sims.append(1.0 if la == lb else 0.0)
+        sims.append(_level_similarity(la, lb))
 
     return sum(sims) / len(sims) if sims else 0.0
 

@@ -1,7 +1,8 @@
 """Build the MDO observation from substrate state and the abstract plan.
 
-The observation follows v6.2 Eq. 2:
-  o^MDO_t = ({ĉ^m_res, r̂^m_res, τ^m}, {b^res_ℓ, D_ℓ}, π̃_t)
+The observation follows v6.2 Eq. 2, plus the arriving request's QoS vector
+(2026-08-20, docs/RL_DIAGNOSIS_2026-08-20.md §6.1):
+  o^MDO_t = ({ĉ^m_res, r̂^m_res, τ^m}, {b^res_ℓ, D_ℓ}, π̃_t, q_s)
 
 Domain features are sorted by canonical key (tier_type, domain_id) for
 stable ordering across state evolution. Do NOT sort by state-dependent
@@ -10,6 +11,8 @@ quantities (residual capacity etc).
 
 from __future__ import annotations
 
+import logging
+import math
 from collections import Counter
 
 import torch
@@ -20,7 +23,8 @@ from orion.mdo.types import (
     MDOObservation,
     PlanSummary,
 )
-from orion.config import MDO_HEADROOM_CPU_REF, MDO_HEADROOM_RAM_REF
+from orion.config import (MDO_DELAY_REF, MDO_HEADROOM_CPU_REF,
+                          MDO_HEADROOM_RAM_REF)
 from orion.substrate.graph_model import SubstrateNetwork
 from orion.types import (InfrastructureTier, TIER_INDEX, TIER_INDEX_NORM,
                          TIER_ORDER)
@@ -28,6 +32,8 @@ from orion.types import (InfrastructureTier, TIER_INDEX, TIER_INDEX_NORM,
 # Canonical tier ordering for sort key
 # Canonical ordering lives in orion.types (one definition, see TIER_ORDER).
 _TIER_ORDER = TIER_INDEX
+
+logger = logging.getLogger(__name__)
 
 # Feature dimensions. THIS module owns the layout; `hierarchical_topology.OBS_DIM`
 # imports DOMAIN_FEAT_DIM from here rather than restating it, so the declared width
@@ -69,6 +75,22 @@ _TIER_ORDER = TIER_INDEX
 DOMAIN_FEAT_DIM = 5 + 4 * len(TIER_ORDER)   # 17
 LINK_FEAT_DIM = 3     # bw_res_frac, bw_cap_norm, delay_norm
 VNF_FEAT_DIM = 5      # cpu_norm, ram_norm, tier_idx, vcr, bw_norm
+
+# Slice-level block, replacing the five reserved zero slots (2026-08-20,
+# RL_DIAGNOSIS §6.1). See `_slice_features` for what each slot is and why.
+SLICE_FEAT_DIM = 6
+
+# Bumped whenever the MEANING of any slot changes, not only its width. A width
+# change makes a stale checkpoint fail loudly in `load_state_dict`; a
+# same-width semantic change would not, and this project has already been bitten
+# by a checkpoint whose filename did not encode the config that produced it.
+# `train_approach` writes this into every checkpoint and refuses to warm-start
+# across a mismatch.
+#
+#   1  pre-2026-08-20: 5 reserved zeros, per-VNF demand normalised by the
+#      per-arrival chain max, no QoS anywhere in the tensor.
+#   2  2026-08-20: slice/QoS block, per-VNF demand on substrate constants.
+OBS_VERSION = 2
 
 # Per VNF slot the observation ALSO carries a one-hot of the proposed domain m̃_k, in
 # CANONICAL index space, so the plan block is VNF_FEAT_DIM + M wide (2026-08-12).
@@ -195,15 +217,66 @@ def build_inter_domain_links(substrate: SubstrateNetwork) -> list[InterDomainLin
     return links
 
 
+_SLICE_CTX_WARNED = False
+
+
+def _slice_features(
+    qos,
+    plan: PlanSummary,
+    max_cpu_cap: float,
+    max_ram_cap: float,
+    max_bw_cap: float,
+    max_vnfs: int = 10,
+) -> list[float]:
+    """The slice-level block: what the ARRIVAL asks for (2026-08-20).
+
+    Six slots, replacing the five reserved zeros:
+
+      0  delay budget, linear, clipped at MDO_DELAY_REF. Full resolution over
+         the range where C7 actually binds (URLLC 5.4, V2X 12.4, XR 16.7),
+         saturated above it where it never does.
+      1  delay budget, log. Preserves the ORDERING of the loose tail
+         (eMBB 60, mMTC 290) that slot 0 saturates away.
+      2  min_throughput on the inter-domain bandwidth scale, so "this slice
+         needs more than a link has left" is expressible.
+      3  chain length / MAX_VNFS.
+      4  TOTAL chain CPU on the substrate scale.
+      5  TOTAL chain RAM on the substrate scale.
+
+    Slots 4-5 are the colocation feasibility question stated directly: a
+    colocated plan needs ONE domain to hold the whole chain, and the domain
+    block already publishes tier residuals on these same two normalisers.
+    Together with the per-VNF demands (now on the same scale, see
+    `observation_to_tensor`) this is the first observation in which
+    `d_k <= h^m` and `sum(d) <= tier_residual` are functions of the tensor.
+    """
+    delay = float(getattr(qos, "max_e2e_delay", 0.0) or 0.0)
+    thr = float(getattr(qos, "min_throughput", 0.0) or 0.0)
+    return [
+        min(1.0, delay / MDO_DELAY_REF) if delay > 0 else 0.0,
+        (math.log1p(delay) / math.log1p(MDO_DELAY_REF)) if delay > 0 else 0.0,
+        thr / max_bw_cap,
+        plan.num_vnfs / max(1, max_vnfs),
+        sum(plan.cpu_demands) / max_cpu_cap,
+        sum(plan.ram_demands) / max_ram_cap,
+    ]
+
+
 def build_mdo_observation(
     substrate: SubstrateNetwork,
     plan: PlanSummary,
+    slice_req=None,
 ) -> MDOObservation:
-    """Build the structured MDO observation."""
+    """Build the structured MDO observation.
+
+    `slice_req` supplies q_s for the slice block. Optional so width probes and
+    unit tests can omit it; the coordinator always passes it.
+    """
     return MDOObservation(
         domain_summaries=build_domain_summaries(substrate),
         inter_domain_links=build_inter_domain_links(substrate),
         plan=plan,
+        qos=getattr(slice_req, "qos", None),
     )
 
 
@@ -256,10 +329,25 @@ def observation_to_tensor(obs: MDOObservation, max_vnfs: int = 10) -> torch.Tens
             l.propagation_delay / max_delay,
         ])
 
-    # Plan features (per-VNF)
-    max_cpu_d = max(obs.plan.cpu_demands, default=1.0) or 1.0
-    max_ram_d = max(obs.plan.ram_demands, default=1.0) or 1.0
-    max_bw_d = max(obs.plan.bw_demands, default=1.0) or 1.0
+    # Plan features (per-VNF).
+    #
+    # These used to divide by max(plan.cpu_demands) / max(plan.ram_demands) /
+    # max(plan.bw_demands) -- PER-ARRIVAL scalars that appear NOWHERE in the
+    # tensor. Measured over 2000 L3 arrivals, max(cpu_demands) took 137 distinct
+    # values spanning 2.00 to 16.00 CPU (8.0x), so the largest VNF of every chain
+    # encoded as exactly 1.0 whether it needed 2 CPU or 16, and the fit test
+    # `d_k <= h^m` was not a function of the observation at ANY setting of the
+    # weights. That is the 2026-08-20 diagnosis: the policy's damage concentrates
+    # in `actor_infeasible` (98 -> 254 on an identical plan) precisely because it
+    # cannot ask whether a VNF fits the domain it is moving it to.
+    #
+    # They now divide by the SAME whole-substrate maxima the domain block and h^m
+    # already use, which is what makes the comparison well posed. Within-chain
+    # shape is not lost: the ratios between slots are unchanged, only the scale
+    # is now shared and observable.
+    max_cpu_d = max_cpu_cap
+    max_ram_d = max_ram_cap
+    max_bw_d = max_bw_cap
 
     # m̃ is emitted in CANONICAL index space, the same space the policy's logits and the
     # tier mask live in. suggested_domains holds raw domain ids; feeding those straight
@@ -289,9 +377,23 @@ def observation_to_tensor(obs: MDOObservation, max_vnfs: int = 10) -> torch.Tens
         else:
             parts.extend([0.0] * (VNF_FEAT_DIM + n_dom))
 
-    # Reserved feature slots (constant zero). Kept so the observation width
-    # stays stable across checkpointed policies.
-    parts.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+    # Slice block. Was five reserved zeros until 2026-08-20; `post_commit_c7_delay`
+    # is the largest rejection bin in the system and the delay budget it tests
+    # against was not in the tensor at all, so the reserved width is spent on it.
+    if obs.qos is None:
+        global _SLICE_CTX_WARNED
+        if not _SLICE_CTX_WARNED:
+            _SLICE_CTX_WARNED = True
+            logger.warning(
+                "observation_to_tensor: no q_s on the observation, slice block "
+                "emitted as zeros. Legal for width probes; inside an episode it "
+                "means the caller built the observation without slice_req and "
+                "the policy is blind to the delay budget again.")
+        parts.extend([0.0] * SLICE_FEAT_DIM)
+    else:
+        parts.extend(_slice_features(
+            obs.qos, obs.plan, max_cpu_cap, max_ram_cap, max_bw_cap,
+            max_vnfs=max_vnfs))
 
     return torch.tensor(parts, dtype=torch.float32)
 

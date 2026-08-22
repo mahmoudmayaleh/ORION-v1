@@ -38,7 +38,14 @@ from torch_geometric.data import Data
 from orion.actors.backbone import GATv2Backbone, GatedGCNBackbone, MLPBackbone
 from orion.actors.domain_observation import NODE_FEAT_DIM
 
-VNF_CONTEXT_DIM = 9
+# 9 -> 12 (2026-08-20, docs/RL_DIAGNOSIS_2026-08-20.md §9). The context carried
+# what the VNF NEEDS and nothing about the budget it has to fit into, while the
+# node features carry each node's processing delay -- so the policy could see the
+# price of every node and not the wallet. Exactly the MDO's §2b defect one level
+# down, and it is the reason a learned actor could not have beaten the fixed
+# min-delay rule: without the budget it cannot tell "I am tight, take the fast
+# node" from "I have slack, take the tight-fitting one".
+VNF_CONTEXT_DIM = 12
 
 
 class VNFEncoder(nn.Module):
@@ -51,6 +58,15 @@ class VNFEncoder(nn.Module):
       6: vcr
       7: bw_demand_norm      (bandwidth / max_link_bw in domain)
       8: position_in_sfc_norm (position / sfc_length)
+      9:  delay_remaining_abs  (min(1, remaining / MDO_DELAY_REF))
+      10: delay_remaining_log  (log1p(remaining) / log1p(MDO_DELAY_REF))
+      11: delay_budget_frac    (remaining / fragment budget, 1.0 at the first VNF)
+
+    Slots 9-10 are on MDO_DELAY_REF, the SAME absolute scale as node feature 15
+    (processing_delay_abs), so `node_delay * intensity <= remaining` is a
+    function of the observation. Node feature 8 is normalised by the domain's
+    max delay instead, which makes it useless for that comparison -- it is kept
+    because it still ranks nodes WITHIN the domain.
     """
 
     def __init__(self, in_dim: int = VNF_CONTEXT_DIM, out_dim: int = 128) -> None:
@@ -165,8 +181,29 @@ class DomainPolicy(nn.Module):
         # Apply learned bias to NULL slot
         scores[-1] = scores[-1] + self.null_bias
 
-        # Mask: real nodes use action_mask, NULL slot is always valid
-        aug_mask = torch.cat([action_mask, torch.tensor([True])])
+        # Mask: real nodes use action_mask; the NULL slot is reachable ONLY
+        # when no real node is feasible.
+        #
+        # NULL used to be unconditionally valid, which handed PPO a free
+        # "give up" action that the reward pays for. A coordinator-level
+        # reject scores 0; an admitted-then-revoked arrival scores
+        # -lambda_viol = -1. So refusing STRICTLY DOMINATES attempting a
+        # placement that might miss the delay budget, and the actor learned
+        # exactly that: measured 2026-08-20 at L3, an untrained actor chose
+        # NULL 109 times and every one was forced (mask empty), while after
+        # one training segment it chose NULL 196 times with 101 of those
+        # taken WHILE A FEASIBLE NODE EXISTED. Each voluntary refusal fails
+        # the whole arrival.
+        #
+        # Refusal is the coordinator's authority (MDOAction.COMMIT/REJECT),
+        # not the actor's -- an actor declining a slice the orchestrator chose
+        # to admit is deciding admission unilaterally. Restricting NULL to the
+        # genuinely-unplaceable case scopes the action space to what the actor
+        # is actually for, and leaves the BC semantics intact (the oracle's
+        # NULL label is only ever produced when it could not place either).
+        null_valid = not bool(action_mask.any())
+        aug_mask = torch.cat(
+            [action_mask, torch.tensor([null_valid], device=action_mask.device)])
         scores = scores.masked_fill(~aug_mask, float("-inf"))
 
         return scores
@@ -212,6 +249,34 @@ class DomainPolicy(nn.Module):
             action_val = self.NULL_ACTION
 
         return action_val, log_prob, entropy
+
+    def evaluate_step(
+        self,
+        graph_data,
+        vnf_context,
+        action_mask,
+        action_idx: int,
+    ):
+        """Re-evaluate one recorded placement step under CURRENT parameters.
+
+        The PPO replay path (2026-08-20, orion.training.actor_ppo). The
+        recorded `graph_data`/`action_mask` already encode the autoregressive
+        state at collection time (`has_placed_vnf`, resource overrides), so
+        re-scoring them is the chain-rule-correct conditional -- no
+        re-simulation needed.
+
+        `action_idx` uses the same convention `forward` returns: NULL_ACTION
+        (-1) maps to the NULL slot at index N.
+
+        Returns (log_prob, entropy), BOTH gradient-carrying -- unlike
+        `forward`, whose entropy is a float for rollout telemetry.
+        """
+        n_nodes = action_mask.size(0)
+        scores = self._encode_and_score(graph_data, vnf_context, action_mask)
+        dist = Categorical(logits=scores)
+        idx = n_nodes if action_idx == self.NULL_ACTION else action_idx
+        a = torch.tensor(idx, dtype=torch.long, device=scores.device)
+        return dist.log_prob(a), dist.entropy()
 
     def forward_bc(
         self,

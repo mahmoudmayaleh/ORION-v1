@@ -32,18 +32,45 @@ from orion.types import (
 # is why the binding tier has to be re-measured rather than carried over from the
 # four-tier substrate (where it was regional_cloud at 0.96).
 #
-# Invariant worth stating because a result depends on it: NO template permits
-# `central_cloud` exclusively, and every chain contains at least one edge-only or
-# regional-only VNF. So a domain holding central cloud alone (D3) can host no
-# COMPLETE chain and can only receive a fragment of a split partition. That is what
-# makes cross-domain placement genuinely forced here, and it is asserted in
-# tests/test_y_topology_and_load.py so it cannot be broken by a template edit.
+# §Y.1f AMENDMENT (2026-08-22). The invariant that USED to stand here said no
+# template permits `central_cloud` exclusively. It has been deliberately broken,
+# because it was the reason cross-domain placement was never actually forced.
+#
+# Central cloud was offered only ever ALONGSIDE edge or regional, so every function
+# could sit in an access domain, four of five domains hold both edge and regional,
+# and a single domain could host the WHOLE chain on 99.9% of arrivals at L1 and
+# 98.4% at L3. D3's ten central nodes were dead capacity that no chain ever needed.
+# Amending DOMAIN_TIERS alone does nothing about this and was measured doing nothing.
+#
+# Two functions are now cloud-ANCHORED, and both are latency-tolerant, which is why
+# they and not others:
+#
+#   mMTC Analytics   a batch analytics function over aggregated IoT telemetry. mMTC's
+#                    delay budget is 50-500 ms, the loosest of the five slice types,
+#                    so a national data centre is where this belongs.
+#   eMBB vEPC        the packet core. eMBB's budget is 20-100 ms and its traffic is
+#                    throughput-shaped rather than latency-shaped.
+#
+# NOT XR's vEPC and NOT URLLC or V2X: §Y.1c already recorded that pinning XR's vEPC
+# to central made 41% of XR infeasible on an EMPTY substrate, because a 5-30 ms
+# motion-to-photon budget cannot absorb a core-uplink traversal. That reasoning is
+# unchanged and those templates are untouched.
+#
+# eMBB's Firewall still permits central_cloud, deliberately. It is what makes eMBB
+# chains require the planner to LOOK AHEAD: a placer that seats the Firewall in D3
+# because D3 is the emptiest domain must then leave for the CDN and, under C10,
+# cannot return for the vEPC. Measured by exhaustive search over contiguous
+# admissible partitions, EVERY arrival a first-fit builder abandons this way has a
+# valid partition it simply did not find: 246/246 at L1 and 123/148 at L3. The
+# instance class separates lookahead from first-fit rather than being hard.
+#
+# Result: whole-chain host rate 99.9% -> 48.5%, acceptance roughly unchanged.
 
 _VNF_TEMPLATES: dict[SliceType, list[dict]] = {
     SliceType.EMBB: [
         {"type": "Firewall",   "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.8, "vcr": 1.0, "tiers": ["edge", "regional_cloud", "central_cloud"]},
         {"type": "CDN",        "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.2, "vcr": 0.7, "tiers": ["edge", "regional_cloud"]},
-        {"type": "vEPC",       "cpu": (4, 8),  "ram": (4, 16), "intensity": 1.0, "vcr": 1.0, "tiers": ["regional_cloud", "central_cloud"]},
+        {"type": "vEPC",       "cpu": (4, 8),  "ram": (4, 16), "intensity": 1.0, "vcr": 1.0, "tiers": ["central_cloud"]},  # §Y.1f: cloud-anchored
     ],
     SliceType.URLLC: [
         {"type": "Firewall",   "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.5, "vcr": 1.0, "tiers": ["edge"]},
@@ -52,7 +79,7 @@ _VNF_TEMPLATES: dict[SliceType, list[dict]] = {
     SliceType.MMTC: [
         {"type": "IoTGateway", "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.4, "vcr": 0.3, "tiers": ["edge"]},
         {"type": "Aggregator", "cpu": (2, 4),  "ram": (2, 8),  "intensity": 0.6, "vcr": 0.5, "tiers": ["edge", "regional_cloud"]},
-        {"type": "Analytics",  "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.5, "vcr": 1.0, "tiers": ["regional_cloud", "central_cloud"]},
+        {"type": "Analytics",  "cpu": (4, 8),  "ram": (8, 16), "intensity": 1.5, "vcr": 1.0, "tiers": ["central_cloud"]},  # §Y.1f: cloud-anchored
     ],
     SliceType.V2X: [
         {"type": "Firewall",   "cpu": (1, 2),  "ram": (1, 4),  "intensity": 0.5, "vcr": 1.0, "tiers": ["edge"]},
@@ -243,21 +270,3 @@ def generate_slice_request(
         lifetime=lifetime,
     )
 
-
-def generate_slice_batch(
-    substrate: SubstrateNetwork,
-    rng: np.random.Generator,
-    num_requests: int,
-) -> list[SliceRequest]:
-    """Generate a static batch of slice requests (for MILP oracle evaluation).
-
-    All requests have arrival_time=0.0 and lifetime=0.0.
-    """
-    return [
-        generate_slice_request(
-            request_id=f"req_{i:04d}",
-            substrate=substrate,
-            rng=rng,
-        )
-        for i in range(num_requests)
-    ]

@@ -89,7 +89,9 @@ def test_every_tier_is_populated():
     for n in sub.graph.nodes:
         counts[sub.graph.nodes[n]["tier"]] = counts.get(sub.graph.nodes[n]["tier"], 0) + 1
     assert set(counts) == {t.value for t in TIER_ORDER}
-    assert counts == {"edge": 54, "regional_cloud": 14, "central_cloud": 12}
+    # §Y.1f: D0 and D2 lost their one central node each, which the tree generator
+    # re-spends on edge leaves. Total node count is unchanged at 80.
+    assert counts == {"edge": 56, "regional_cloud": 14, "central_cloud": 10}
     assert sub.graph.number_of_nodes() == TOTAL_NODES == 80
 
 
@@ -108,11 +110,18 @@ def test_domains_hold_different_tier_sets():
 
 
 def test_no_domain_can_host_every_chain_alone():
-    """The registered Y.1e prediction, asserted so a template edit cannot silently
-    break it: the central-only domain can host NO complete chain, because no template
-    permits central cloud exclusively and every chain contains at least one edge-only
-    or regional-only VNF. That is what makes cross-domain placement forced here
-    rather than optional."""
+    """§Y.1f, asserted so a template or topology edit cannot silently undo it.
+
+    The §Y.1e version of this test checked only that the central-only domain hosts
+    no complete chain. That was true and it did not deliver what it claimed: D0 and
+    D2 held all three tiers, so THEY hosted every chain instead, and a whole-chain
+    host existed on 99.9% of arrivals at L1. Cross-domain placement was optional on
+    essentially every arrival.
+
+    So the property pinned here is the one that actually matters: a large share of
+    chains must be colocatable NOWHERE. A cloud-anchored function plus an
+    edge-anchored one cannot share a domain now that no domain holds both tiers.
+    """
     sub = generate_hierarchical_topology(0)
     rng = np.random.default_rng(0)
     central_only = [d for d, t in DOMAIN_TIERS.items()
@@ -120,17 +129,32 @@ def test_no_domain_can_host_every_chain_alone():
     assert central_only, "no central-only domain in the committed composition"
 
     colocatable = {d: 0 for d in range(NUM_DOMAINS)}
+    colocatable_per_chain = []
     for i in range(300):
         sr = generate_slice_request(f"r{i}", sub, rng, arrival_time=0.0, lifetime=20.0)
         assert all(v.permitted_nodes for v in sr.vnfs), "a VNF is placeable nowhere"
+        this = {}
         for d in range(NUM_DOMAINS):
             nodes = set(sub.nodes_in_domain(d))
-            if all(set(v.permitted_nodes) & nodes for v in sr.vnfs):
+            this[d] = all(set(v.permitted_nodes) & nodes for v in sr.vnfs)
+            if this[d]:
                 colocatable[d] += 1
+        colocatable_per_chain.append(this)
     for d in central_only:
         assert colocatable[d] == 0, (
             f"D{d} is central-only but colocated {colocatable[d]} chains")
     assert any(colocatable[d] > 0 for d in range(NUM_DOMAINS) if d not in central_only)
+
+    # The §Y.1f property: a chain colocatable in NO domain is the common case, not a
+    # curiosity. Measured 51.5% on the committed composition; the bound is loose so
+    # that instance sampling cannot flake it, but tight enough that reverting either
+    # amendment (which would send this to ~0%) fails here.
+    nowhere = sum(1 for i in range(300)
+                  if not any(colocatable_per_chain[i][d] for d in range(NUM_DOMAINS)))
+    assert nowhere >= 90, (
+        f"only {nowhere}/300 chains are colocatable nowhere; the multi-domain "
+        "problem is optional again, so a template or DOMAIN_TIERS edit has undone "
+        "the Y.1f amendment")
 
 
 def test_levels_follow_tier_count_and_the_top_tier_is_plural_where_it_must_be():
@@ -326,8 +350,12 @@ def test_obs_dim_matches_the_realised_substrate():
     n_pairs = len(build_inter_domain_links(sub))
     assert n_pairs == NUM_DOMAIN_PAIRS == 2 * len(INTER_DOMAIN_ADJACENCIES) == 16
     assert DOMAIN_FEAT_DIM == 5 + 4 * len(TIER_ORDER) == 17
+    # 5 -> SLICE_FEAT_DIM (2026-08-20): the five reserved zeros became the
+    # slice/QoS block. See docs/RL_DIAGNOSIS_2026-08-20.md §6.1.
+    from orion.mdo.observation import SLICE_FEAT_DIM, VNF_FEAT_DIM
     assert OBS_DIM == (DOMAIN_FEAT_DIM * NUM_DOMAINS + 3 * n_pairs
-                       + (5 + NUM_DOMAINS) * 10 + 5) == 238
+                       + (VNF_FEAT_DIM + NUM_DOMAINS) * 10
+                       + SLICE_FEAT_DIM) == 239
 
 
 def test_the_size_and_composition_are_constants_not_parameters():
@@ -336,7 +364,7 @@ def test_the_size_and_composition_are_constants_not_parameters():
     own results."""
     import inspect
 
-    assert (NUM_DOMAINS, TOTAL_NODES, OBS_DIM) == (5, 80, 238)
+    assert (NUM_DOMAINS, TOTAL_NODES, OBS_DIM) == (5, 80, 239)
     params = inspect.signature(generate_hierarchical_topology).parameters
     assert not {"size", "num_domains", "composition", "tiers"} & set(params)
     sub = generate_hierarchical_topology(0)
@@ -457,7 +485,7 @@ def test_calibrated_levels_are_frozen_and_ordered():
 
     assert set(CALIBRATED_LEVELS) == {"L1", "L2", "L3", "L4"}
     lams = [CALIBRATED_LEVELS[n].arrival_rate for n in ("L1", "L2", "L3", "L4")]
-    accs = [CALIBRATED_LEVELS[n].plain_acceptance for n in ("L1", "L2", "L3", "L4")]
+    accs = [CALIBRATED_LEVELS[n].reference_acceptance for n in ("L1", "L2", "L3", "L4")]
     assert lams == sorted(lams), "lambda must rise L1 -> L4"
     assert accs == sorted(accs, reverse=True), "acceptance must fall L1 -> L4"
     # A is the offered concurrency; it must be well under N or the episode cannot
@@ -549,8 +577,15 @@ def test_observation_width_is_measured_not_declared():
         vcrs=[v.vcr for v in sr.vnfs],
         bw_demands=[f.bandwidth_demand for f in sr.flow_edges])
 
-    tensor = observation_to_tensor(build_mdo_observation(sub, plan), max_vnfs=10)
-    assert tensor.shape[0] == OBS_DIM == 238
+    # slice_req passed: the width must be the one the REAL path emits, which
+    # since 2026-08-20 includes the slice/QoS block.
+    tensor = observation_to_tensor(
+        build_mdo_observation(sub, plan, slice_req=sr), max_vnfs=10)
+    assert tensor.shape[0] == OBS_DIM == 239
+    # ... and omitting slice_req must not silently change the width, only zero
+    # the block, so a width probe and a real arrival agree.
+    assert observation_to_tensor(
+        build_mdo_observation(sub, plan), max_vnfs=10).shape[0] == OBS_DIM
 
 
 def test_per_tier_residuals_distinguish_domains_that_lack_a_tier():

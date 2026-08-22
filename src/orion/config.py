@@ -16,6 +16,21 @@ from pydantic_settings import BaseSettings
 MDO_HEADROOM_CPU_REF: float = 16.0
 MDO_HEADROOM_RAM_REF: float = 32.0
 
+# --- QoS reference constant (2026-08-20, RL_DIAGNOSIS §6.1) ---
+# `max_e2e_delay` was absent from the MDO observation entirely, while
+# `post_commit_c7_delay` is the LARGEST rejection bin (422 of 1049 at L3/seed42,
+# 40%). It is emitted now, and this is the scale it is emitted on. Budgets are
+# heavy-tailed by slice class -- measured over 1885 L3 arrivals, URLLC 5.4+-2.6
+# through mMTC 290.5+-126.4, spanning [1.0, 498.0] over 969 distinct values --
+# so a single linear normaliser wastes all its resolution on the loose end where
+# the constraint never binds. The observation carries BOTH a linear feature
+# clipped at this reference (resolution where it binds) and a log feature over
+# the whole range (ordering where it does not).
+#
+# FROZEN LITERAL, same discipline as the headroom refs above: it sets what the
+# policy can resolve, so it must not silently follow the QoS generator.
+MDO_DELAY_REF: float = 100.0
+
 # --- CPU energy estimation constant (PREREG 2026-07-11 §M.4-Δ7) ---
 # Measured CPU energy is UNAVAILABLE on the experiment box without root: RAPL sysfs is
 # permission-denied, the perf RAPL PMU is blocked (perf_event_paranoid=4), and k10temp exposes
@@ -49,27 +64,12 @@ class TopologyConfig(BaseSettings):
     model_config = {"env_prefix": "ORION_TOPOLOGY_"}
 
 
-class MILPConfig(BaseSettings):
-    """MILP solver parameters."""
-
-    solver: str = "PULP_CBC_CMD"
-    time_limit: int = 60
-    mip_gap: float = 0.01
-    mu: float = 100.0
-    alpha: float = 1.0
-    gamma_intra: float = 0.1
-    gamma_inter: float = 1.0
-    max_inter_domain_hops: int = 3
-
-    model_config = {"env_prefix": "ORION_MILP_"}
-
 
 class OrionConfig(BaseSettings):
     """Root configuration."""
 
     project_root: Path = Path(".")
     topology: TopologyConfig = Field(default_factory=TopologyConfig)
-    milp: MILPConfig = Field(default_factory=MILPConfig)
     seed: int = 42
 
     model_config = {"env_prefix": "ORION_", "env_file": ".env", "env_nested_delimiter": "__"}

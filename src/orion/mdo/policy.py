@@ -236,6 +236,34 @@ class AutoregMDOPolicy(nn.Module):
         pos = torch.tensor([k / max(num_vnfs, 1)], dtype=h.dtype, device=h.device)
         return self.decoder(torch.cat([h, cnt, pos]))  # [M] raw (pre-mask)
 
+    @staticmethod
+    def _raw_entropy(raw, mask, neg_inf, advised_dist, prior_logits):
+        """Entropy of the RAW (unadvised) policy at this step.
+
+        Changed 2026-08-20 (RL_DIAGNOSIS §6.3). This used to return the entropy
+        of the ADVISED distribution, softmax(raw + w * onehot(m~)), which is what
+        the PPO loss subtracts `ent_coef * ent` from. Maximising THAT entropy
+        drives the advised logits toward uniform, and its fixed point is
+        raw[m~] = -w: the bonus is satisfied exactly when the policy has
+        cancelled the entire advisory channel. Measured at init with M=5
+        feasible domains, dH/d raw[m~] = -0.456, and the §Y.13 dual controller
+        can multiply that by ENT_COEF_MAX = 0.5. So it was a SYSTEMATIC pull
+        away from the advisor, competing against a PPO term whose whitened
+        advantage has mean zero -- a small biased force against a large unbiased
+        one, which the bias wins in expectation.
+
+        The entropy floor exists to stop the POLICY from collapsing, and the
+        policy is `raw`; the advisory shift is a fixed, parameterless offset
+        that exploration should not be spending its budget undoing.
+
+        With `prior_logits is None` or `prior_weight == 0` the two distributions
+        are identical, so every unadvised path (RL-alone, deterministic eval)
+        is byte-identical to before this change.
+        """
+        if prior_logits is None:
+            return advised_dist.entropy()
+        return Categorical(logits=torch.where(mask, raw, neg_inf)).entropy()
+
     def forward(self, obs, tier_mask, num_vnfs, deterministic=False,
                 prior_logits=None, prior_weight=0.0):
         """prior_logits [K, M] + prior_weight>0 make the LLM plan ADVISE the decode
@@ -255,13 +283,82 @@ class AutoregMDOPolicy(nn.Module):
             ai = int(a.item())
             partition.append(ai)
             lp_list.append(dist.log_prob(a))
-            ent_sum += dist.entropy().item()
+            ent_sum += float(self._raw_entropy(
+                raw, tier_mask[k], neg_inf, dist, prior_logits).item())
             raw_list.append(raw)
             counts[ai] += 1.0
         log_probs = torch.stack(lp_list)
         logits = torch.stack(raw_list)  # [K, M] raw
         mean_ent = ent_sum / num_vnfs if num_vnfs > 0 else 0.0
         return partition, log_probs, logits, mean_ent
+
+    def joint_host_decode(self, obs, tier_mask, num_vnfs,
+                          prior_logits=None, prior_weight=0.0,
+                          candidate_mask=None):
+        """Argmax over the COLOCATED partitions of this policy's OWN joint.
+
+        §AE (2026-08-19). `forward` decodes per-VNF: K argmaxes, each free to name a
+        different domain. Under `ORION_COLOCATION_CONTRACT` the plan carries ONE
+        `host_domain`, so a per-VNF decode can only either copy it K times or BREAK
+        it, and breaking it is what the `cross_domain_infeasible` + `c9_hops` bins
+        are. The decision the contract actually poses is "which domain hosts this
+        chain", which is ONE categorical over M, not K over M.
+
+        This scores exactly that. For each candidate host c it replays the
+        autoregressive decode along the all-c partition and sums the per-step
+        log-probs, which IS log pi(all-c | s) because the decode is a chain rule
+        over the same steps: the counts vector is deterministic given c (counts[c]
+        == k at step k), so no approximation and no re-parameterisation is involved.
+        The argmax is then the most probable COLOCATED action under the trained
+        policy, with the advisory bias included exactly as `forward` includes it.
+
+        This is not a way to make the policy obey the plan. It restricts the action
+        SET to the colocated ones and lets the policy choose freely inside it, so it
+        can and does name a host the planner did not (see JOINT_HOST_STATS
+        `overrode`). What it removes is the policy's ability to shatter a chain,
+        which under the contract is never the intended action.
+
+        `candidate_mask` [M] optionally narrows the hosts further (e.g. capacity).
+
+        Returns (partition, log_probs, logits, mean_entropy, host, n_candidates),
+        or None when NO domain is tier-feasible for every VNF -- which is exactly
+        the case the contract itself falls back to per-VNF assignment for, and the
+        one where a split is the right answer. The caller decodes normally then.
+        """
+        h = self._encode(obs)
+        neg_inf = torch.tensor(float("-inf"), dtype=h.dtype, device=h.device)
+        feasible = tier_mask[:num_vnfs].all(dim=0)  # [M] tier-feasible for ALL VNFs
+        if candidate_mask is not None:
+            feasible = feasible & candidate_mask
+        candidates = feasible.nonzero(as_tuple=True)[0].tolist()
+        if not candidates:
+            return None
+
+        best = None  # (score, host, lps, ents, raws)
+        for c in candidates:
+            counts = [0.0] * self.num_domains
+            score = 0.0
+            lps, ents, raws = [], [], []
+            for k in range(num_vnfs):
+                raw = self._step_logits(h, counts, k, num_vnfs)
+                dec = raw if prior_logits is None else raw + prior_weight * prior_logits[k]
+                masked = torch.where(tier_mask[k], dec, neg_inf)
+                dist = Categorical(logits=masked)
+                lp = dist.log_prob(torch.tensor(c, device=masked.device))
+                score += float(lp.item())
+                lps.append(lp)
+                ents.append(float(self._raw_entropy(
+                    raw, tier_mask[k], neg_inf, dist, prior_logits).item()))
+                raws.append(raw)
+                counts[c] += 1.0
+            if best is None or score > best[0]:
+                best = (score, c, lps, ents, raws)
+
+        _score, host, lps, ents, raws = best
+        partition = [host] * num_vnfs
+        mean_ent = sum(ents) / num_vnfs if num_vnfs > 0 else 0.0
+        return (partition, torch.stack(lps), torch.stack(raws), mean_ent,
+                host, len(candidates))
 
     def evaluate_actions(self, obs, tier_mask, actions, num_vnfs,
                          prior_logits=None, prior_weight=0.0):
@@ -288,7 +385,11 @@ class AutoregMDOPolicy(nn.Module):
             masked = torch.where(tier_mask[k], dec, neg_inf)
             dist = Categorical(logits=masked)
             lp_list.append(dist.log_prob(actions[k]))
-            ent_sum = ent_sum + dist.entropy()
+            # RAW-policy entropy: the loss maximises this, and maximising the
+            # ADVISED entropy would drive raw[m~] to -prior_weight. See
+            # `_raw_entropy`. Gradient-carrying, unlike the two call sites above.
+            ent_sum = ent_sum + self._raw_entropy(
+                raw, tier_mask[k], neg_inf, dist, prior_logits)
             raw_list.append(raw)
             counts[int(actions[k].item())] += 1.0
         log_probs = torch.stack(lp_list)

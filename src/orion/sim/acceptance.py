@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 REJECT_BINS = (
     # ── PRE-COMMIT: the coordinator refused before anything was allocated ──
     "structural",            # never reached the MDO: no admissible plan built
+    "chain_order",           # C10: the partition re-enters a domain it had left
     "actor_infeasible",      # a domain actor returned z^m = 0 (capacity / tier)
     "cross_domain_infeasible",  # no route between the assigned domains
     "c5b_bandwidth",         # inter-domain bandwidth
@@ -134,6 +135,10 @@ def _classify(result) -> str:
     violation = getattr(decision, "violation", None) if decision else None
     if violation is None:
         return "unattributed"
+    # C10 first: it is decided from the partition alone, before any actor runs, so
+    # nothing else in this record can be the binding constraint.
+    if getattr(violation, "chain_order_violated", False):
+        return "chain_order"
     if getattr(violation, "actor_infeasible", False):
         return "actor_infeasible"
     if getattr(violation, "cross_domain_infeasible", False):

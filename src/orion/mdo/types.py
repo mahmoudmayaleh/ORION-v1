@@ -18,7 +18,7 @@ from typing import Any
 import torch
 
 from orion.actors.types import DomainResponse
-from orion.types import InfrastructureTier, SliceType
+from orion.types import InfrastructureTier, QoSRequirements, SliceType
 
 
 class MDOAction(IntEnum):
@@ -103,11 +103,22 @@ class PlanSummary:
 class MDOObservation:
     """Aggregated cross-domain observation for the MDO policy (v6.2 Eq. 2).
 
-    o^MDO_t = ({ĉ^m_res, r̂^m_res, τ^m}, {b^res_ℓ, D_ℓ}, π̃_t)
+    o^MDO_t = ({ĉ^m_res, r̂^m_res, τ^m}, {b^res_ℓ, D_ℓ}, π̃_t, q_s)
+
+    `qos` is the ARRIVING REQUEST's q_s, added 2026-08-20 (RL_DIAGNOSIS §6.1).
+    It is deliberately NOT a field of `PlanSummary`: the QoS vector is the
+    request's, not the planner's, and threading it through every plan builder
+    would have given each of them a chance to forget it. The coordinator holds
+    the authoritative `slice_req` and passes it here.
+
+    None means "no request context supplied" -- the slice block emits zeros.
+    That is legal for width probes and for tests, and `observation_to_tensor`
+    warns once when it happens inside a real episode.
     """
     domain_summaries: list[DomainSummary]
     inter_domain_links: list[InterDomainLink]
     plan: PlanSummary
+    qos: QoSRequirements | None = None
 
     @property
     def num_domains(self) -> int:
@@ -122,6 +133,9 @@ class ViolationInfo:
     c9_violated: bool = False
     actor_infeasible: bool = False  # any z^m = 0
     cross_domain_infeasible: bool = False
+    #: C10 — the partition re-enters a domain it had already left. Decided from the
+    #: partition alone, before any actor is dispatched. See orion.mdo.chain_order.
+    chain_order_violated: bool = False
     e2e_delay: float = 0.0
     e2e_budget: float = 0.0
     total_bw: float = 0.0
@@ -131,10 +145,12 @@ class ViolationInfo:
 
     @property
     def violation_vector(self) -> tuple[bool, ...]:
-        """(C5b, C7, C9, actor_infeasible, cross_domain_infeasible) for stability detection."""
+        """(C5b, C7, C9, actor_infeasible, cross_domain_infeasible, chain_order)
+        for stability detection."""
         return (
             self.c5b_violated, self.c7_violated, self.c9_violated,
             self.actor_infeasible, self.cross_domain_infeasible,
+            self.chain_order_violated,
         )
 
     @property

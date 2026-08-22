@@ -2,9 +2,8 @@
 
 The coordinator's commits are verified post-commit by the ground-truth
 verifier (M/M/1 sojourn delay, hop budget), and violating admissions are
-deallocated. Plans admitted by static baselines (Plain's co-location FFD,
-the MILP approach) and by the feasibility ceiling's co-location fast path did not
-pass through that machinery. This module gives them the SAME check, with the
+deallocated. Plans admitted by static baselines (Plain's co-location FFD) did not pass
+through that machinery. This module gives them the SAME check, with the
 verifier's delay model, evaluated on the candidate plan against the current
 (pre-allocation) substrate state.
 

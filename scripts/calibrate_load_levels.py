@@ -27,8 +27,10 @@ substrate lambda=4.0 is only rho~0.30, so the pre-§Y bracket of 0.5..4.0 never
 approaches saturation and could not have produced the L3/L4 targets.
 
 Plain admission is byte-identical to `grid_runner.eval_plain`: colocation_ffd,
-then the §X.2 QoS gate, then allocate; departures release. If those diverge the
-calibration describes a policy that never runs.
+then C10 chain-order contiguity, then the §X.2 QoS gate, then allocate; departures
+release. If those diverge the calibration describes a policy that never runs, and
+they DID diverge: C10 was added to `eval_plain` and not here, so until 2026-08-22
+the ladder was pinned on a Plain that never faced it.
 
 Run:  PYTHONHASHSEED=0 PYTHONPATH=src python scripts/calibrate_load_levels.py
 """
@@ -46,7 +48,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import numpy as np  # noqa: E402
 
+from dataclasses import replace  # noqa: E402
+
 from orion.baselines.colocation_ffd import colocation_ffd  # noqa: E402
+from orion.mdo import chain_order as _chain_order  # noqa: E402
+from partial_obs_prior import oracle_builder  # noqa: E402
+
+#: Sentinel for "the oracle found no partition, so no placement was attempted".
+#: A distinct object rather than None so the branch below cannot be confused with
+#: a real GreedyResult whose plan happens to be None.
+GreedyResultMissing = object()
 from orion.baselines.greedy_ffd import GreedyConfig  # noqa: E402
 from orion.sim.arrival_process import EventType  # noqa: E402
 from orion.sim.load_levels import (  # noqa: E402
@@ -76,8 +87,27 @@ log = logging.getLogger("calib")
 OUT = Path("results/y3_load_calibration.json")
 
 
-def run_plain(substrate, arrival_rate, rng, num_arrivals=NUM_ARRIVALS):
-    """One Plain episode. Admission logic mirrors grid_runner.eval_plain exactly.
+def _restricted(sr, domains, substrate):
+    """`sr` with every VNF's permitted nodes narrowed to its assigned domain.
+
+    Lets the oracle reuse the SAME placement, routing, QoS gate and allocate path
+    as the Plain reference: once the partition is fixed the node-level work is
+    identical, so the two references differ in exactly one thing, which is the
+    partition. Returns None if the narrowing empties a VNF.
+    """
+    g = substrate.graph
+    vnfs = []
+    for v, d in zip(sr.vnfs, domains):
+        keep = [n for n in v.permitted_nodes if g.nodes[n]["domain_id"] == d]
+        if not keep:
+            return None
+        vnfs.append(replace(v, permitted_nodes=keep))
+    return replace(sr, vnfs=vnfs)
+
+
+def run_plain(substrate, arrival_rate, rng, num_arrivals=NUM_ARRIVALS,
+              reference="plain"):
+    """One reference episode. Admission mirrors grid_runner.eval_plain exactly.
 
     Returns per-arrival admit flags in arrival order, plus occupancy samples so
     the steady state can be checked rather than assumed.
@@ -92,7 +122,8 @@ def run_plain(substrate, arrival_rate, rng, num_arrivals=NUM_ARRIVALS):
     # reads zero for every tier, because the last events are departures and the
     # substrate is empty again by then.
     util_samples: list[dict] = []
-    causes = {"no_placement": 0, "qos_gate": 0, "allocate_failed": 0}
+    causes = {"no_placement": 0, "chain_order": 0, "qos_gate": 0,
+              "allocate_failed": 0}
     n_arrivals_seen = 0
 
     for ev in ap.events:
@@ -104,13 +135,31 @@ def run_plain(substrate, arrival_rate, rng, num_arrivals=NUM_ARRIVALS):
         if ev.event_type != EventType.ARRIVAL or ev.slice_request is None:
             continue
         sr = ev.slice_request
-        res = colocation_ffd(substrate, sr, GreedyConfig())
+        placed = sr
+        if reference == "oracle":
+            # §Y.3b: choose the partition exhaustively, then place inside it.
+            summary = oracle_builder(sr, substrate)
+            placed = None if summary is None else _restricted(
+                sr, summary.suggested_domains, substrate)
+        res = (GreedyResultMissing if placed is None
+               else colocation_ffd(substrate, placed, GreedyConfig()))
         ok = False
         # Separate the two rejection causes. A rejection floor that persists at
         # near-zero utilisation is structural, not congestion, and calibrating
         # load levels against it would be pinning lambda on a constant.
-        if not res.feasible or res.plan is None:
+        if res is GreedyResultMissing or not res.feasible or res.plan is None:
             causes["no_placement"] += 1
+        elif _chain_order.violates(
+                [substrate.graph.nodes[res.plan.vnf_placements[v.vnf_id]]["domain_id"]
+                 for v in sr.vnfs]):
+            # C10, added 2026-08-22 to restore the byte-identical claim above.
+            # `grid_runner.eval_plain` has applied the contiguity constraint since
+            # it was introduced; this script did not, so the ladder was calibrated
+            # against a Plain facing one fewer constraint than the Plain that runs.
+            # Measured cost of the divergence on the §Y.1f substrate: 604 of 2000
+            # arrivals at L1, so the frozen `plain_acceptance` overstated the real
+            # row by 24 pp and every level sat at the wrong lambda.
+            causes["chain_order"] += 1
         elif not plan_qos_ok(substrate, sr, res.plan):
             causes["qos_gate"] += 1
         else:
@@ -163,6 +212,21 @@ def main():
                     default=list(TRAIN_INSTANCES[:3]),
                     help="topology instances to average over")
     ap.add_argument("--arrivals", type=int, default=NUM_ARRIVALS)
+    ap.add_argument("--reselect", action="store_true",
+                    help="do NOT re-run the sweep: reload it from the previous "
+                         "calibration JSON and re-pick the four levels against "
+                         "the CURRENT ACCEPTANCE_TARGETS. Level selection is a "
+                         "pure function of the cached sweep, so re-measuring to "
+                         "change a target costs ~40 min and can only introduce "
+                         "drift. Refuses if the cached sweep was produced with a "
+                         "different reference or a different arrival count.")
+    ap.add_argument("--reference", choices=("plain", "oracle"), default="oracle",
+                    help="what the ladder is pinned on. 'oracle' (default, §Y.3b) "
+                         "is the partition-exhaustive reference: it answers how "
+                         "many arrivals are admissible AT ALL, so the curve "
+                         "measures the substrate rather than one heuristic's "
+                         "blind spot. 'plain' is the superseded reference and is "
+                         "kept only to reproduce the pre-§Y.1f ladder.")
     args = ap.parse_args()
 
     probe_sub = generate_hierarchical_topology(args.instances[0])
@@ -178,14 +242,27 @@ def main():
 
     rows = []
     t0 = time.time()
-    for rho in rhos:
+    if args.reselect:
+        cached = json.loads(OUT.read_text())
+        if cached.get("reference", "plain") != args.reference:
+            sys.exit(f"--reselect refused: cached sweep used reference "
+                     f"{cached.get('reference', 'plain')!r}, asked for "
+                     f"{args.reference!r}. Re-run the sweep.")
+        if cached.get("num_arrivals") != args.arrivals:
+            sys.exit(f"--reselect refused: cached sweep used "
+                     f"N={cached.get('num_arrivals')}, asked for N={args.arrivals}.")
+        rows = cached["sweep"]
+        log.info("### --reselect: %d cached sweep points, no episodes run",
+                 len(rows))
+    for rho in ([] if args.reselect else rhos):
         lam = arrival_rate_for_rho(probe_sub, rho, ecpu, eram)
         accs, accs_ss, occs, tiers, spans, cause_acc = [], [], [], [], [], []
         for inst in args.instances:
             for seed in args.seeds:
                 sub = generate_hierarchical_topology(inst)
                 admits, concurrent, utils, span, causes = run_plain(
-                    sub, lam, np.random.default_rng(seed + 777), args.arrivals)
+                    sub, lam, np.random.default_rng(seed + 777), args.arrivals,
+                    reference=args.reference)
                 # PRIMARY: admitted / total GENERATED, over every arrival in the
                 # episode. This is the supervisor's ratified definition
                 # (2026-07-30) and it is byte-identical to what grid_runner and
@@ -334,6 +411,7 @@ def main():
         "service_rate": SERVICE_RATE, "num_arrivals": args.arrivals,
         "warmup_arrivals": WARMUP_ARRIVALS,
         "seeds": args.seeds, "instances": args.instances,
+        "reference": args.reference,
         "monotone": monotone, "wall_s": round(time.time() - t0, 1),
     }, indent=2))
     print(f"\n  written: {OUT}")

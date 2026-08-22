@@ -107,11 +107,16 @@ class TestActorCTDEPPOSmoke:
         ep = runner.run_episode(mdo_mode="random")
 
         # Collect a transition with steps
+        # The step must offer a REAL CHOICE. Since 2026-08-20 (§9) the NULL slot
+        # is masked whenever any node is feasible, so a step whose mask is empty
+        # has exactly one legal action, log_prob == log(1) == 0 exactly, and no
+        # update can move it -- picking one of those makes this test assert that
+        # a constant changed.
         sample_transition = None
         sample_domain = None
         for domain_id, transitions in ep.rollout.domain_actor.items():
             for t in transitions:
-                if t.steps:
+                if t.steps and int(t.steps[0].action_mask.sum()) > 1:
                     sample_transition = t
                     sample_domain = domain_id
                     break

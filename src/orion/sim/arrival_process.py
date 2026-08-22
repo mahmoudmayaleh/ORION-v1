@@ -1,7 +1,9 @@
 """Event-driven Poisson arrival process with exponential slice lifetimes.
 
-  - Static offline: batch of S requests at t=0 (for MILP oracle)
   - Dynamic online: Poisson arrivals (rate lambda), Exp lifetimes (rate mu)
+
+The static-offline batch mode was removed with the MILP package (2026-08-22):
+it existed only to feed a solver that no approach used.
 
 Adapted from Virne's VirtualNetworkRequestSimulator event generation pattern.
 """

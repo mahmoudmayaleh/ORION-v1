@@ -16,6 +16,11 @@ Layout (single float vector):
     ] +
     [ global:
         total_arrivals_norm, admitted_count_norm, rejected_by_mdo_count_norm
+    ] +
+    [ arriving request (2026-08-20, REQUEST_FEAT_DIM slots):
+        delay_budget_lin, delay_budget_log, min_throughput_norm,
+        chain_len_norm, chain_cpu_norm, chain_ram_norm,
+        max_vnf_cpu_norm, max_vnf_ram_norm
     ]
 
 The shape depends on the substrate (num_domains, num_inter_domain_links),
@@ -31,10 +36,12 @@ same ordering — non-negotiable per Choice A1).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
 
+from orion.config import MDO_DELAY_REF
 from orion.mdo.observation import build_domain_summaries, build_inter_domain_links
 from orion.substrate.graph_model import SubstrateNetwork
 from orion.types import InfrastructureTier, TIER_INDEX, TIER_ORDER
@@ -60,9 +67,56 @@ class GlobalStateStats:
     max_arrivals: int = 100  # one episode's expected horizon
 
 
+#: Width of the arriving-request block appended to s_t (2026-08-20).
+REQUEST_FEAT_DIM = 8
+
+
+def _request_features(
+    slice_req,
+    max_cpu_cap: float,
+    max_ram_cap: float,
+    max_bw_cap: float,
+) -> list[float]:
+    """What is ARRIVING. Eight slots, all zero when no request is supplied.
+
+    Why this exists (RL_DIAGNOSIS §6.2). s_t used to be substrate state plus
+    three episode counters and nothing else, so V(s_t) was necessarily an
+    average over the arrival distribution. Measured on 1885 L3 arrivals, a
+    linear read of the whole 86-d s_t explained **R^2 = 0.038** of the actual
+    RL reward, while the slice features it structurally excluded explained
+    **0.215** -- the delay budget alone explained 0.103, nearly three times the
+    entire critic input. Since A_a = r_a + gamma*V_{a+1} - V_a and V could not
+    represent "a hard slice arrived", the overwhelming majority of every
+    advantage was variance the action had no bearing on. Whitening removes the
+    mean of that, not the variance.
+
+    Same normalisers as the corresponding MDO observation block, so the actor's
+    and the critic's views of the request agree (Choice A1 discipline).
+    """
+    if slice_req is None:
+        return [0.0] * REQUEST_FEAT_DIM
+    vnfs = getattr(slice_req, "vnfs", []) or []
+    cpu = [float(v.cpu_demand) for v in vnfs]
+    ram = [float(v.ram_demand) for v in vnfs]
+    qos = getattr(slice_req, "qos", None)
+    delay = float(getattr(qos, "max_e2e_delay", 0.0) or 0.0)
+    thr = float(getattr(qos, "min_throughput", 0.0) or 0.0)
+    return [
+        min(1.0, delay / MDO_DELAY_REF) if delay > 0 else 0.0,
+        (math.log1p(delay) / math.log1p(MDO_DELAY_REF)) if delay > 0 else 0.0,
+        thr / max_bw_cap,
+        len(vnfs) / 10.0,
+        sum(cpu) / max_cpu_cap,
+        sum(ram) / max_ram_cap,
+        (max(cpu) / max_cpu_cap) if cpu else 0.0,
+        (max(ram) / max_ram_cap) if ram else 0.0,
+    ]
+
+
 def encode_global_state(
     substrate: SubstrateNetwork,
     stats: GlobalStateStats,
+    slice_req=None,
 ) -> torch.Tensor:
     """Encode s_t = (per-domain state, inter-domain link state, global state).
 
@@ -117,6 +171,9 @@ def encode_global_state(
         stats.admitted / norm,
         stats.rejected_by_mdo / norm,
     ])
+
+    # Arriving-request block (2026-08-20). See `_request_features`.
+    parts.extend(_request_features(slice_req, max_cpu_cap, max_ram_cap, max_bw_cap))
 
     return torch.tensor(parts, dtype=torch.float32)
 

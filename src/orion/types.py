@@ -206,30 +206,10 @@ class PlacementPlan:
     source: str = "llm"
 
 
-@dataclass
-class MILPSolution:
-    """Complete solution returned by the MILP oracle.
-
-    Attributes:
-        objective_value: Optimal or best-found objective value.
-        admitted: z_s — maps each request_id to admission decision.
-        placements: Maps each admitted request_id to its PlacementPlan.
-        solve_time: Wall-clock seconds consumed by the solver.
-        gap: MIP optimality gap at termination.
-        status: Solver status string — "Optimal", "Feasible", or "Infeasible".
-    """
-
-    objective_value: float
-    admitted: dict[str, bool]
-    placements: dict[str, PlacementPlan]
-    solve_time: float
-    gap: float
-    status: str
-
 
 @dataclass
 class FeasibilityResult:
-    """Output of the MILP Validator checking C2, C3, C5, C5b, C7."""
+    """Output of the structural validator checking C2, C3, C5, C5b, C7."""
 
     is_feasible: bool
     violated_constraints: list[str]

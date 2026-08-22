@@ -105,17 +105,43 @@ class TestDomainPolicy:
                 break
         assert has_grad, "No gradients reached any parameter"
 
-    def test_gradient_flows_through_null_token(self, small_substrate):
-        """Gradients should reach the null_token parameter."""
+    def test_null_is_unreachable_while_any_node_is_feasible(self, small_substrate):
+        """The NULL slot is masked whenever a real placement exists.
+
+        Contract CHANGED 2026-08-20 (RL_DIAGNOSIS §9). NULL used to be
+        unconditionally valid, which handed PPO a free "give up" action the
+        reward pays for: a coordinator-level reject scores 0 while an
+        admitted-then-revoked arrival scores -1, so refusing strictly dominates
+        attempting a placement that might miss the delay budget. Measured, the
+        actor learned exactly that -- 101 of 196 refusals in one segment were
+        taken while a feasible node existed, and each one fails the arrival.
+        Refusal is the coordinator's authority (MDOAction.COMMIT/REJECT).
+
+        This test previously asserted the opposite (that a gradient reaches
+        null_token with a fully-feasible mask). It is inverted, not deleted, so
+        the change of contract is recorded rather than silently dropped.
+        """
         data, node_ids = build_domain_observation(small_substrate, domain_id=0)
         policy = DomainPolicy(backbone_type="gatv2", hidden_dim=64, num_heads=2)
-        mask = torch.ones(len(node_ids), dtype=torch.bool)
+        ctx = self._make_vnf_context()
 
-        _, log_prob, _ = policy(data, self._make_vnf_context(), mask)
-        (-log_prob).backward()
+        feasible = torch.ones(len(node_ids), dtype=torch.bool)
+        scores = policy._encode_and_score(data, ctx, feasible)
+        assert scores[-1] == float("-inf"), (
+            "NULL is reachable while real nodes are feasible; PPO will learn "
+            "to refuse rather than place")
+        for _ in range(10):
+            action, log_prob, _ = policy(data, ctx, feasible)
+            assert action != DomainPolicy.NULL_ACTION
+            assert log_prob.isfinite()
 
-        assert policy.null_token.grad is not None
-        assert policy.null_token.grad.abs().sum() > 0
+        # ... and it is still reachable, as the only option, when nothing fits.
+        empty = torch.zeros(len(node_ids), dtype=torch.bool)
+        scores = policy._encode_and_score(data, ctx, empty)
+        assert torch.isfinite(scores[-1]), "NULL must remain the fallback"
+        action, log_prob, _ = policy(data, ctx, empty)
+        assert action == DomainPolicy.NULL_ACTION
+        assert log_prob.isfinite()
 
     def test_all_backbone_types_work(self, small_substrate):
         """All three backbone types should produce valid output."""

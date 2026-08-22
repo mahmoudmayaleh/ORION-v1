@@ -2,7 +2,7 @@
 cannot see which domain is loaded.
 
 This is the confound behind the "Agent B plans worse than the heuristic" reading.
-`RL-alone`, `RL-advised` and `MDO-partial` call their builder FRESH on every
+`RL-alone` and `MDO-partial` call their builder FRESH on every
 arrival (`eval_nonmemory` sets `pb = partial_obs_builder`, no cache wrapper), while
 `Memory-off` and `Full` serve ~89-95% of arrivals from `_cached_plan_builder`.
 

@@ -38,52 +38,6 @@ def orion_config() -> OrionConfig:
 
 
 @pytest.fixture
-def two_node_substrate() -> tuple[list[NodeAttributes], list[LinkAttributes]]:
-    """Minimal 2-node, 1-link substrate for MILP integration tests.
-
-    Uses a tiny graph so solver runtimes remain negligible in tests.
-    Per CLAUDE.md: do NOT mock the MILP solver — use this real tiny instance.
-    """
-    nodes = [
-        NodeAttributes(
-            node_id="n0",
-            domain_id=0,
-            tier=InfrastructureTier.EDGE,
-            cpu_capacity=16.0,
-            ram_capacity=64.0,
-            processing_delay=1.0,
-        ),
-        NodeAttributes(
-            node_id="n1",
-            domain_id=0,
-            tier=InfrastructureTier.REGIONAL_CLOUD,
-            cpu_capacity=32.0,
-            ram_capacity=128.0,
-            processing_delay=2.0,
-        ),
-    ]
-    links = [
-        LinkAttributes(
-            link_id="l0",
-            source="n0",
-            target="n1",
-            bandwidth_capacity=1000.0,
-            propagation_delay=2.0,
-            link_type=LinkType.INTRA,
-        ),
-        LinkAttributes(
-            link_id="l1",
-            source="n1",
-            target="n0",
-            bandwidth_capacity=1000.0,
-            propagation_delay=2.0,
-            link_type=LinkType.INTRA,
-        ),
-    ]
-    return nodes, links
-
-
-@pytest.fixture
 def simple_slice_request() -> SliceRequest:
     """A 2-VNF slice request compatible with two_node_substrate."""
     return SliceRequest(

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -75,6 +76,134 @@ def tier_feasible_domains(vnf: dict, abstract_topology: dict) -> list[str]:
     return out
 
 
+#: §AC (2026-08-19) -- capacity in the DECODE MASK, not in the prompt.
+#:
+#: Measured on 40 real L3 arrivals, seed 42, M^B off, cache bypassed, temperature 0:
+#: `partial_obs_builder` colocates 100% of chains (1.00 domains) and Agent B splits
+#: 85% (2.30 domains, histogram {1:6, 2:20, 3:10, 4:4}), even though a whole-chain
+#: host exists on every one of those arrivals. It is not an information problem --
+#: the system prompt already carries the ordered decision procedure ("assign EVERY
+#: VNF to the single domain with the largest margin, and stop... Only if that list
+#: is empty may you split") and the topology already carries
+#: `largest_free_node_by_tier`. The model is told to colocate, shown the numbers
+#: that say it can, and splits anyway.
+#:
+#: Restating the derived set as PROSE is known to make it worse: see the note in
+#: `_build_user_prompt` where an admissible-domains block raised the split rate
+#: 78.4% -> 80.2% and 77.2% -> 96.4% on paired L3 probes. So the correction goes
+#: where the tier contract already goes, into the grammar, where the model cannot
+#: anchor on it or argue with it.
+#:
+#: This adds NO information. Every quantity is read out of the two dicts this
+#: function is already handed, and the three tests are the ones
+#: `_PartitionView.colocation_candidate` applies to the heuristic's own proposal.
+#: It only stops the decoder from expressing a partition those inputs already rule
+#: out. Off by default so every banked cell reproduces.
+CAPACITY_MASK = os.environ.get("ORION_CAPACITY_MASK", "0") != "0"
+
+#: §AD (2026-08-19) -- colocation as the plan's SHAPE, not as a preference.
+#:
+#: The decode mask (§AC) narrows WHICH domains are selectable but leaves the shape
+#: free: with two qualifying hosts the model can still put VNF 1 in one and VNF 2 in
+#: the other. Measured L3 seed 42, splitting is what is left of the gap once the h^m
+#: guard is applied -- `cross_domain_infeasible` + `c9_hops` run 447 per 2000 for the
+#: guarded LLM plan against 9 for `MDO-partial`, which is 22.4% of arrivals, while the
+#: capacity bin has already gone the other way (16 against 98).
+#:
+#: So this changes the CONTRACT. When some domain can host the whole chain the model
+#: emits ONE `host_domain` chosen from those domains and nothing else; `expand_host_domain`
+#: turns that into the per-VNF assignments every downstream stage already expects. A
+#: split is then not discouraged, it is unrepresentable. When no host exists the schema
+#: falls back to per-VNF assignments, which is exactly when a split is the right answer
+#: and the model's judgement about WHERE to cut is worth having.
+#:
+#: This is `partial_obs_builder`'s step 3 / step 4 moved out of the prompt and into the
+#: grammar. It leaves Agent B real authorship -- which host, and how to cut the hard
+#: cases -- and it costs 1 decoded field instead of K.
+COLOCATION_CONTRACT = os.environ.get("ORION_COLOCATION_CONTRACT", "0") != "0"
+
+#: §AD.1 -- keep only hosts whose slack is within this fraction of the best host's.
+#:
+#: Measured L3 seed 42 under the contract: Agent B chose domain `d0` on 30/30
+#: arrivals, and reversing the enum did not move it (same DOMAIN 30/30, same INDEX
+#: 0/30), so this is a fixed preference over domains and not enum position. Every
+#: slice therefore lands in one domain, which drives it to its margin while it still
+#: passes the tests -- and `fits_a_node` is NECESSARY, NOT SUFFICIENT (it reports the
+#: best node per tier, so it cannot see two co-located functions competing for the
+#: same node). That blind spot bites precisely at the margin, which is why the
+#: contract eliminated every split (cross 215->0, c9 78->0) and still tripled the
+#: actor bin (299 -> 704).
+#:
+#: `partial_obs_builder` never reaches that regime because it always takes the
+#: LARGEST slack, which load-balances as domains fill. This band gives the model the
+#: same protection without taking the choice away: it may pick any host that is still
+#: competitive, but it can no longer ride one domain down while a much emptier one
+#: sits in the enum. 0.0 keeps every qualifying host (shipped behaviour).
+HOST_SLACK_BAND = float(os.environ.get("ORION_HOST_SLACK_BAND", "0") or 0.0)
+
+
+def expand_host_domain(plan: dict, slice_request: dict) -> bool:
+    """Expand {"host_domain": d} into the per-VNF assignment list, in place.
+
+    Runs immediately after parsing and BEFORE `fill_derived_fields`, so the defensive
+    validator, `recompute_required_tiers`, `recompute_flow_boundaries`, `check_plan`
+    and the `PlanSummary` build all see the shape they have always seen. Returns True
+    if it expanded, False if the plan was already in per-VNF form.
+    """
+    host = plan.pop("host_domain", None)
+    if host is None:
+        return False
+    plan["vnf_assignments"] = [
+        {"vnf_id": v.get("vnf_id"), "domain": host}
+        for v in (slice_request.get("vnfs") or [])
+    ]
+    return True
+
+
+def whole_chain_hosts(slice_request: dict, abstract_topology: dict) -> list[str]:
+    """Domains that can host the ENTIRE chain, best aggregate slack first.
+
+    Three tests, all on the observation surface:
+      (a) every VNF is tier-feasible in the domain,
+      (b) for every VNF some permitted tier's `largest_free_node_by_tier` seats it
+          on ONE node (h^m: a tier can hold 300 free CPU and still not seat a VNF
+          needing 12 if its biggest free node has 8), and
+      (c) the domain's aggregate residual covers the whole chain with slack > 0.
+
+    Returns [] when no single domain can take the chain, which is exactly when a
+    split is legitimate.
+    """
+    vnfs = slice_request.get("vnfs", [])
+    if not vnfs:
+        return []
+    tot_cpu = sum(float(v.get("cpu_demand") or 0.0) for v in vnfs)
+    tot_ram = sum(float(v.get("ram_demand") or 0.0) for v in vnfs)
+    scored: list[tuple[float, str]] = []
+    for d in abstract_topology.get("domains", []):
+        dom_tiers = set(d.get("dominant_tiers", []))
+        h = d.get("largest_free_node_by_tier", {}) or {}
+        for v in vnfs:
+            permitted = set(v.get("permitted_tiers", [])) & dom_tiers
+            if not permitted:
+                break
+            cpu_d = float(v.get("cpu_demand") or 0.0)
+            ram_d = float(v.get("ram_demand") or 0.0)
+            if not any(float((h.get(t) or {}).get("cpu") or 0.0) >= cpu_d
+                       and float((h.get(t) or {}).get("ram") or 0.0) >= ram_d
+                       for t in permitted):
+                break
+        else:
+            slack = min(float(d.get("cpu_residual") or 0.0) - tot_cpu,
+                        float(d.get("ram_residual") or 0.0) - tot_ram)
+            if slack > 0:
+                scored.append((slack, d["domain_id"]))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    if HOST_SLACK_BAND > 0.0 and scored:
+        cutoff = scored[0][0] * HOST_SLACK_BAND
+        scored = [x for x in scored if x[0] >= cutoff]
+    return [dom for _, dom in scored]
+
+
 #: Completion ceiling for a plan call. The server reserves this on TOP of the
 #: prompt, so leaving it at the 2048 default cost both overnight jobs: a 4121-token
 #: prompt plus a 2048-token reservation is 6169 against a 4096 window, and the
@@ -104,11 +233,24 @@ def build_pinned_plan_schema(slice_request: dict, abstract_topology: dict) -> di
     """
     vnfs = slice_request.get("vnfs", [])
     vnf_ids = [v["vnf_id"] for v in vnfs]
+    # §AC: when some domain can take the whole chain, restrict EVERY position to
+    # those domains. The model still chooses which one, and may still split, but
+    # only across domains that each individually pass the same admissibility tests
+    # the heuristic applies -- so a split can no longer name a domain that cannot
+    # seat the function it is given. When the list is empty a split is legitimate
+    # and the mask falls back to the tier contract, unchanged.
+    # The contract IMPLIES the mask: it is defined in terms of the whole-chain hosts,
+    # so gating it on CAPACITY_MASK alone would let ORION_COLOCATION_CONTRACT=1 be set
+    # on its own and silently do nothing.
+    hosts = (whole_chain_hosts(slice_request, abstract_topology)
+             if (CAPACITY_MASK or COLOCATION_CONTRACT) else [])
 
     def assignment_for(v):
         feas = tier_feasible_domains(v, abstract_topology)
         if not feas:
             return None  # signals genuine tier-infeasibility for this VNF
+        if hosts:
+            feas = list(hosts)
         tiers = sorted(v.get("permitted_tiers", []))
         # required_tier, cpu_demand and ram_demand are NOT asked for. The first is
         # overwritten by recompute_required_tiers and the other two are echoes of the
@@ -123,6 +265,16 @@ def build_pinned_plan_schema(slice_request: dict, abstract_topology: dict) -> di
                 "domain": {"enum": feas},                    # D(tau_fk) only
             },
             "required": ["vnf_id", "domain"],
+            "additionalProperties": False,
+        }
+
+    if COLOCATION_CONTRACT and hosts:
+        # A non-empty `hosts` already implies every VNF is tier-feasible in each of
+        # them, so the None contract below cannot be reachable from here.
+        return {
+            "type": "object",
+            "properties": {"host_domain": {"enum": list(hosts)}},
+            "required": ["host_domain"],
             "additionalProperties": False,
         }
 
@@ -564,6 +716,7 @@ class AgentB:
                 f"n_ctx={getattr(self.llm.config, 'n_ctx', None)})"
             )
         plan = extract_json(raw)
+        expand_host_domain(plan, slice_request)
         fill_derived_fields(plan, slice_request)
         # Defensive secondary check (v6.5): with grammar-constrained decoding this
         # must already hold. If it ever fires, the constrained path has regressed —

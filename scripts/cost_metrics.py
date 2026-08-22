@@ -34,7 +34,7 @@ apart:
 
 All aggregates in (a) and (b) are over ADMITTED arrivals of the held-out stream only.
 The same link-classification rule (an edge whose endpoints carry different domain_ids
-is inter-domain) is applied to every approach, so Plain/MILP plan routes and
+is inter-domain) is applied to every approach, so Plain's plan routes and
 coordinator cross-domain routes are measured identically. Group (c) is over every
 arrival, admitted or not, because occupancy is a state of the network rather than an
 outcome of a request.
@@ -181,7 +181,7 @@ class CostAccumulator:
         return n
 
     def add_plan(self, sr, plan) -> None:
-        """Admitted PlacementPlan (Plain / MILP): routes from plan.flow_routes."""
+        """Admitted PlacementPlan (Plain): routes from plan.flow_routes."""
         bw_by_flow = {(fe.source_vnf, fe.target_vnf): float(fe.bandwidth_demand)
                       for fe in sr.flow_edges}
         hops, bwh = 0, 0.0

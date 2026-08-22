@@ -6,20 +6,19 @@ every code path, so a wiring mistake, an unset mode or a canonical/raw index sli
 would make it a no-op that still returns a plausible plan and still banks a cell.
 See the silent-no-op guard principle.
 
-The measurement that motivates the guard (banked conventional/i100/2000-arrival
-cells, 5 seeds):
+Status of the motivating measurement, 2026-08-17/18. The guard was built on a
+reading of `data/grid_cells` that turned out to be the STALE pre-2026-08-12 set;
+`data/parity_cells` is current. On the current cells the dominant bin is
+`actor_infeasible`, not the split bins, and a live run of `Memory-off-rpg` against
+`Memory-off` (3 seeds, L1-L4) returned only +0.3 / +3.0 / +1.3 / +1.0 pp with
+`actor_infeasible` 705 -> 594 at L3 -- far short of the predicted 10-13 pp, and
+within seed noise at L3/L4.
 
-    approach      L1     L2     L3     L4     cross_domain_infeasible + c9_hops
-    MDO-partial  .817   .732   .594   .512     0 /   0 /  15 /  15
-    RL-alone     .835   .731   .584   .511    12 /  20 /   7 /   6
-    Full         .722   .658   .536   .445   236 / 220 / 183 / 146
-
-Both of those bins are reachable ONLY through a split partition
-(MDOCoordinator._build_fragments routes a flow cross-domain iff its endpoints
-differ), `partial_obs_builder` splits 0.0% of arrivals, and a whole-chain host is
-node-feasible on 100% of arrivals. So the Full-minus-RL-alone gap is elective
-splitting by the planner, not the h^m encoding defect of
-docs/OBS_ENCODING_DEFECT_2026-08-15.md.
+So these tests pin BEHAVIOUR, not a claim about size. `repair_plan` is a
+pass-through on almost every path, so a wiring mistake, an unset mode or a
+canonical/raw index slip would make it a silent no-op that still returns a
+plausible plan and still banks a cell. That is what is guarded here.
+See docs/ORION_GAP_2026-08-17.md for what the numbers actually say.
 """
 
 from __future__ import annotations
@@ -85,30 +84,30 @@ def _split_plan(sr, sub):
     return replace(base, suggested_domains=doms)
 
 
-# ── the builder property the whole diagnosis rests on ───────────────────────────
-def test_partial_obs_builder_never_splits_when_a_host_exists(stream):
-    """RL-alone's and MDO-partial's plan source colocates whenever it can.
+# ── the builder contract, after colocation-first was removed (2026-08-21) ───────
+def test_partial_obs_builder_no_longer_forces_one_host(stream):
+    """The colocation-first branch is gone; the builder places per VNF.
 
-    This is the control for the Full comparison. If it ever starts splitting, the
-    "elective split" reading of the gap is void and the guard is aimed wrong.
+    It replaces `test_partial_obs_builder_never_splits_when_a_host_exists`, which
+    pinned the OPPOSITE contract and was correct until the branch was removed. The
+    "elective split" reading of the gap rested on that contract and does not
+    survive it: the heuristic no longer declines to split, so a comparison against
+    it is no longer a comparison against a colocating reference.
     """
+    from orion.mdo import chain_order
+
     sub, reqs = stream
-    summaries = build_domain_summaries(sub)
-    dom_nodes = [set(sub.nodes_in_domain(s.domain_id)) for s in summaries]
     checked = 0
     for sr in reqs:
-        colocatable = any(
-            all(set(v.permitted_nodes) & dn for v in sr.vnfs) for dn in dom_nodes)
-        if not colocatable:
-            continue
         plan = POP.partial_obs_builder(sr, sub)
         if plan is None:
             continue
         checked += 1
-        assert len(set(plan.suggested_domains)) == 1, (
-            f"partial_obs_builder split a colocatable chain: "
-            f"{plan.suggested_domains}")
-    assert checked > 0, "no colocatable arrival was exercised"
+        # C10 still binds: whatever it chooses must be committable.
+        assert chain_order.is_contiguous(plan.suggested_domains), (
+            f"builder authored a partition C10 refuses: {plan.suggested_domains}")
+        assert len(plan.suggested_domains) == len(sr.vnfs)
+    assert checked > 0, "no arrival was exercised"
 
 
 # ── the guard must not move a single shipped cell ───────────────────────────────
@@ -251,7 +250,7 @@ def test_runner_exposes_the_repair_approaches_without_touching_the_base_rows():
 
     for ap, mode in G.REPAIR_APPROACHES.items():
         assert ap in G.APPROACHES
-        assert mode in ("guard", "full")
+        assert mode in ("guard", "full", "colo")
         base = G.REPAIR_BASE[ap]
         assert base in G.APPROACHES
         # A repair cell must run the same weights as the row it is compared to.
@@ -261,3 +260,102 @@ def test_runner_exposes_the_repair_approaches_without_touching_the_base_rows():
         assert ap in G.TRAINED_APPROACHES
     # The base rows must not have acquired a repair by being listed here.
     assert set(G.REPAIR_APPROACHES) & set(G.REPAIR_BASE.values()) == set()
+
+
+def test_every_llm_fed_approach_builds_an_agent():
+    """A repair variant of an LLM approach must itself require the LLM client.
+
+    `main` gated on a literal {"Memory-off", "Full"}, so `--approaches
+    Memory-off-rp` alone built no Agent B and died on the first arrival with
+    `'NoneType' object has no attribute 'generate_with_memory'`. It looked fine
+    only because a base approach was usually requested alongside it.
+    """
+    import inspect
+    import grid_runner as G
+
+    for ap, base in G.REPAIR_BASE.items():
+        assert (base in G.LLM_APPROACHES) == (ap in G.LLM_APPROACHES), (
+            f"{ap} and its base {base} disagree about needing Agent B")
+    assert {"Memory-off", "Full"} <= G.LLM_APPROACHES
+    # The gate must READ the derived set, not restate the literal.
+    src = inspect.getsource(G.main)
+    assert "need_llm = bool(set(args.approaches) & LLM_APPROACHES)" in src, (
+        "main re-states the LLM approach set instead of deriving it")
+
+
+# ── §AD.2: the colocation-preserving repair mode ──────────────────────────────
+
+def test_colo_mode_is_registered_and_validated():
+    import partial_obs_prior as POP
+    import pytest as _pt
+    with _pt.raises(ValueError, match="off|guard|full|colo"):
+        POP.repair_plan(object(), None, None, mode="nonsense")
+
+
+def test_colo_keeps_a_still_admissible_host_untouched(stream):
+    """An admissible proposal is never second-guessed, or ORION converges on
+    `partial_obs_builder` and the planner's contribution stops being measurable."""
+    import partial_obs_prior as POP
+    sub, reqs = stream
+    from dataclasses import replace as _replace
+    sr = reqs[0]
+    plan = POP.partial_obs_builder(sr, sub)
+    assert plan is not None
+    # The builder no longer colocates by rule, so the single-host fixture this mode
+    # is defined on is constructed here: the best whole-chain host if one exists.
+    view = POP._PartitionView(sr, sub)
+    host, _slack = view.colocation_candidate()
+    if host is None:
+        import pytest as _pytest
+        _pytest.skip("no whole-chain host on this arrival")
+    plan = _replace(plan,
+                    suggested_domains=[view.summaries[host].domain_id] * view.K)
+    out = POP.repair_plan(plan, sr, sub, mode="colo")
+    assert list(out.suggested_domains) == list(plan.suggested_domains)
+
+
+def test_colo_moves_the_WHOLE_chain_when_the_host_is_exhausted(stream):
+    """The split the contract removed must not come back through the repair.
+
+    §Y.1f: the collapse is now CONDITIONAL on a whole-chain host still existing.
+    Since no domain holds both central and edge, a chain with a cloud-anchored and
+    an edge-anchored function is colocatable nowhere, and for those the fall-through
+    to the per-VNF guard is the correct answer rather than a re-split. So the
+    property asserted is: collapse when a host exists, and never keep the stale one.
+    """
+    import partial_obs_prior as POP
+    sub, reqs = stream
+    sr = reqs[0]
+    plan = POP.partial_obs_builder(sr, sub)
+    host = plan.suggested_domains[0]
+
+    g = sub.graph
+    saved = {}
+    for n in sub.nodes_in_domain(host):
+        saved[n] = (g.nodes[n]["cpu_residual"], g.nodes[n]["ram_residual"])
+        g.nodes[n]["cpu_residual"] = 0.0
+        g.nodes[n]["ram_residual"] = 0.0
+    try:
+        view = POP._PartitionView(sr, sub)
+        best, _ = view.colocation_candidate()
+        out = POP.repair_plan(plan, sr, sub, mode="colo")
+        doms = set(out.suggested_domains)
+        assert host not in doms, "stale host survived the repair"
+        if best is not None:
+            assert len(doms) == 1, f"a host existed but repair split across {doms}"
+        else:
+            assert all(view.admissible(k, view.domain_to_canonical[d])
+                       for k, d in enumerate(out.suggested_domains)), (
+                "no whole-chain host exists, so the per-VNF guard must run and "
+                f"every assignment in {doms} must be admissible")
+    finally:
+        for n, (c, r) in saved.items():
+            g.nodes[n]["cpu_residual"], g.nodes[n]["ram_residual"] = c, r
+
+
+def test_colo_never_returns_none(stream):
+    import partial_obs_prior as POP
+    sub, reqs = stream
+    sr = reqs[0]
+    plan = POP.partial_obs_builder(sr, sub)
+    assert POP.repair_plan(plan, sr, sub, mode="colo") is not None

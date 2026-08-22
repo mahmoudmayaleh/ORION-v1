@@ -59,7 +59,7 @@ def main() -> int:
     for n in names:
         v = res["levels"][n]
         rows.append('    "%s": LoadLevel("%s", arrival_rate=%.4f, rho_offered=%.4f, '
-                    'plain_acceptance=%.4f),'
+                    'reference_acceptance=%.4f),'
                     % (n, n, v["lambda"], v["rho_offered"], v["acceptance_mean"]))
 
     header = (

@@ -136,7 +136,16 @@ def test_an_advised_stack_is_selected_and_scored_advised():
     assert G.SELECTABLE_STACKS["llm_guided"] in G.ADVISED_APPROACHES
     import wp7_runner as W
     src = inspect.getsource(W.train_approach)
-    assert 'mode=("advised" if TRAIN_MDO_MODE == "advised_sample"' in src
+    # The mode expression moved out of the eval_acceptance call into `_eval_mode`
+    # on 2026-08-20 (§9 added a follow_prior branch for actor-only training).
+    # The PROPERTY is unchanged and is what this pins: an advised-sample stack
+    # must have its per-round curve scored advised, and that curve must be the
+    # one handed to eval_acceptance.
+    assert '_eval_mode = ("advised" if TRAIN_MDO_MODE == "advised_sample"' in src
+    assert "mode=_eval_mode" in src
+    # An actor-only stack trains follow_prior and must be scored follow_prior
+    # for the same reason: its partition policy was never trained.
+    assert 'else "follow_prior" if TRAIN_MDO_MODE == "follow_prior"' in src
 
 
 def test_the_training_decode_mode_is_reset_per_cell():

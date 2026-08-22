@@ -312,32 +312,6 @@ def test_plain_reports_a_rejection_taxonomy():
 
 # ── ceiling enumerator: cannot hang, refuses §Y scale ───────────────────────
 
-def test_ceiling_refuses_y_scale_substrates():
-    """§Y Large is 100 nodes. The oracle is contention-blind AND unbounded there,
-    so it must refuse loudly rather than park a core."""
-    import approach_runner as F
-    from orion.substrate.hierarchical_topology import generate_hierarchical_topology
-
-    sub = generate_hierarchical_topology(0)
-    with pytest.raises(RuntimeError, match="compute_ceiling refused"):
-        F.compute_ceiling(sub, arrival_seed=42, num_arrivals=5)
-
-
-def test_ceiling_never_materialises_the_placement_product():
-    """Regression: the old code built the full product BEFORE down-sampling it, so
-    the 5000 cap could not save it (40 nodes, K=5 => 1.0e8 tuples allocated)."""
-    import approach_runner as F
-
-    # Comments legitimately quote the old line to explain why it went, so only
-    # executable lines are checked.
-    code = "\n".join(
-        line for line in Path(F.__file__).read_text(encoding="utf-8").splitlines()
-        if not line.lstrip().startswith("#")
-    )
-    assert "list(itertools.product(*feasible_nodes))" not in code
-    assert "itertools.islice(itertools.product(" in code
-
-
 # ── per-cell timeout ────────────────────────────────────────────────────────
 
 def test_cell_timeout_fires_or_no_ops_cleanly():
@@ -383,7 +357,10 @@ def test_every_y_runner_stream_uses_the_calibrated_rate():
     This is the silent-no-op class: the run completes and every cell carries a
     plausible number, so nothing surfaces until the levels are compared.
 
-    Checked across ALL THREE §Y runners, not just the one where it was found.
+    Checked across every §Y runner, not just the one where it was found.
+    `milp_approach_runner` was the third and was deleted 2026-08-22: the MILP
+    baseline arm does not exist, so the runner produced no cell and the solver it
+    drove was reachable from nothing but itself.
     Pre-§Y probe scripts are out of scope: they produce no §Y cell and several
     legitimately sweep their own rate.
     """
@@ -391,7 +368,6 @@ def test_every_y_runner_stream_uses_the_calibrated_rate():
     import inspect
 
     import grid_runner
-    import milp_approach_runner
     import wp7_runner
 
     # module -> the ONE function allowed to fall back to the module constants,
@@ -400,11 +376,10 @@ def test_every_y_runner_stream_uses_the_calibrated_rate():
     ALLOWED_FALLBACK = {
         "grid_runner": "_ap_for_level",
         "wp7_runner": "_make_ap",
-        "milp_approach_runner": None,
     }
 
     offenders = []
-    for mod in (grid_runner, wp7_runner, milp_approach_runner):
+    for mod in (grid_runner, wp7_runner):
         name = mod.__name__
         tree = ast.parse(inspect.getsource(mod))
         # Map each ArrivalProcess call to its enclosing function, so "allowed"

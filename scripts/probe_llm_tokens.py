@@ -1,4 +1,9 @@
-"""Where the 6.4 s per Agent B call goes: prompt tokens, completion tokens, latency.
+"""Where the time per Agent B call goes: prompt tokens, completion tokens, latency.
+
+The 6.4 s figure this was written against was WRONG: one plan build costs 2.83 s
+measured, so every cache-off refusal derived from it was ~2x too pessimistic. The
+tool is kept because it is the thing that measures the number; the number itself
+is not a constant and should be re-measured rather than quoted from here.
 
 A trained LLM cell costs ~11 min per round in steady state, entirely inside model
 calls, which puts the full grid at ~350 h. Single-stream decode is output-bound, so

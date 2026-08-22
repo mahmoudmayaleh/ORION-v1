@@ -31,6 +31,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -48,6 +49,7 @@ from orion.llm.condition_signature import compute_condition_signature
 from orion.mdo.coordinator import ADVISE_WEIGHT, MDOConfig, MDOCoordinator
 from orion.mdo.kl_prior import analytical_kl, build_prior_logits, beta_schedule
 from orion.mdo.observation import (
+    OBS_VERSION,
     build_domain_summaries,
     build_mdo_observation,
     observation_to_tensor,
@@ -209,6 +211,48 @@ ENT_TARGET_FRAC = 0.25
 ENT_DUAL_LR = 0.5      # dual step on log-coefficient, per round
 ENT_COEF_MAX = 0.5     # ceiling; the controller must not drown the policy loss
 ENT_ADAPTIVE = True    # False restores the pure §M.4-Δ5 schedule byte-for-byte
+
+# 2026-08-20 (RL_DIAGNOSIS §6.4) — PPO minibatching.
+#
+# The optimizer step used to sit OUTSIDE the arrival loop: one Adam step per
+# epoch, four per round, **800 for the entire 200-round curriculum**. Two
+# consequences, both measured. The effective batch was ~500 arrivals x K VNFs
+# full-batch, so a 0.5 gradient-norm clip on a mean gradient of that size makes
+# each step tiny; and PPO's clip never binds, because epoch 1 has parameters
+# unchanged from the rollout (ratio == 1.0 exactly) and epochs 2-4 are one, two
+# and three small steps away. The update was four repeated vanilla
+# policy-gradient steps, not PPO.
+#
+# `MAPPOConfig.minibatch_size = 64` declared the intended value and was read by
+# nothing in the tree. It is wired now: 4 * ceil(500/64) = 32 steps per round,
+# 6400 for the curriculum, at ZERO additional environment or LLM cost.
+#
+# Set ORION_PPO_MINIBATCH=0 to restore the full-batch behaviour exactly.
+#
+# Expect the clip to start engaging -- that is correct, not a regression, and
+# `ppo_clip_frac` is on the round curve so it can be watched. Ordering note from
+# the diagnosis: this is necessary but NOT sufficient, and it is deliberately
+# sequenced after the observation and critic fixes, because 8x more steps on a
+# gradient that is 96% noise is 8x more steps in a random direction.
+PPO_MINIBATCH = int(os.environ.get("ORION_PPO_MINIBATCH", "64") or 0)
+
+# 2026-08-20 (RL_DIAGNOSIS §9) - trainable domain actors.
+#
+# `build_stack` has always created NO actor optimizer ("actors are FROZEN"), so
+# no experiment in this project ever ran a trained actor. With
+# ORION_TRAIN_ACTORS=1 it builds per-domain GATv2 pointer actors (the §U.2
+# machinery, HARL no-weight-sharing) plus one Adam per domain (eps 1e-5, per the
+# PPO implementation-details literature), and `train_approach` runs the
+# HAPPO-style sequential update in `orion.training.actor_ppo` after the MDO
+# update each round. Default 0 keeps every existing path byte-identical.
+TRAIN_ACTORS = os.environ.get("ORION_TRAIN_ACTORS", "0") == "1"
+ACTOR_BACKBONE = os.environ.get("ORION_ACTOR_BACKBONE", "gatv2")
+ACTOR_LR = float(os.environ.get("ORION_ACTOR_LR", "5e-4"))
+# Optional BC warm-start: dict domain_id -> state_dict, applied to freshly
+# built actors. Set by the caller BEFORE train_approach; consumed once so a
+# chained curriculum warm-starts segment 0 from BC and later segments from the
+# previous segment's checkpoint (init_from), never silently re-cloning.
+BC_INIT_STATES = None
 
 # §U.2b (2026-07-18): the LLM occasionally suggests a tier-infeasible domain (VNF
 # needs MEC, assigned cloud-only). In sample mode the tier mask blocks it; the
@@ -476,10 +520,31 @@ def build_stack(substrate, seed, lr, actors=None, mdo_cfg=None):
     else:
         policy = MDOPolicy(obs_dim=obs_dim, num_domains=num_domains,
                            max_vnfs=MAX_VNFS, hidden_dim=128, num_layers=2)
+    actor_optimizers = {}
     if actors is None:
-        actors = {d: GreedyDomainActor(d) for d in range(num_domains)}  # FROZEN (no params)
+        if TRAIN_ACTORS:
+            # §9 - learned per-domain actors, one policy per domain (no weight
+            # sharing, HARL) and one optimizer per policy. Adam eps 1e-5.
+            from orion.actors.domain_actor import DomainActor
+            from orion.actors.policy import DomainPolicy
+            actors = {}
+            for d in range(num_domains):
+                pol = DomainPolicy(backbone_type=ACTOR_BACKBONE, hidden_dim=128)
+                actors[d] = DomainActor(d, pol)
+                actor_optimizers[d] = torch.optim.Adam(
+                    pol.parameters(), lr=ACTOR_LR, eps=1e-5)
+            if BC_INIT_STATES:
+                for d, sd_ in BC_INIT_STATES.items():
+                    actors[int(d)].policy.load_state_dict(sd_)
+                logger.info("actors warm-started from BC (%d domains)",
+                            len(BC_INIT_STATES))
+        else:
+            actors = {d: GreedyDomainActor(d) for d in range(num_domains)}  # FROZEN (no params)
     coord = MDOCoordinator(policy, actors,
                            mdo_cfg or MDOConfig(mu=1.0, alpha=0.1, eta=0.1))
+    # Riding on the coordinator keeps build_stack's signature and return tuple
+    # stable for its many call sites; empty dict when the actors are frozen.
+    coord.actor_optimizers = actor_optimizers
     # §O.3 (Choice A1, conformance): the centralised critic consumes the designed
     # global state s_t, NOT the local o^MDO.
     critic = CentralisedCritic(input_dim=probe_global_state_dim(substrate),
@@ -612,6 +677,19 @@ def _eval_episode(coord, fam_name, seed, arrivals, delays, plan_builder=None,
             cost_out["utilization"] = acc.utilization_summary()
         except Exception:  # noqa: BLE001 -- secondary instrumentation must never break eval
             cost_out.setdefault("n_admitted", None)
+        # Partition shape, QoS margin and the acceptance trajectory. Attached to
+        # the same dict rather than through new parameters, so every caller that
+        # already banks `cost` gets them and no call site changes. Wrapped for the
+        # same reason as the block above: instrumentation must never break eval.
+        try:
+            from structure_metrics import from_episode
+            sr_by_rid_all = {ev.slice_request.request_id: ev.slice_request
+                             for ev in ap.events
+                             if ev.event_type == EventType.ARRIVAL
+                             and ev.slice_request is not None}
+            cost_out.update(from_episode(ep, sub, sr_by_rid_all))
+        except Exception:  # noqa: BLE001 -- secondary instrumentation must never break eval
+            pass
     # m~-agreement (fifth-degenerate check, PREREG 5I): fraction of committed per-VNF domain
     # choices that equal the prior m~. Near-1.0 with collapsed entropy => approach 2 is just
     # following the prior (behaviourally == Prior-only), so (2)~=(3) would be a reward artifact.
@@ -702,8 +780,12 @@ def _with_state_capture(base_cls):
                 rejected_by_mdo=stats.rejected_by_mdo,
                 max_arrivals=getattr(self, "_cap_max_arrivals", 100),
             )
+            # `slice_req` added 2026-08-20 (RL_DIAGNOSIS §6.2). It is captured at
+            # the same instant as the substrate state, so V_phi conditions on the
+            # arrival it is being asked to value rather than averaging over the
+            # arrival distribution.
             self.s_t_by_request[slice_req.request_id] = encode_global_state(
-                self.substrate, gs).detach()
+                self.substrate, gs, slice_req=slice_req).detach()
             super()._handle_arrival(slice_req, mdo_mode, rollout, mdo_results, stats,
                                     arrival_trace)
 
@@ -835,9 +917,35 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
     # every segment, because the topology size and inter-domain adjacency are fixed.
     if init_from is not None:
         _sd = torch.load(init_from, map_location="cpu")
+        # Refuse a warm start across an observation-semantics change. Without
+        # this the load succeeds whenever the widths happen to agree and the
+        # policy silently reads its features on the wrong scale for the rest of
+        # the curriculum -- a run that completes and produces a plausible number,
+        # which is the failure mode this project keeps rediscovering.
+        _ckpt_obs_v = _sd.get("obs_version", 1)
+        if _ckpt_obs_v != OBS_VERSION:
+            raise SystemExit(
+                f"refusing to warm-start from {init_from}: checkpoint was written "
+                f"under obs_version={_ckpt_obs_v}, this tree emits "
+                f"obs_version={OBS_VERSION}. The observation's MEANING changed "
+                f"(see docs/RL_DIAGNOSIS_2026-08-20.md); retrain from scratch or "
+                f"point --ckpt-dir at a matching set.")
         policy.load_state_dict(_sd["policy_state"])
         critic.load_state_dict(_sd["critic_state"])
-        logger.info("curriculum warm-start: loaded policy+critic from %s", init_from)
+        _actor_sds = _sd.get("actor_states")
+        if _actor_sds:
+            for _d, _asd in _actor_sds.items():
+                _a = coord.domain_actors.get(int(_d))
+                if getattr(_a, "policy", None) is None:
+                    raise SystemExit(
+                        "checkpoint %s carries trained actor states but domain "
+                        "%s has a frozen actor -- set ORION_TRAIN_ACTORS=1 "
+                        "before warm-starting from it." % (init_from, _d))
+                _a.policy.load_state_dict(_asd)
+        logger.info("curriculum warm-start: loaded policy+critic%s from %s "
+                    "(obs_version=%s)",
+                    (" + %d actor(s)" % len(_actor_sds)) if _actor_sds else "",
+                    init_from, _ckpt_obs_v)
 
     # §O.1 — value normalization: running stats updated ONCE PER ROUND from that
     # round's return batch, BEFORE the critic epochs, frozen within the update
@@ -1060,6 +1168,8 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
         train_agreement_fr = None                 # §Z.5 free-running counterpart
         train_support_tf = train_support_fr = None  # §Z.6 support of both
         ev = corr_adv_pos = neg_adv_admitted = float("nan")
+        steps_taken = 0; _clip_fired = _clip_seen = 0
+        actor_stats = None
         if len(buffer) > 0:
             with profiled("train.gae"):
                 with torch.no_grad():
@@ -1109,99 +1219,144 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
                     opt_critic.zero_grad(); (0.5 * v_loss).backward()
                     torch.nn.utils.clip_grad_norm_(critic.parameters(), 0.5); opt_critic.step()
 
-            # MDO PPO update with KL prior toward m~
+            # MDO PPO update with KL prior toward m~.
+            #
+            # Skipped when the training decode is follow_prior (§9 actor-only
+            # training): the partition is then copied from the plan rather than
+            # sampled from the policy, and the recorded log-probs are the zeros
+            # follow_prior emits, so a ratio exp(new_lp - 0) against them is
+            # meaningless. The critic still trains (its targets do not involve
+            # the partition policy) and the actor update below does the learning.
             steps = 0
+            # 2026-08-20: minibatched. `_mb` is the shuffled index list of the
+            # minibatch currently accumulating; the optimizer steps once per
+            # minibatch instead of once per epoch. PPO_MINIBATCH = 0 restores
+            # the pre-2026-08-20 full-batch behaviour, in which case each epoch
+            # is a single minibatch spanning the whole buffer, which is exactly
+            # what the old loop did.
+            _n = len(buffer.mdo_obs) if TRAIN_MDO_MODE != "follow_prior" else 0
+            _mb_size = PPO_MINIBATCH if PPO_MINIBATCH > 0 else max(1, _n)
+            _clip_fired = 0
+            _clip_seen = 0
+            steps_taken = 0
             with profiled("train.ppo_update"):
                 for _ in range(cfg.update_epochs):
-                    epoch_loss = torch.tensor(0.0); cnt = 0
-                    for i in range(len(buffer.mdo_obs)):
-                        obs_i = buffer.mdo_obs[i]
-                        if obs_i.numel() == 0:
-                            continue
-                        k = buffer.mdo_num_vnfs[i]
-                        if k == 0 or i >= len(buffer.mdo_tier_masks):
-                            continue
-                        action_i = torch.tensor(buffer.mdo_actions[i], dtype=torch.long)
-                        tm_i = buffer.mdo_tier_masks[i]
-                        adv_i = float(advantages[i]) if i < len(advantages) else 0.0
-                        # The rollout was sampled from the ADVISED policy when the
-                        # stack trains advised, so the recomputation must include the
-                        # same bias or the ratio compares two different policies. The
-                        # advisory term carries no parameters, so the gradient is
-                        # unchanged; what changes is which distribution it belongs to.
-                        pri_i = None
-                        if TRAIN_MDO_MODE == "advised_sample" and i < len(suggested_list):
-                            sug_i = suggested_list[i]
-                            if sug_i and len(sug_i) == k:
-                                sc = [domain_to_canonical.get(d) for d in sug_i]
-                                if all(c is not None for c in sc):
-                                    pri_i = torch.zeros(k, num_domains)
-                                    for j, c in enumerate(sc):
-                                        if 0 <= c < num_domains:
-                                            pri_i[j, c] = 1.0
-                        new_lp, new_ent, new_logits = policy.evaluate_actions(
-                            obs_i, tm_i, action_i, k,
-                            prior_logits=pri_i,
-                            prior_weight=ADVISE_WEIGHT if pri_i is not None else 0.0)
-                        ratio = torch.exp(new_lp.sum() - buffer.mdo_log_probs[i].sum())
-                        step_loss = -torch.min(
-                            ratio * adv_i,
-                            torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * adv_i)
-                        kl_term = torch.tensor(0.0)
-                        if beta_t > 0 and i < len(suggested_list):
-                            sug = suggested_list[i]
-                            if sug and len(sug) == k:
-                                # §O.4 — canonicalize m~ (raw domain IDs) into the
-                                # policy/mask frame, matching coordinator follow_prior.
-                                sug_c = [domain_to_canonical.get(d) for d in sug]
-                                if any(c is None for c in sug_c):
-                                    kl_frame_skips += 1
-                                elif isinstance(policy, AutoregMDOPolicy):
-                                    if PRIOR_LOSS == "distill":
-                                        # §X.4 — teacher-forced distillation on
-                                        # m̃'s own prefix (the §V.4-validated
-                                        # gradient form).
-                                        if all(bool(tm_i[j][sug_c[j]]) for j in range(k)):
-                                            sug_t = torch.tensor(sug_c, dtype=torch.long)
-                                            lp_sug, _, _ = policy.evaluate_actions(
-                                                obs_i, tm_i, sug_t, k)
-                                            # §Z.1: sum, not mean — same reduction
-                                            # analytical_kl uses, so beta is one unit.
-                                            kl_term = -lp_sug.sum()
+                    _order = torch.randperm(_n).tolist() if _n > 0 else []
+                    _batches = [_order[b:b + _mb_size]
+                                for b in range(0, _n, _mb_size)] or [[]]
+                    for _mb in _batches:
+                        epoch_loss = torch.tensor(0.0); cnt = 0
+                        for i in _mb:
+                            obs_i = buffer.mdo_obs[i]
+                            if obs_i.numel() == 0:
+                                continue
+                            k = buffer.mdo_num_vnfs[i]
+                            if k == 0 or i >= len(buffer.mdo_tier_masks):
+                                continue
+                            action_i = torch.tensor(buffer.mdo_actions[i], dtype=torch.long)
+                            tm_i = buffer.mdo_tier_masks[i]
+                            adv_i = float(advantages[i]) if i < len(advantages) else 0.0
+                            # The rollout was sampled from the ADVISED policy when the
+                            # stack trains advised, so the recomputation must include the
+                            # same bias or the ratio compares two different policies. The
+                            # advisory term carries no parameters, so the gradient is
+                            # unchanged; what changes is which distribution it belongs to.
+                            pri_i = None
+                            if TRAIN_MDO_MODE == "advised_sample" and i < len(suggested_list):
+                                sug_i = suggested_list[i]
+                                if sug_i and len(sug_i) == k:
+                                    sc = [domain_to_canonical.get(d) for d in sug_i]
+                                    if all(c is not None for c in sc):
+                                        pri_i = torch.zeros(k, num_domains)
+                                        for j, c in enumerate(sc):
+                                            if 0 <= c < num_domains:
+                                                pri_i[j, c] = 1.0
+                            new_lp, new_ent, new_logits = policy.evaluate_actions(
+                                obs_i, tm_i, action_i, k,
+                                prior_logits=pri_i,
+                                prior_weight=ADVISE_WEIGHT if pri_i is not None else 0.0)
+                            ratio = torch.exp(new_lp.sum() - buffer.mdo_log_probs[i].sum())
+                            step_loss = -torch.min(
+                                ratio * adv_i,
+                                torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * adv_i)
+                            _clip_seen += 1
+                            _clip_fired += int(abs(float(ratio) - 1.0) > cfg.clip_eps)
+                            kl_term = torch.tensor(0.0)
+                            if beta_t > 0 and i < len(suggested_list):
+                                sug = suggested_list[i]
+                                if sug and len(sug) == k:
+                                    # §O.4 — canonicalize m~ (raw domain IDs) into the
+                                    # policy/mask frame, matching coordinator follow_prior.
+                                    sug_c = [domain_to_canonical.get(d) for d in sug]
+                                    if any(c is None for c in sug_c):
+                                        kl_frame_skips += 1
+                                    elif isinstance(policy, AutoregMDOPolicy):
+                                        if PRIOR_LOSS == "distill":
+                                            # §X.4 — teacher-forced distillation on
+                                            # m̃'s own prefix (the §V.4-validated
+                                            # gradient form).
+                                            if all(bool(tm_i[j][sug_c[j]]) for j in range(k)):
+                                                sug_t = torch.tensor(sug_c, dtype=torch.long)
+                                                lp_sug, _, _ = policy.evaluate_actions(
+                                                    obs_i, tm_i, sug_t, k)
+                                                # §Z.1: sum, not mean — same reduction
+                                                # analytical_kl uses, so beta is one unit.
+                                                kl_term = -lp_sug.sum()
+                                            else:
+                                                kl_frame_skips += 1
                                         else:
-                                            kl_frame_skips += 1
+                                            # §U.1e legacy — per-step KL along the
+                                            # sampled prefix (temp committed).
+                                            prior = build_prior_logits(
+                                                sug_c, num_domains, tm_i,
+                                                temperature=AUTOREG_PRIOR_TEMP)
+                                            kl_term = analytical_kl(
+                                                new_logits[:k], prior[:k],
+                                                tm_i[:k] if tm_i.dim() == 2 else None)
+                                    elif isinstance(policy, DirectJointPolicy):
+                                        # §U.1b — joint KL toward the single m̃ atom.
+                                        jp = policy.joint_prior_logits(
+                                            tm_i, k, sug_c, JOINT_PRIOR_TEMP)
+                                        if jp is None:
+                                            kl_frame_skips += 1  # m̃ not a feasible atom
+                                        else:
+                                            prior_logits, jmask = jp
+                                            kl_term = analytical_kl(
+                                                new_logits, prior_logits, jmask)
                                     else:
-                                        # §U.1e legacy — per-step KL along the
-                                        # sampled prefix (temp committed).
-                                        prior = build_prior_logits(
-                                            sug_c, num_domains, tm_i,
-                                            temperature=AUTOREG_PRIOR_TEMP)
+                                        prior = build_prior_logits(sug_c, num_domains, tm_i)
                                         kl_term = analytical_kl(
                                             new_logits[:k], prior[:k],
                                             tm_i[:k] if tm_i.dim() == 2 else None)
-                                elif isinstance(policy, DirectJointPolicy):
-                                    # §U.1b — joint KL toward the single m̃ atom.
-                                    jp = policy.joint_prior_logits(
-                                        tm_i, k, sug_c, JOINT_PRIOR_TEMP)
-                                    if jp is None:
-                                        kl_frame_skips += 1  # m̃ not a feasible atom
-                                    else:
-                                        prior_logits, jmask = jp
-                                        kl_term = analytical_kl(
-                                            new_logits, prior_logits, jmask)
-                                else:
-                                    prior = build_prior_logits(sug_c, num_domains, tm_i)
-                                    kl_term = analytical_kl(
-                                        new_logits[:k], prior[:k],
-                                        tm_i[:k] if tm_i.dim() == 2 else None)
-                        epoch_loss = epoch_loss + step_loss - ent_coef_t * new_ent + beta_t * kl_term
-                        cnt += 1; steps += 1
-                        kl_sum += float(kl_term)
-                    if cnt > 0:
-                        opt_mdo.zero_grad(); (epoch_loss / cnt).backward()
-                        torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5); opt_mdo.step()
+                            epoch_loss = epoch_loss + step_loss - ent_coef_t * new_ent + beta_t * kl_term
+                            cnt += 1; steps += 1
+                            kl_sum += float(kl_term)
+                        if cnt > 0:
+                            opt_mdo.zero_grad(); (epoch_loss / cnt).backward()
+                            torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+                            opt_mdo.step()
+                            steps_taken += 1
             motion = sum((p - init_params[n]).abs().sum().item()
                          for n, p in policy.named_parameters())
+
+            # §9 - HAPPO sequential update on the domain actors, using the SAME
+            # arrival-level advantages the MDO update consumed, mapped by
+            # request_id. No-op when the actors are frozen.
+            _actor_opts = getattr(coord, "actor_optimizers", None)
+            if _actor_opts:
+                from orion.training.actor_ppo import (ActorPPOConfig,
+                                                      update_domain_actors)
+                _rid_to_adv = {}
+                for _i, _t in enumerate(ep.rollout.mdo):
+                    if _i < len(advantages):
+                        _rid_to_adv[_t.request_id] = float(advantages[_i])
+                _gen = torch.Generator()
+                _gen.manual_seed(seed * 100003 + rnd)
+                with profiled("train.actor_ppo"):
+                    actor_stats = update_domain_actors(
+                        ep.rollout.domain_actor, _rid_to_adv,
+                        coord.domain_actors, _actor_opts,
+                        ActorPPOConfig(), generator=_gen)
 
             # §Y.9 — TRAIN-side prior telemetry. §X.4 declared the prior channel
             # inert on the strength of EVAL m~-agreement alone, which conflates
@@ -1282,11 +1437,24 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
         # advised stack, deterministic otherwise. This curve is what §Y.14 selects a
         # checkpoint on, so scoring an advised stack unadvised would select on a
         # policy nobody runs.
-        foc, eadm, etot, magree = eval_acceptance(coord, fam_name, seed, arrivals, delays,
-                                           plan_builder=eval_pb,
-                                           mode=("advised" if TRAIN_MDO_MODE == "advised_sample"
-                                                 else "deterministic"),
-                                           agree_out=eval_support)
+        # §9: eval decodes with ARGMAX actors while rollouts sample, matching
+        # how the frozen greedy actor is deterministic everywhere. And a
+        # follow_prior-trained stack must be scored follow_prior, because its
+        # partition policy was never trained -- only its actors were.
+        _eval_mode = ("advised" if TRAIN_MDO_MODE == "advised_sample"
+                      else "follow_prior" if TRAIN_MDO_MODE == "follow_prior"
+                      else "deterministic")
+        for _a in coord.domain_actors.values():
+            if hasattr(_a, "stochastic"):
+                _a.stochastic = False
+        try:
+            foc, eadm, etot, magree = eval_acceptance(
+                coord, fam_name, seed, arrivals, delays,
+                plan_builder=eval_pb, mode=_eval_mode, agree_out=eval_support)
+        finally:
+            for _a in coord.domain_actors.values():
+                if hasattr(_a, "stochastic"):
+                    _a.stochastic = True
         curve.append({
             "round": rnd + 1, "cumulative_arrivals": cumulative_arrivals,
             "train_admit": ep.stats.admitted, "train_total": ep.stats.total_arrivals,
@@ -1318,6 +1486,24 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
             "train_support_fr": train_support_fr,
             "eval_support": eval_support or None,
             "adv_mode": ADV_MODE, "lambda_viol": REWARD_LAMBDA_VIOL,
+            # 2026-08-20 — PPO health. `ppo_steps` was 4/round until minibatching
+            # landed; `ppo_clip_frac` was structurally 0 (epoch 1 has ratio == 1.0
+            # exactly and epochs 2-4 are one to three tiny steps away), so a
+            # non-zero value here is the first evidence the clip has ever bound.
+            "ppo_steps": steps_taken, "ppo_minibatch": PPO_MINIBATCH,
+            # §9 actor-update telemetry; None when the actors are frozen.
+            "actor_steps": actor_stats.steps if actor_stats else None,
+            "actor_clip_frac": actor_stats.clip_frac if actor_stats else None,
+            "actor_kl": actor_stats.approx_kl if actor_stats else None,
+            "actor_entropy": actor_stats.entropy if actor_stats else None,
+            "actor_null_rate": actor_stats.null_rate if actor_stats else None,
+            "actor_fragments": actor_stats.fragments if actor_stats else None,
+            "actor_fragments_by_domain": (actor_stats.fragments_by_domain
+                                          if actor_stats else None),
+            "actor_untrained_domains": (actor_stats.untrained_domains
+                                        if actor_stats else None),
+            "ppo_clip_frac": (_clip_fired / _clip_seen) if _clip_seen else None,
+            "obs_version": OBS_VERSION,
             "value_norm_mean": value_norm.mean, "value_norm_std": value_norm.std,
         })
         # §O.9 — peak RSS/VRAM sampled at round boundaries.
@@ -1342,10 +1528,26 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
     # SAME held-out stream + plans (eval_pb) in follow_prior mode: the trained
     # selector (per-round eval_foc, deterministic) vs plan-following, only the
     # selector differs. Δ = the RL selector's contribution beyond following the plan.
-    if curve:
-        foc_follow, fadm, ftot, _ = eval_acceptance(
-            coord, fam_name, seed, arrivals, delays,
-            plan_builder=eval_pb, mode="follow_prior")
+    # §9 (2026-08-20): SKIPPED under actor-only training. With
+    # TRAIN_MDO_MODE="follow_prior" the per-round eval ALSO runs follow_prior,
+    # so the two sides share an identical selector and the difference between
+    # them is not a selector delta at all. Left unguarded it reported
+    # +10.0pp on the first smoke run, which was purely argmax actors (the
+    # per-round eval) against SAMPLING actors (this comparator, which did not
+    # set the decode). Both defects are fixed: the toggle is applied here too,
+    # and the block does not run when there is no selector to isolate.
+    if curve and TRAIN_MDO_MODE != "follow_prior":
+        for _a in coord.domain_actors.values():
+            if hasattr(_a, "stochastic"):
+                _a.stochastic = False
+        try:
+            foc_follow, fadm, ftot, _ = eval_acceptance(
+                coord, fam_name, seed, arrivals, delays,
+                plan_builder=eval_pb, mode="follow_prior")
+        finally:
+            for _a in coord.domain_actors.values():
+                if hasattr(_a, "stochastic"):
+                    _a.stochastic = True
         curve[-1]["eval_acceptance_follow_prior"] = foc_follow
         curve[-1]["eval_admit_follow_prior"] = fadm
         curve[-1]["eval_acceptance_trained"] = curve[-1]["eval_acceptance"]
@@ -1377,6 +1579,19 @@ def train_approach(approach, fam_name, seed, rounds, arrivals, lr,
                 "critic_state": critic.state_dict(),
                 "value_norm_state": value_norm.state_dict(),
                 "obs_dim": obs_dim, "num_domains": num_domains,
+                # 2026-08-20 — stamp the observation semantics. A width change
+                # already fails loudly in load_state_dict; this catches the case
+                # a width change would NOT catch, a same-width change of MEANING.
+                # `grid_runner` names checkpoints (scenario, config, seed, seg)
+                # and nothing else, so the file itself has to carry this.
+                "obs_version": OBS_VERSION,
+                # §9 - trained per-domain actor policies (absent when frozen).
+                "actor_states": ({d: a.policy.state_dict()
+                                  for d, a in coord.domain_actors.items()
+                                  if getattr(a, "policy", None) is not None
+                                  and d in getattr(coord, "actor_optimizers", {})}
+                                 or None),
+                "actor_backbone": ACTOR_BACKBONE if TRAIN_ACTORS else None,
                 "canonical_to_domain": canonical_to_domain,
                 "final_curve": curve[-1] if curve else None,
             }, ckpt_path)

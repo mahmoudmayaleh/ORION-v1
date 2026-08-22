@@ -41,7 +41,13 @@ class TestPlanSummary:
 class TestViolationInfo:
     def test_violation_vector(self):
         v = ViolationInfo(c5b_violated=True, c9_violated=True)
-        assert v.violation_vector == (True, False, True, False, False)
+        assert v.violation_vector == (True, False, True, False, False, False)
+        assert v.has_violation is True
+
+    def test_chain_order_is_a_violation(self):
+        # C10: refused from the partition alone, before any actor is dispatched.
+        v = ViolationInfo(chain_order_violated=True)
+        assert v.violation_vector == (False, False, False, False, False, True)
         assert v.has_violation is True
 
     def test_no_violation(self):

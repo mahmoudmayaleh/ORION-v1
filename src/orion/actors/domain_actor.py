@@ -23,6 +23,8 @@ entropy only.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from orion.actors.action_mask import compute_action_mask
@@ -34,6 +36,7 @@ from orion.actors.routing import (
     deallocate_route_bw,
     route_flow,
 )
+from orion.config import MDO_DELAY_REF
 from orion.actors.types import ActorStepRecord, DomainResponse, PlanFragment, VNFAssignment
 from orion.substrate.graph_model import SubstrateNetwork
 from orion.types import InfrastructureTier, TIER_INDEX, TIER_ORDER
@@ -71,11 +74,19 @@ class DomainActor:
         self.cost_alpha = cost_alpha
         self.cost_gamma_intra = cost_gamma_intra
 
+    # Rollout/eval mode switch (2026-08-20). The coordinator calls
+    # `act(substrate, fragment)` with no decode argument, so which decode a
+    # learned actor uses has to live on the actor. Training rollouts need
+    # sampling (PPO is on-policy); every eval must be argmax, matching how the
+    # frozen greedy actor is deterministic everywhere. `train_approach` flips
+    # this around its eval calls.
+    stochastic: bool = True
+
     def act(
         self,
         substrate: SubstrateNetwork,
         fragment: PlanFragment,
-        deterministic: bool = False,
+        deterministic: bool | None = None,
     ) -> DomainResponse:
         """Execute interleaved placement and routing for a plan fragment.
 
@@ -130,6 +141,9 @@ class DomainActor:
         for fe in fragment.intra_flows:
             intra_flow_by_target[fe.target_vnf] = (fe.source_vnf, fe.bandwidth_demand)
 
+        if deterministic is None:
+            deterministic = not self.stochastic
+
         vnf_list = fragment.vnf_assignments
         delay_remaining = fragment.delay_budget_ms
 
@@ -148,8 +162,12 @@ class DomainActor:
             )
 
             # 3. Build VNF context vector
+            # `delay_remaining` is threaded in so the policy can see the budget
+            # it is spending, not just the price of each node (§9).
             vnf_ctx = self._build_vnf_context(
                 vnf, max_cpu, max_ram, max_bw,
+                delay_remaining=delay_remaining,
+                delay_budget=fragment.delay_budget_ms,
             )
 
             # 4. Run policy (NULL slot is always available even if mask is all-False)
@@ -218,6 +236,11 @@ class DomainActor:
                 g.nodes[chosen_node]["processing_delay"] * vnf.computational_intensity
             )
             total_proc_delay += proc_delay
+            # Same defect as GreedyDomainActor had: the budget tracker was
+            # decremented only by routing propagation delay and never by the
+            # processing delay it was itself accumulating, so `delay_remaining`
+            # overstated what was left for every VNF after the first.
+            delay_remaining -= proc_delay
 
             # Resource cost
             total_resource_cost += self.cost_alpha * (vnf.cpu_demand + vnf.ram_demand)
@@ -283,8 +306,15 @@ class DomainActor:
         max_cpu: float,
         max_ram: float,
         max_bw: float,
+        delay_remaining: float | None = None,
+        delay_budget: float | None = None,
     ) -> torch.Tensor:
-        """Build the VNF context vector [VNF_CONTEXT_DIM=9]."""
+        """Build the VNF context vector [VNF_CONTEXT_DIM=12].
+
+        Slots 9-11 are the delay budget (2026-08-20). They default to zeros when
+        no budget is supplied, which keeps the pre-2026-08-20 call signature
+        working, but a real episode always passes one.
+        """
         ctx = torch.zeros(VNF_CONTEXT_DIM)
         ctx[0] = vnf.cpu_demand / max_cpu if max_cpu > 0 else 0.0
         ctx[1] = vnf.ram_demand / max_ram if max_ram > 0 else 0.0
@@ -293,6 +323,11 @@ class DomainActor:
         ctx[6] = vnf.vcr
         ctx[7] = vnf.bandwidth_in / max_bw if max_bw > 0 else 0.0
         ctx[8] = vnf.position_in_sfc / vnf.sfc_length if vnf.sfc_length > 0 else 0.0
+        if delay_remaining is not None:
+            rem = max(0.0, float(delay_remaining))
+            ctx[9] = min(1.0, rem / MDO_DELAY_REF)
+            ctx[10] = math.log1p(rem) / math.log1p(MDO_DELAY_REF)
+            ctx[11] = (rem / delay_budget) if delay_budget else 0.0
         return ctx
 
     def _rollback(

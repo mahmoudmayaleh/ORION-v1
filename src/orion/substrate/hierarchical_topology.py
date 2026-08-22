@@ -62,6 +62,8 @@ from orion.substrate.topology_generator import (
     _add_directed_link_pair,
 )
 from orion.mdo.observation import DOMAIN_FEAT_DIM as _DOMAIN_FEAT_DIM
+from orion.mdo.observation import SLICE_FEAT_DIM as _SLICE_FEAT_DIM
+from orion.mdo.observation import VNF_FEAT_DIM as _VNF_FEAT_DIM
 from orion.types import InfrastructureTier, LinkType, TIER_ORDER
 
 _EDGE = InfrastructureTier.EDGE
@@ -91,10 +93,26 @@ BRANCHING_FACTOR = 4
 #: realistic for a national data centre hosting only cloud-anchored functions, and
 #: it is what makes cross-domain placement genuinely forced here. Registered as a
 #: prediction in §Y.1e so it is checked rather than rationalised afterwards.
+#: §Y.1f AMENDMENT (2026-08-22). D0 and D2 lost `central_cloud`.
+#:
+#: The §Y.1e prediction above was true of D3 and IRRELEVANT, because D0 and D2 each
+#: held all three tiers and were therefore complete networks in miniature: any chain,
+#: whatever tiers it spanned, fitted inside one of them. Measured on the banked
+#: conventional cells, a single domain could host the WHOLE chain on 99.9% of
+#: arrivals at L1 and 98.4% at L3, so the multi-domain problem the orchestrator
+#: exists to solve was optional on essentially every arrival, and every approach
+#: that colocated was rewarded for it.
+#:
+#: With central cloud held ONLY by D3, no domain holds both central and edge, so a
+#: chain containing a cloud-anchored function and an edge-anchored one CANNOT be
+#: colocated. That is the property §Y.1e claimed and did not have. Paired with the
+#: template amendment in `slice_generator._VNF_TEMPLATES` (which is what actually
+#: pins functions to central; this constant ALONE changes nothing, measured), the
+#: whole-chain host rate falls from 99.9% to 48.5%.
 DOMAIN_TIERS: dict[int, tuple[InfrastructureTier, ...]] = {
-    0: (_CENTRAL, _REGIONAL, _EDGE),
+    0: (_REGIONAL, _EDGE),
     1: (_REGIONAL, _EDGE),
-    2: (_CENTRAL, _REGIONAL, _EDGE),
+    2: (_REGIONAL, _EDGE),
     3: (_CENTRAL,),
     4: (_REGIONAL, _EDGE),
 }
@@ -194,13 +212,15 @@ NUM_DOMAIN_PAIRS = 2 * len(INTER_DOMAIN_ADJACENCIES)                  # 16
 #: with the emitter and would fail silently if it ever stopped agreeing.
 NUM_TIERS = len(TIER_ORDER)
 DOMAIN_FEAT_DIM = _DOMAIN_FEAT_DIM                                    # 17
+VNF_FEAT_DIM = _VNF_FEAT_DIM                                          # 5
+SLICE_FEAT_DIM = _SLICE_FEAT_DIM                                      # 6
 
 #: MDO observation width at this substrate. Constant across every §Y cell.
 MAX_VNFS = 10
 OBS_DIM = (DOMAIN_FEAT_DIM * NUM_DOMAINS
            + 3 * NUM_DOMAIN_PAIRS
-           + (5 + NUM_DOMAINS) * MAX_VNFS   # per-VNF features + one-hot of m̃_k
-           + 5)                                                       # 238
+           + (VNF_FEAT_DIM + NUM_DOMAINS) * MAX_VNFS  # per-VNF + one-hot of m̃_k
+           + SLICE_FEAT_DIM)                                          # 239
 
 # The adjacency list is written down explicitly, so it must name real domains and
 # contain no duplicate or self adjacency. A silent bad entry would be dropped by
@@ -437,7 +457,8 @@ def describe() -> str:
         row[tier] = row.get(tier, 0) + 1
     lines = [
         f"M={NUM_DOMAINS}  total nodes={TOTAL_NODES}",
-        f"  obs_dim={OBS_DIM}   ({DOMAIN_FEAT_DIM}M + 3L + 5*MAX_VNFS + 5, "
+        f"  obs_dim={OBS_DIM}   ({DOMAIN_FEAT_DIM}M + 3L + "
+        f"{VNF_FEAT_DIM}*MAX_VNFS + {SLICE_FEAT_DIM}, "
         f"L={NUM_DOMAIN_PAIRS})",
         f"  directed links: {sub.graph.number_of_edges()} "
         f"({len(sub.inter_domain_links())} inter-domain)",

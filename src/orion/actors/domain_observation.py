@@ -13,6 +13,14 @@ Node features [N_m x 15]:
   12: is_border_node          (1 if node has inter-domain links, 0 otherwise)
   13: border_to_target        (1 if node borders a domain in fragment's target set)
   14: has_placed_vnf          (1 if a VNF from this slice is already placed here)
+  15: processing_delay_abs    (delay / MDO_DELAY_REF -- ABSOLUTE scale, 2026-08-20)
+
+Feature 8 normalises processing delay by the domain's own maximum, which ranks
+nodes within a domain but cannot be compared to a delay BUDGET. Feature 15 is
+the same quantity on the fixed reference the VNF context's budget slots use, so
+"does this node's delay fit what is left" is expressible. Both are kept: 8 is
+the better within-domain ranking signal, 15 is the only one that is commensurable
+with the constraint.
 
 Edge features [E_m x 2]:
   0: residual_bw_frac         (bw_residual / bandwidth_capacity)
@@ -26,6 +34,7 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 
+from orion.config import MDO_DELAY_REF
 from orion.substrate.graph_model import SubstrateNetwork
 from orion.types import InfrastructureTier, TIER_INDEX, TIER_ORDER
 
@@ -33,7 +42,7 @@ from orion.types import InfrastructureTier, TIER_INDEX, TIER_ORDER
 _TIER_ORDER = list(TIER_ORDER)
 _TIER_TO_IDX = {t: i for i, t in enumerate(_TIER_ORDER)}
 
-NODE_FEAT_DIM = 15
+NODE_FEAT_DIM = 16
 EDGE_FEAT_DIM = 2
 
 
@@ -161,6 +170,7 @@ def build_domain_observation(
         node_feats[i, 3] = ram_cap / max_ram
         node_feats[i, 4 + _TIER_TO_IDX[tier]] = 1.0
         node_feats[i, 8] = nd["processing_delay"] / max_delay
+        node_feats[i, 15] = min(1.0, nd["processing_delay"] / MDO_DELAY_REF)
         node_feats[i, 9] = degree[i] / max_degree
         count = incident_bw_count[i]
         node_feats[i, 10] = incident_bw_sum[i] / count if count > 0 else 1.0

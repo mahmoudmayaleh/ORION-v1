@@ -41,6 +41,8 @@ from orion.mdo.observation import (
 )
 from orion.mdo.policy import MDOPolicy
 from orion.profiling import profiled
+from orion.mdo import admissibility as _adm
+from orion.mdo import chain_order
 from orion.mdo.types import (
     MDOAction,
     MDOResult,
@@ -79,6 +81,48 @@ logger = logging.getLogger(__name__)
 # same bias, so these must never be set independently. Any run at a non-default
 # weight must bank to a scratch cell directory; it is a different policy.
 ADVISE_WEIGHT = float(os.environ.get("ORION_ADVISE_WEIGHT", "2.0"))
+
+# §AE (2026-08-19) -- decode the CHAIN HOST, not K independent domains.
+#
+# Measured at L3 seed 42 under `ORION_COLOCATION_CONTRACT`: the plan is a single
+# `host_domain`, and `follow_prior` (which commits it verbatim) scores .6260 while
+# the same plan through mode="advised" scores .4725. The advised decode is a
+# per-VNF argmax over raw(s) + 2.0*prior (`AutoregMDOPolicy.forward`), so wherever a
+# VNF's raw logits beat the +2.0 nudge the chain is split -- and a split the
+# contract deliberately made unrepresentable in the PLAN is still representable in
+# the DECODE. That 15.4 pp is the price of asking K questions when the contract
+# poses one.
+#
+# With this on, the advised path calls `joint_host_decode`: the policy scores every
+# domain that is tier-feasible for the whole chain by the exact joint log-prob of
+# hosting the chain there, and takes the argmax. The RL still decides, and may name
+# a host the planner did not. It can no longer shatter the chain.
+#
+# This is the test of the headline claim, so it is worth being precise about what a
+# win would mean. It does NOT show that a factored policy learned colocation; the
+# action set is restricted, not the parameters. It shows that the LLM's plan SHAPE
+# fixes the action space the RL acts in, which is a claim about the interface
+# between the two, and it is falsifiable here: if this does not beat .6260 the
+# policy is adding nothing at this observability and the honest reading is that
+# `follow_prior` is the executor.
+#
+# Off by default: every banked cell decoded per-VNF.
+JOINT_HOST_DECODE = os.environ.get("ORION_JOINT_HOST_DECODE", "0") != "0"
+
+#: Per-cell counters for the above. `arrivals` counts advised decodes reached with
+#: the flag on; `colocated` those where some domain could host the whole chain;
+#: `fallback_split` those where none could, which fall through to the per-VNF decode.
+#: `agreed`/`overrode` split `colocated` by whether the policy's host is the one the
+#: plan named -- the selector delta the advised path has never been able to show,
+#: because a per-VNF decode that copies m~ on 95-98% of slots has no host of its own.
+JOINT_HOST_STATS = {"arrivals": 0, "colocated": 0, "fallback_split": 0,
+                    "agreed": 0, "overrode": 0, "no_plan_host": 0, "candidates": 0}
+
+
+def reset_joint_host_stats():
+    for _k in JOINT_HOST_STATS:
+        JOINT_HOST_STATS[_k] = 0
+    return JOINT_HOST_STATS
 
 
 @dataclass
@@ -138,7 +182,9 @@ class MDOCoordinator:
         Returns:
             MDOResult with final outcome, reward, and the recorded decision.
         """
-        obs_struct = build_mdo_observation(substrate, plan)
+        # slice_req carries q_s. Passed explicitly rather than folded into
+        # PlanSummary: the QoS vector is the request's, not the planner's.
+        obs_struct = build_mdo_observation(substrate, plan, slice_req=slice_req)
         # §U.1d — node-based feasibility (permitted_nodes ∩ domain nodes) when enabled;
         # slice_req carries the authoritative D_f per VNF.
         tier_mask = build_tier_masks(
@@ -182,15 +228,46 @@ class MDOCoordinator:
         # Map canonical indices to actual domain IDs
         partition = [canonical_to_domain[c] for c in partition_canonical]
 
+        # --- §AI: h^m guard on the FINAL partition, whatever produced it ---
+        # The policy's action mask carries `feas` (may this VNF legally sit here)
+        # but not `fits_a_node` (is there a node in there big enough right now), and
+        # `repair_plan` guards the LLM plan BEFORE the policy moves things. So an
+        # advised decode can seat a VNF in an empty-but-legal domain and nothing
+        # re-checks. This asks the heuristic's own question of the committed answer.
+        # A partition that already passes is returned unchanged, so the heuristic
+        # rows cannot move; see orion.mdo.admissibility.
+        if _adm.POSTDECODE_GUARD:
+            # Exact minimal repair: C10 is a JOINT constraint, so the left-to-right
+            # pass cannot fix the shape that actually occurs (the planner seats a
+            # VNF in a domain a LATER VNF needs, and the failure is invisible until
+            # that later VNF). The search returns the nearest committable partition,
+            # so the planner's intent survives wherever it was committable.
+            repaired = _adm.minimal_committable_partition(
+                partition, slice_req, substrate, obs_struct.domain_summaries)
+            if repaired is not partition:
+                partition = repaired
+                partition_canonical = [canonical_to_domain.index(d)
+                                       for d in partition]
+
+        # --- C10: chain-order contiguity, decided from the partition alone ---
+        # Applied here so it binds on EVERY approach identically: the heuristic
+        # builders, Agent B's m̃ under follow_prior, and anything the policy samples
+        # all reach this line. Refused before dispatch, so a scattered partition
+        # costs no placement work and allocates nothing.
+        chain_order_bad = chain_order.violates(partition)
+
         # --- Snapshot substrate CPU/RAM before actor dispatch ---
         node_snapshot = self._snapshot_node_residuals(substrate, partition)
 
         # --- Split into PlanFragments and dispatch ---
-        fragments, cross_domain_flows = self._build_fragments(
-            plan, partition, slice_req,
-        )
-        with profiled("actor.place", {"n_domains": len(fragments)}):
-            responses = self._dispatch_to_actors(substrate, fragments)
+        if chain_order_bad:
+            fragments, cross_domain_flows, responses = {}, [], {}
+        else:
+            fragments, cross_domain_flows = self._build_fragments(
+                plan, partition, slice_req,
+            )
+            with profiled("actor.place", {"n_domains": len(fragments)}):
+                responses = self._dispatch_to_actors(substrate, fragments)
 
         # --- Route cross-domain flows on full graph ---
         actor_infeasible = any(
@@ -224,6 +301,7 @@ class MDOCoordinator:
         total_inter_hops = cross_hops
 
         violation = ViolationInfo(
+            chain_order_violated=chain_order_bad,
             c7_violated=e2e > slice_req.qos.max_e2e_delay,
             c9_violated=total_inter_hops > cfg.max_inter_domain_hops,
             actor_infeasible=actor_infeasible,
@@ -394,6 +472,31 @@ class MDOCoordinator:
                 c = domain_to_canonical.get(d, d)
                 if 0 <= c < M:
                     prior_logits[k, c] = 1.0
+            if JOINT_HOST_DECODE and hasattr(self.policy, "joint_host_decode"):
+                JOINT_HOST_STATS["arrivals"] += 1
+                with torch.no_grad():
+                    jd = self.policy.joint_host_decode(
+                        obs_tensor, tier_mask, K,
+                        prior_logits=prior_logits, prior_weight=ADVISE_WEIGHT)
+                if jd is not None:
+                    partition, log_probs, logits, entropy, host, n_cand = jd
+                    with torch.no_grad():
+                        value = self.policy.get_value(obs_tensor).item()
+                    JOINT_HOST_STATS["colocated"] += 1
+                    JOINT_HOST_STATS["candidates"] += n_cand
+                    # The plan's own host, for the selector delta. Only defined when
+                    # the plan is itself colocated (the contract's normal output); a
+                    # split plan has no single host to agree or disagree with.
+                    sug = [domain_to_canonical.get(d, d)
+                           for d in plan.suggested_domains[:K]]
+                    if sug and len(set(sug)) == 1:
+                        JOINT_HOST_STATS["agreed" if sug[0] == host
+                                         else "overrode"] += 1
+                    else:
+                        JOINT_HOST_STATS["no_plan_host"] += 1
+                    return partition, log_probs, logits, entropy, value
+                # No domain can host the whole chain: the legitimate-split case.
+                JOINT_HOST_STATS["fallback_split"] += 1
             with torch.no_grad():
                 partition, log_probs, logits, entropy = self.policy(
                     obs_tensor, tier_mask, K, deterministic=True,

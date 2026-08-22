@@ -123,7 +123,36 @@ RHO_SWEEP = (0.10, 2.00)
 #: and regional (37% of XR is delay-infeasible on an EMPTY substrate; see
 #: scripts/diag_delay_budget.py). The acceptance axis is therefore compressed, but
 #: the LOAD axis is not: rho spans 0.10 to 2.00 and mean concurrency 20 to 220.
-ACCEPTANCE_TARGETS = {"L1": 0.72, "L2": 0.66, "L3": 0.60, "L4": 0.55}
+#: §Y.3b AMENDMENT (2026-08-22). Re-targeted, and re-targeted against a DIFFERENT
+#: reference: the partition oracle rather than the `Plain` greedy.
+#:
+#: The ladder used to be pinned on one policy's acceptance, which only works while
+#: that policy's failures track load. After §Y.1f they stop, twice over. `Plain`'s
+#: FFD fallback discards chain position, so C10 refuses a LOAD-INDEPENDENT 604 of
+#: 2000 arrivals at L1 and 602 at L4: its range collapses to .486-.384, every
+#: target sits above the ceiling and the ladder goes degenerate. And the first-fit
+#: builders strand themselves in the emptiest domain, which is emptiest at LOW
+#: load, so their give-ups run 299 per 1000 at L1 against 87 at L3 and difficulty
+#: ANTI-correlates with offered load.
+#:
+#: Both are properties of a heuristic, not of the problem. `orion.sim.partition_
+#: oracle` answers the policy-free question instead -- how many arrivals are
+#: admissible AT ALL -- and its curve is monotone .799 -> .431 across rho 0.1-2.0
+#: with +/-0.010-0.020 against Plain's +/-0.07, because removing the heuristic's
+#: idiosyncratic failures removes most of the variance with them.
+#:
+#: The four targets below name four distinct measured rungs on that curve, spanning
+#: rho 0.13 to 2.00 and binding-tier utilisation 0.18 to 0.96. They are NOT
+#: comparable to the superseded targets: those were Plain-acceptance, these are
+#: oracle-acceptance, and the same number means a different thing.
+#: Re-derived 2026-08-22 after the reference itself became delay-aware, which
+#: raised its whole curve (.8964 down to .4916 across rho 0.1-2.0). The previous
+#: targets were set against the capacity-only reference and, read against the new
+#: curve, all four landed in rho 0.673-2.000: the ladder still passed monotone and
+#: distinct-lambda but its concurrency ratio fell to 1.58 against an expectation of
+#: 3, i.e. it had no genuinely light rung left. These four name rungs at rho 0.131,
+#: 0.512, 1.160 and 2.000, spanning mean concurrency 24 to 173 (ratio 7.1).
+ACCEPTANCE_TARGETS = {"L1": 0.885, "L2": 0.83, "L3": 0.66, "L4": 0.49}
 
 #: The load level every learned stack trains at (§Y.4).
 TRAINING_LEVEL = "L2"
@@ -139,7 +168,14 @@ class LoadLevel:
     #: Offered load as a fraction of substrate CPU capacity, at the reference size.
     rho_offered: float | None = None
     #: Acceptance the reference greedy policy achieved during calibration.
-    plain_acceptance: float | None = None
+    #: Acceptance of the CALIBRATION REFERENCE at this level, not of any results
+    #: row. Renamed from `plain_acceptance` on 2026-08-22 with §Y.3b, when the
+    #: reference stopped being `Plain`: the name had become a false statement about
+    #: what the number measures, and a field that quietly means something new is
+    #: how a stale claim survives into a paper. It is now the partition oracle's
+    #: acceptance -- the fraction of arrivals admissible AT ALL, see
+    #: `orion.sim.partition_oracle`. No approach is expected to reach it.
+    reference_acceptance: float | None = None
 
     @property
     def erlangs(self) -> float:
@@ -148,9 +184,9 @@ class LoadLevel:
 
     def __str__(self) -> str:
         rho = "--" if self.rho_offered is None else f"{self.rho_offered:.3f}"
-        acc = "--" if self.plain_acceptance is None else f"{self.plain_acceptance:.3f}"
+        acc = "--" if self.reference_acceptance is None else f"{self.reference_acceptance:.3f}"
         return (f"{self.name}: lambda={self.arrival_rate:.3f} A={self.erlangs:.1f} "
-                f"rho_offered={rho} plain_acceptance={acc}")
+                f"rho_offered={rho} reference_acceptance={acc}")
 
 
 #: FROZEN 2026-07-29 by scripts/calibrate_load_levels.py on the committed
@@ -174,7 +210,7 @@ class LoadLevel:
 #: named expectations passed (monotone; concurrency ratio 5.39; binding-tier
 #: utilisation 0.96 on regional_cloud).
 #:
-#: `plain_acceptance` is the ratified metric. The steady-state value is recorded
+#: `reference_acceptance` is the ratified metric. The steady-state value is recorded
 #: next to it for reference: L1 0.851, L2 0.749, L3 0.603, L4 0.428, so the
 #: transient contributes +0.002 / +0.011 / +0.024 / +0.043.
 #:
@@ -210,11 +246,26 @@ class LoadLevel:
 #: Monotone in rho and every level has a distinct lambda; the script refuses
 #: to write this table otherwise, and writes it itself rather than by hand.
 #: Recalibrated after the Y.10 chain-truncation fix; the superseded ladder measured a workload in which 61% of arrivals were 2-VNF chains.
+#: FROZEN by scripts/freeze_load_levels.py from a §Y.3 calibration sweep:
+#:   N=2000, 12 rho points, seeds [42, 43, 44, 45, 46, 47, 48, 49], instances [0, 1, 2, 3, 4], 740 s wall.
+#: Monotone in rho and every level has a distinct lambda; the script refuses
+#: to write this table otherwise, and writes it itself rather than by hand.
+#: Recalibrated for the Y.1f amendment (cloud-anchored mMTC Analytics and eMBB vEPC; central cloud held only by D3). 12 rho points, seeds 42-49, instances 0-4, N=2000. The binding tier at L4 is now central_cloud at 0.91, where the superseded ladder bound on regional_cloud.
+#: FROZEN by scripts/freeze_load_levels.py from a §Y.3 calibration sweep:
+#:   N=2000, 12 rho points, seeds [42, 43, 44, 45, 46, 47, 48, 49], instances [0, 1, 2, 3, 4], 990 s wall.
+#: Monotone in rho and every level has a distinct lambda; the script refuses
+#: to write this table otherwise, and writes it itself rather than by hand.
+#: Y.3b: pinned on the PARTITION ORACLE, not on Plain. 12 rho points, seeds 42-49, instances 0-4, N=2000, oracle reference. Plain could no longer calibrate anything after Y.1f: C10 costs its chain-order-blind FFD fallback a load-INDEPENDENT 604 of 2000 arrivals at L1, collapsing its range to .486-.384 with every target above the ceiling. The oracle curve is monotone .799-.431 over rho 0.1-2.0 with +/-0.010-0.020.
+#: FROZEN by scripts/freeze_load_levels.py from a §Y.3 calibration sweep:
+#:   N=2000, 12 rho points, seeds [42, 43, 44, 45, 46], instances [0, 1, 2], 0 s wall.
+#: Monotone in rho and every level has a distinct lambda; the script refuses
+#: to write this table otherwise, and writes it itself rather than by hand.
+#: Y.3b final: delay-aware partition-oracle reference, 12 rho points, seeds 42-46, instances 0-2, N=2000. Targets re-derived onto rungs spanning rho 0.131-2.000 (mean concurrency 24 to 173, ratio 7.11); the previous targets were set against the capacity-only reference and left the ladder with no light rung.
 CALIBRATED_LEVELS: dict[str, LoadLevel] = {
-    "L1": LoadLevel("L1", arrival_rate=1.0593, rho_offered=0.1000, plain_acceptance=0.7211),
-    "L2": LoadLevel("L2", arrival_rate=7.1279, rho_offered=0.6729, plain_acceptance=0.6687),
-    "L3": LoadLevel("L3", arrival_rate=12.2889, rho_offered=1.1601, plain_acceptance=0.6091),
-    "L4": LoadLevel("L4", arrival_rate=16.1358, rho_offered=1.5232, plain_acceptance=0.5485),
+    "L1": LoadLevel("L1", arrival_rate=1.3348, rho_offered=0.1313, reference_acceptance=0.8847),
+    "L2": LoadLevel("L2", arrival_rate=5.2095, rho_offered=0.5125, reference_acceptance=0.8270),
+    "L3": LoadLevel("L3", arrival_rate=11.7930, rho_offered=1.1601, reference_acceptance=0.6640),
+    "L4": LoadLevel("L4", arrival_rate=20.3318, rho_offered=2.0000, reference_acceptance=0.4916),
 }
 
 
